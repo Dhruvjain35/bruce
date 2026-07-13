@@ -407,6 +407,17 @@ async def discover_professors(
                 continue  # skip a candidate that fails to enrich rather than fail the whole run
         candidates.sort(key=lambda c: c.fit_score, reverse=True)
 
+        # Collapse duplicates (same name + institution = one person split across OpenAlex IDs).
+        seen_person: set[tuple[str, str]] = set()
+        deduped_cands: list[ProfessorCandidate] = []
+        for c in candidates:
+            key = (c.name.lower(), c.institution.lower())
+            if key in seen_person:
+                continue
+            seen_person.add(key)
+            deduped_cands.append(c)
+        candidates = deduped_cands
+
         return DiscoveryResult(
             goal=goal,
             candidates=candidates,
