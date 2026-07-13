@@ -8,6 +8,10 @@ pdfplumber>=0.11       # extract corresponding-author emails from open-access PD
 python-dotenv>=1.0     # load API keys from .env (never committed) at the entrypoint
 fastapi>=0.115         # API service exposing the engine to clients
 uvicorn[standard]>=0.30  # ASGI server for local/prod serving
+sqlalchemy[asyncio]>=2.0  # ORM + async engine for Postgres persistence
+asyncpg>=0.29          # async PostgreSQL driver
+alembic>=1.13          # schema migrations (upgrade-from-empty + downgrade)
+pyjwt[crypto]>=2.9     # verify IdP (Supabase/Apple) JWTs at the auth boundary
 
 # dev
 pytest>=8.0
