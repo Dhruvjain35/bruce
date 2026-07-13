@@ -164,3 +164,122 @@ class OutreachPlan(BaseModel):
     goal: OutreachGoal
     discovery: DiscoveryResult
     drafts: list[OutreachDraft] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (student intake): shared contracts for extraction, tasks, calendar,
+# briefing, and mission phases. Same grounding rule applies — never invent a
+# date/requirement; every extracted fact carries the verbatim source span it
+# came from, and anything uncertain goes in `ambiguities`, never guessed.
+# ---------------------------------------------------------------------------
+
+
+class IntakeSourceKind(str, Enum):
+    text = "text"
+    email = "email"
+    pdf = "pdf"
+    image = "image"
+    screenshot = "screenshot"
+    url = "url"
+
+
+class TaskKind(str, Enum):
+    deadline = "deadline"
+    opportunity = "opportunity"
+    application = "application"
+    assignment = "assignment"
+    event = "event"
+    form = "form"
+    outreach = "outreach"
+    other = "other"
+
+
+class TaskStatus(str, Enum):
+    open = "open"
+    in_progress = "in_progress"
+    awaiting_decision = "awaiting_decision"
+    blocked = "blocked"
+    done = "done"
+    expired = "expired"
+    dismissed = "dismissed"
+
+
+class MissionPhase(str, Enum):
+    """Observable phases a Dynamic Island / Live Activity renders (no fake 'thinking')."""
+
+    created = "created"
+    understanding = "understanding"
+    extracting = "extracting"
+    awaiting_approval = "awaiting_approval"
+    executing = "executing"
+    waiting_external = "waiting_external"
+    verifying = "verifying"
+    succeeded = "succeeded"
+    blocked = "blocked"
+    failed = "failed"
+
+
+class ExtractedDeadline(BaseModel):
+    label: str = Field(description="what is due / happening")
+    date: str | None = Field(default=None, description="ISO 8601 date if determinable, else None")
+    time: str | None = None
+    source_span: str = Field(description="verbatim text this was extracted from (grounding)")
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class RequiredItem(BaseModel):
+    name: str
+    kind: str | None = Field(default=None, description="doc | form | essay | fee | recommendation | test")
+    provided: bool = False
+
+
+class ExtractedIntake(BaseModel):
+    """Structured result of extraction (#2) from any ugly input. Grounded, provenance-carrying."""
+
+    source_kind: IntakeSourceKind
+    title: str | None = None
+    summary: str | None = None
+    deadlines: list[ExtractedDeadline] = Field(default_factory=list)
+    required_items: list[RequiredItem] = Field(default_factory=list)
+    cost: str | None = None
+    location: str | None = None
+    contacts: list[str] = Field(default_factory=list)
+    links: list[str] = Field(default_factory=list)
+    eligibility: str | None = None
+    ambiguities: list[str] = Field(default_factory=list)
+    raw_source_excerpt: str | None = Field(default=None, description="for provenance/verification")
+
+
+class Task(BaseModel):
+    """Canonical unit of the unified task list (#3). Everything Bruce tracks becomes a Task."""
+
+    task_id: str
+    kind: TaskKind
+    title: str
+    course_or_org: str | None = None
+    due: str | None = Field(default=None, description="ISO 8601 date/datetime")
+    status: TaskStatus = TaskStatus.open
+    required_items: list[RequiredItem] = Field(default_factory=list)
+    source: str | None = Field(default=None, description="provenance (url/file/'email'/mission id)")
+    notes: str | None = None
+    workload_minutes: int | None = None
+
+
+class CalendarEvent(BaseModel):
+    """A calendar event Bruce builds from an intake (#4). Rendered to .ics; the actual add is client/OAuth."""
+
+    title: str
+    start: str = Field(description="ISO 8601 start datetime")
+    end: str | None = None
+    location: str | None = None
+    prep_minutes: int | None = None
+    tentative: bool = True
+    source: str | None = None
+
+
+class DailyBrief(BaseModel):
+    """A concise student brief (#5): ~5 useful lines. Composed from Tasks, not model prose."""
+
+    kind: str = Field(description="morning | afterschool | night")
+    date: str | None = None
+    lines: list[str] = Field(default_factory=list)
