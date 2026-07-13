@@ -9,6 +9,8 @@ Nothing that isn't in the evidence is allowed; verify.py fails closed on the res
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, PromptedOutput
 
@@ -44,6 +46,19 @@ class _Generated(BaseModel):
 def _last_name(full: str) -> str:
     parts = [p for p in full.replace(".", "").split() if p]
     return parts[-1] if parts else full
+
+
+_GREETING_RE = re.compile(
+    r"^\s*(hi|hello|dear|greetings|good (?:morning|afternoon|evening))\b[^,\n]*,\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_greeting(text: str) -> str:
+    """Drop a leading salutation the model may have written despite instructions — we inject
+    our own greeting, so a model-written one produces a double greeting (an AI-sloppy tell)."""
+    t = _GREETING_RE.sub("", text, count=1).strip()
+    return (t[:1].upper() + t[1:]) if t else t
 
 
 async def draft_one(student: StudentProfile, candidate: ProfessorCandidate) -> OutreachDraft:
@@ -86,7 +101,7 @@ PAPERS (reference exactly one by index):
     body = "\n\n".join(
         [
             greeting,
-            gen.opening.strip(),
+            _strip_greeting(gen.opening),
             gen.personalization.strip(),
             f"{gen.fit.strip()} {STUDENT_QUESTION_PLACEHOLDER}",
             gen.ask.strip(),
