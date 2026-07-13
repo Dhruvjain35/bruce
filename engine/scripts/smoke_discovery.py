@@ -10,6 +10,12 @@ Usage:
 
 import asyncio
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load engine/.env so OPENALEX_API_KEY (and later keys) are available to the client.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 from bruce_engine.discovery import discover_professors
 from bruce_engine.models import OutreachGoal, OutreachType, StudentLevel, StudentProfile
