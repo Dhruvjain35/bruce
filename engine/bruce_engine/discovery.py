@@ -20,6 +20,7 @@ separate, out-of-band step and is never guessed.
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -76,6 +77,15 @@ def _norm_title(title: str) -> str:
 
 def _is_preprint_doi(doi: str | None) -> bool:
     return bool(doi) and ("arxiv" in doi or "zenodo" in doi)
+
+
+def _person_like(name: str | None) -> bool:
+    """Filter org/consortium/garbled author entries (e.g. 'inquantio'): require >=2 name
+    tokens and at least one capitalized (real people are capitalized; junk/orgs often aren't)."""
+    if not name:
+        return False
+    tokens = [t for t in re.split(r"[^A-Za-zÀ-ɏ]+", name) if len(t) >= 2]
+    return len(tokens) >= 2 and any(t[0].isupper() for t in tokens)
 
 
 class OpenAlexClient:
@@ -157,7 +167,7 @@ async def find_candidate_seeds(
         for authorship in w.get("authorships", []):
             author = authorship.get("author") or {}
             aid = author.get("id")
-            if not aid:
+            if not aid or not _person_like(author.get("display_name")):
                 continue
             seed = seeds.setdefault(
                 aid,
@@ -307,6 +317,12 @@ async def enrich_candidate(
         fit_flags.append("Early-career researcher — often more bandwidth to mentor a student.")
     if count < 2:
         fit_flags.append("Only one recent paper on this topic — confirm it's a current focus.")
+    if institution == "Unknown":
+        # An author we can't place at an institution is not an actionable outreach target
+        # (no email, no way to verify who they are) — sink them, don't recommend sending.
+        fit_score = round(fit_score * 0.4, 2)
+        recommend_send = False
+        fit_flags.append("Could not confirm a current affiliation — hard to contact or verify; low priority.")
 
     uncertainties: list[str] = []
     if institution == "Unknown":
