@@ -1,0 +1,29 @@
+# secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# editors
+.vscode/
+.idea/
+
+# iOS (for later)
+app/**/xcuserdata/
+app/**/*.xcuserstate
+app/**/DerivedData/
