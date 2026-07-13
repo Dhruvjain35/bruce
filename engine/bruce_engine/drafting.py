@@ -14,6 +14,7 @@ import re
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, PromptedOutput
 
+from .humanize import humanize_body
 from .llm import drafting_model
 from .models import DraftStatus, OutreachDraft, ProfessorCandidate, StudentProfile
 
@@ -108,6 +109,7 @@ PAPERS (reference exactly one by index):
             f"Best regards,\n{student.name}",
         ]
     )
+    body = humanize_body(body)  # soften AI tells; masks greeting/quoted title/placeholder/signature
     return OutreachDraft(
         candidate_name=candidate.name,
         institution=candidate.institution,

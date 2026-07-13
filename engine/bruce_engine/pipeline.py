@@ -9,7 +9,7 @@ gate. Nothing is sent — the student reviews, adds their own question, and send
 
 from __future__ import annotations
 
-from . import discovery, drafting, email_resolver, verify
+from . import antispam, discovery, drafting, email_resolver, verify
 from .models import OutreachGoal, OutreachPlan, StudentProfile
 
 
@@ -39,5 +39,7 @@ async def build_outreach_plan(
                 draft.flags.append(f"BLOCKED by verification ({verdict.entailment}): {detail}")
 
         drafts.append(draft)
+
+    antispam.flag_spam(drafts)  # name-swap + >2-per-institution flags, appended in place
 
     return OutreachPlan(student=student, goal=goal, discovery=result, drafts=drafts)
