@@ -1,39 +1,105 @@
-"""Personalized outreach drafting.
+"""Grounded outreach drafting (Featherless / open model).
 
-For each verified professor, produce ONE genuinely personalized email that reads like the
-student spent an hour on it: references the professor's specific recent work, makes a real
-fit case from the student's background, and sounds like the student (voice-matched).
-
-Hard rules (enforced in the prompt + validated on output):
-  * Every specific claim in the email must be supported by the candidate's evidence.
-    No invented papers, results, or affiliations.
-  * No mass-template feel. Two drafts for two professors must not be near-identical.
-  * Match the student's voice_sample when provided; otherwise a clean earnest register.
-  * status starts at DraftStatus.draft. The engine never sends. The student sends.
-  * Surface anything unsure in ``flags`` (e.g. "confirm this is still their focus").
-
-Prompt strategy and grounding enforcement land with the grounding research pass; the
-signatures below are the stable contract the client + pipeline build against.
+The drafter sees ONLY the candidate's real papers + the student profile. It anchors a
+personalized hook on ONE real paper and engages a specific finding from its abstract. The
+professor's name is template-injected from the candidate record (not model-written), and a
+required placeholder forces the student to write the one genuine sentence AI can't fake.
+Nothing that isn't in the evidence is allowed; verify.py fails closed on the rest.
 """
 
 from __future__ import annotations
 
-from .models import OutreachDraft, OutreachGoal, ProfessorCandidate, StudentProfile
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, PromptedOutput
+
+from .llm import drafting_model
+from .models import DraftStatus, OutreachDraft, ProfessorCandidate, StudentProfile
+
+STUDENT_QUESTION_PLACEHOLDER = (
+    "[[ADD YOUR OWN GENUINE QUESTION OR IDEA HERE — Bruce won't write this for you]]"
+)
+
+_SYSTEM = """You draft ONE short cold email from a student to a professor about a research opportunity.
+Rules:
+- Use ONLY facts in the STUDENT profile and the PAPERS list. Never state a fact about the professor
+  or their work that is not in a provided abstract. Never invent papers, findings, numbers, or titles.
+- Reference exactly ONE paper (by its index) and engage with a SPECIFIC finding from ITS abstract.
+- In 'personalization', name that paper by its EXACT title in quotes, exactly as given.
+- ~150-180 words total, short paragraphs, one small ask (a ~15-minute chat), no same-day meeting,
+  no flattery, no exclamation-point piles, no 'stepping stone to grad/med school' framing.
+- Write in the student's voice. Do NOT write a greeting or a signature — those are added separately."""
 
 
-async def draft_one(
-    student: StudentProfile, goal: OutreachGoal, candidate: ProfessorCandidate
-) -> OutreachDraft:
-    raise NotImplementedError(
-        "draft_one: pending grounding research (workflow bruce-engine-research). "
-        "Every claim must trace to candidate.evidence; voice-matched; never auto-sent."
+class _Generated(BaseModel):
+    referenced_paper_index: int = Field(description="0-based index into PAPERS the hook is about")
+    subject: str
+    opening: str = Field(description="1-2 sentences: who the student is (name/school/level) and why writing")
+    personalization: str = Field(
+        description="2-3 sentences engaging a specific finding; must quote the paper's EXACT title"
     )
+    fit: str = Field(description="1-2 sentences on the student's relevant background/skills")
+    ask: str = Field(description="one small concrete ask, e.g. a ~15-min chat")
 
 
-async def draft_all(
-    student: StudentProfile, goal: OutreachGoal, candidates: list[ProfessorCandidate]
-) -> list[OutreachDraft]:
-    """Draft for each candidate. Drafts must be individually personalized, not templated."""
-    raise NotImplementedError(
-        "draft_all: pending grounding research (workflow bruce-engine-research)."
+def _last_name(full: str) -> str:
+    parts = [p for p in full.replace(".", "").split() if p]
+    return parts[-1] if parts else full
+
+
+async def draft_one(student: StudentProfile, candidate: ProfessorCandidate) -> OutreachDraft:
+    papers = [p for p in candidate.recent_work if (p.abstract_snippet or "").strip()]
+    if not papers:
+        return OutreachDraft(
+            candidate_name=candidate.name,
+            institution=candidate.institution,
+            subject="",
+            body="",
+            personalization_points=[],
+            word_count=0,
+            flags=["No paper with an abstract to ground a genuine hook — don't send a vague email."],
+            status=DraftStatus.draft,
+        )
+
+    papers_block = "\n\n".join(
+        f"[{i}] TITLE: {p.title}\n    YEAR: {p.year or 'n.d.'}\n    ABSTRACT: {p.abstract_snippet}"
+        for i, p in enumerate(papers)
+    )
+    prompt = f"""STUDENT
+name: {student.name}
+level: {student.level.value}
+school: {student.school or 'n/a'}
+background: {student.background}
+interests: {', '.join(student.field_interests) or 'n/a'}
+
+PROFESSOR: {candidate.name} ({candidate.institution})
+
+PAPERS (reference exactly one by index):
+{papers_block}
+"""
+    agent = Agent(drafting_model(), output_type=PromptedOutput(_Generated), system_prompt=_SYSTEM)
+    gen = (await agent.run(prompt)).output
+
+    idx = gen.referenced_paper_index if 0 <= gen.referenced_paper_index < len(papers) else 0
+    paper = papers[idx]
+
+    greeting = f"Dear Professor {_last_name(candidate.name)},"
+    body = "\n\n".join(
+        [
+            greeting,
+            gen.opening.strip(),
+            gen.personalization.strip(),
+            f"{gen.fit.strip()} {STUDENT_QUESTION_PLACEHOLDER}",
+            gen.ask.strip(),
+            f"Best regards,\n{student.name}",
+        ]
+    )
+    return OutreachDraft(
+        candidate_name=candidate.name,
+        institution=candidate.institution,
+        subject=gen.subject.strip(),
+        body=body,
+        personalization_points=[f'Referenced paper: "{paper.title}" ({paper.year or "n.d."})'],
+        word_count=len(body.split()),
+        flags=["Replace the placeholder with your own genuine question before sending."],
+        status=DraftStatus.draft,
     )
