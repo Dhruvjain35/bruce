@@ -9,8 +9,10 @@ gate. Nothing is sent — the student reviews, adds their own question, and send
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from . import antispam, discovery, drafting, email_resolver, verify
-from .models import OutreachGoal, OutreachPlan, StudentProfile
+from .models import MissionPhase, OutreachGoal, OutreachPlan, StudentProfile
 
 
 async def build_outreach_plan(
@@ -20,9 +22,14 @@ async def build_outreach_plan(
     limit: int = 8,
     resolve_emails: bool = True,
     verify_drafts: bool = True,
+    on_phase: Callable[[MissionPhase], None] | None = None,
 ) -> OutreachPlan:
+    emit = on_phase or (lambda _p: None)
+
+    emit(MissionPhase.understanding)
     result = await discovery.discover_professors(student, goal, limit=limit)
 
+    emit(MissionPhase.executing)
     drafts = []
     for candidate in result.candidates:
         if resolve_emails:
