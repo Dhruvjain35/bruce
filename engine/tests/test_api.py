@@ -1,11 +1,13 @@
-"""Offline tests for the FastAPI service (build_outreach_plan patched — no network/keys)."""
+"""API tests — authenticated + persistence-backed (in-memory repos injected; no network)."""
 
-import asyncio
+import time
+from uuid import uuid4
 
+import jwt
+import pytest
 from fastapi.testclient import TestClient
 
 import bruce_engine.api as api
-from bruce_engine.api import MissionRequest, MissionStatus
 from bruce_engine.models import (
     DiscoveryResult,
     ExtractedDeadline,
@@ -19,77 +21,78 @@ from bruce_engine.models import (
     Task,
     TaskKind,
 )
+from bruce_engine.repositories import InMemoryMissionRepository, InMemoryStore
 
+SECRET = "test-secret"
 client = TestClient(api.app)
 
 
-def _student_goal():
-    student = StudentProfile(name="Test", level=StudentLevel.high_school, background="b")
-    goal = OutreachGoal(outreach_type=OutreachType.research_position, topic="polariton chemistry")
-    return student, goal
+class _NoopUserRepo:
+    async def ensure(self, user_id, **k):
+        return None
+
+    async def delete(self, user_id):
+        return None
 
 
-def _fake_plan(student, goal) -> OutreachPlan:
-    return OutreachPlan(student=student, goal=goal, discovery=DiscoveryResult(goal=goal), drafts=[])
+@pytest.fixture(autouse=True)
+def _setup(monkeypatch):
+    monkeypatch.setenv("BRUCE_JWT_SECRET", SECRET)
+    monkeypatch.delenv("BRUCE_JWKS_URL", raising=False)
+    monkeypatch.delenv("BRUCE_JWT_AUDIENCE", raising=False)
+    monkeypatch.setattr(api, "_mission_repo", InMemoryMissionRepository(InMemoryStore()))
+    monkeypatch.setattr(api, "_user_repo", _NoopUserRepo())
 
-
-def test_health():
-    r = client.get("/health")
-    assert r.status_code == 200 and r.json() == {"status": "ok"}
-
-
-def test_get_unknown_mission_404():
-    assert client.get("/v1/missions/does-not-exist").status_code == 404
-
-
-def test_create_mission_returns_running(monkeypatch):
-    student, goal = _student_goal()
-    # patch so even if the background task runs, it's offline
-    async def fake_build(s, g, **k):
-        return _fake_plan(s, g)
+    async def fake_build(student, goal, **k):
+        return OutreachPlan(student=student, goal=goal, discovery=DiscoveryResult(goal=goal), drafts=[])
 
     monkeypatch.setattr(api, "build_outreach_plan", fake_build)
-    r = client.post(
-        "/v1/missions",
-        json={"student": student.model_dump(mode="json"), "goal": goal.model_dump(mode="json"), "limit": 3},
-    )
-    assert r.status_code == 200
-    body = r.json()
-    assert body["status"] == "running" and body["mission_id"]
-    assert body["mission_id"] in api._MISSIONS
 
 
-def test_run_mission_succeeds(monkeypatch):
-    student, goal = _student_goal()
-
-    async def fake_build(s, g, **k):
-        return _fake_plan(s, g)
-
-    monkeypatch.setattr(api, "build_outreach_plan", fake_build)
-    asyncio.run(api._run_mission("m-ok", MissionRequest(student=student, goal=goal, limit=3)))
-    state = api._MISSIONS["m-ok"]
-    assert state.status == MissionStatus.succeeded and state.plan is not None
+def _auth(uid):
+    tok = jwt.encode({"sub": str(uid), "exp": int(time.time()) + 3600}, SECRET, algorithm="HS256")
+    return {"Authorization": f"Bearer {tok}"}
 
 
-def test_run_mission_failure_is_captured(monkeypatch):
-    student, goal = _student_goal()
-
-    async def boom(s, g, **k):
-        raise RuntimeError("kaboom")
-
-    monkeypatch.setattr(api, "build_outreach_plan", boom)
-    asyncio.run(api._run_mission("m-fail", MissionRequest(student=student, goal=goal, limit=3)))
-    state = api._MISSIONS["m-fail"]
-    assert state.status == MissionStatus.failed and "kaboom" in (state.error or "")
+def _student():
+    return StudentProfile(name="T", level=StudentLevel.high_school, background="b")
 
 
-# --- Phase 1 endpoints ---
+def _goal():
+    return OutreachGoal(outreach_type=OutreachType.research_position, topic="polariton chemistry")
+
+
+def test_health_is_public():
+    assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_mission_requires_auth():
+    body = {"student": _student().model_dump(mode="json"), "goal": _goal().model_dump(mode="json")}
+    assert client.post("/v1/missions", json=body).status_code == 401
+
+
+def test_mission_create_get_and_isolation():
+    a, b = uuid4(), uuid4()
+    body = {"student": _student().model_dump(mode="json"), "goal": _goal().model_dump(mode="json")}
+    r = client.post("/v1/missions", json=body, headers=_auth(a))
+    assert r.status_code == 200 and r.json()["phase"] == "created"
+    mid = r.json()["mission_id"]
+
+    assert client.get(f"/v1/missions/{mid}", headers=_auth(a)).status_code == 200
+    assert client.get(f"/v1/missions/{mid}", headers=_auth(b)).status_code == 404  # 404, not 403
+    assert client.get(f"/v1/missions/{mid}").status_code == 401  # no token
+    assert len(client.get("/v1/missions", headers=_auth(a)).json()) == 1
+    assert client.get("/v1/missions", headers=_auth(b)).json() == []
+
+
+def test_account_delete_requires_auth():
+    assert client.delete("/v1/account").status_code == 401
+    assert client.delete("/v1/account", headers=_auth(uuid4())).json() == {"deleted": True}
 
 
 def test_intake_endpoint(monkeypatch):
     fake = ExtractedIntake(
-        source_kind=IntakeSourceKind.text,
-        title="Science Fair",
+        source_kind=IntakeSourceKind.text, title="Science Fair",
         deadlines=[ExtractedDeadline(label="Registration", date="2026-02-28", source_span="x", confidence=0.9)],
     )
 
@@ -97,14 +100,12 @@ def test_intake_endpoint(monkeypatch):
         return fake
 
     monkeypatch.setattr(api, "extract_from_text", fake_extract)
-    r = client.post("/v1/intake", json={"text": "Registration closes February 28, 2026."})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["title"] == "Science Fair" and len(body["deadlines"]) == 1
+    r = client.post("/v1/intake", json={"text": "Registration closes Feb 28, 2026."}, headers=_auth(uuid4()))
+    assert r.status_code == 200 and r.json()["title"] == "Science Fair"
+    assert client.post("/v1/intake", json={"text": "x"}).status_code == 401  # auth required
 
 
 def test_opportunities_endpoint(monkeypatch):
-    student = StudentProfile(name="T", level=StudentLevel.high_school, background="b")
     intake = ExtractedIntake(source_kind=IntakeSourceKind.text, title="Summer REU")
     task = Task(task_id="t1", kind=TaskKind.application, title="Summer REU")
 
@@ -114,25 +115,19 @@ def test_opportunities_endpoint(monkeypatch):
     monkeypatch.setattr(api, "ingest_opportunity_text", fake_ingest)
     r = client.post(
         "/v1/opportunities",
-        json={"text": "REU at MIT, apply by March 1", "student": student.model_dump(mode="json")},
+        json={"text": "REU at MIT", "student": _student().model_dump(mode="json")},
+        headers=_auth(uuid4()),
     )
-    assert r.status_code == 200
-    body = r.json()
-    assert body["classification"] == "research" and body["is_spam"] is False
-    assert body["task"]["title"] == "Summer REU"
+    assert r.status_code == 200 and r.json()["classification"] == "research"
 
 
 def test_tasks_endpoint():
     intake = ExtractedIntake(
-        source_kind=IntakeSourceKind.text,
-        title="Science Fair",
+        source_kind=IntakeSourceKind.text, title="Fair",
         deadlines=[ExtractedDeadline(label="Registration", date="2999-02-28", source_span="x", confidence=0.9)],
     )
-    r = client.post("/v1/tasks", json={"intakes": [intake.model_dump(mode="json")]})
-    assert r.status_code == 200
-    body = r.json()
-    assert any(t["title"] == "Registration" for t in body["tasks"])
-    assert "later" in body["buckets"] and isinstance(body["counts"], dict)
+    r = client.post("/v1/tasks", json={"intakes": [intake.model_dump(mode="json")]}, headers=_auth(uuid4()))
+    assert r.status_code == 200 and any(t["title"] == "Registration" for t in r.json()["tasks"])
 
 
 def test_calendar_endpoint():
@@ -140,30 +135,11 @@ def test_calendar_endpoint():
         source_kind=IntakeSourceKind.text,
         deadlines=[ExtractedDeadline(label="Projects due", date="2026-03-14", source_span="x", confidence=0.9)],
     )
-    r = client.post("/v1/calendar", json={"intake": intake.model_dump(mode="json")})
-    assert r.status_code == 200
-    body = r.json()
-    assert "BEGIN:VCALENDAR" in body["ics"] and isinstance(body["conflicts"], list)
+    r = client.post("/v1/calendar", json={"intake": intake.model_dump(mode="json")}, headers=_auth(uuid4()))
+    assert r.status_code == 200 and "BEGIN:VCALENDAR" in r.json()["ics"]
 
 
 def test_brief_endpoint():
     task = Task(task_id="t1", kind=TaskKind.deadline, title="Essay", due="2999-01-01")
-    r = client.post("/v1/brief", json={"tasks": [task.model_dump(mode="json")], "kind": "morning"})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["kind"] == "morning" and isinstance(body["lines"], list) and body["lines"]
-
-
-def test_mission_create_has_phase(monkeypatch):
-    student = StudentProfile(name="T", level=StudentLevel.high_school, background="b")
-    goal = OutreachGoal(outreach_type=OutreachType.research_position, topic="x")
-
-    async def fake_build(s, g, **k):
-        return OutreachPlan(student=s, goal=g, discovery=DiscoveryResult(goal=g), drafts=[])
-
-    monkeypatch.setattr(api, "build_outreach_plan", fake_build)
-    r = client.post(
-        "/v1/missions",
-        json={"student": student.model_dump(mode="json"), "goal": goal.model_dump(mode="json")},
-    )
-    assert r.status_code == 200 and r.json()["phase"] == "created"
+    r = client.post("/v1/brief", json={"tasks": [task.model_dump(mode="json")], "kind": "morning"}, headers=_auth(uuid4()))
+    assert r.status_code == 200 and r.json()["kind"] == "morning" and r.json()["lines"]

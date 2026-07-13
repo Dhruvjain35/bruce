@@ -14,7 +14,7 @@ import uuid
 from typing import Protocol
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from . import schema
@@ -47,6 +47,10 @@ class MissionRepository(Protocol):
     async def get_for_user(self, mission_id: UUID, user_id: UUID) -> MissionRecord | None: ...
     async def update_phase(
         self, mission_id: UUID, user_id: UUID, expected_version: int, phase: str, short_status: str
+    ) -> MissionRecord: ...
+    async def finish(
+        self, mission_id: UUID, user_id: UUID, expected_version: int, *, status: str, phase: str,
+        short_status: str, plan: dict | None = None, error: str | None = None,
     ) -> MissionRecord: ...
     async def list_for_user(self, user_id: UUID) -> list[MissionRecord]: ...
 
@@ -125,6 +129,19 @@ class InMemoryMissionRepository:
         if m.version != expected_version:
             raise ConcurrencyError(f"expected version {expected_version}, have {m.version}")
         rec = m.model_copy(update={"phase": phase, "short_status": short_status, "version": m.version + 1})
+        self.store.missions[mission_id] = rec
+        return rec
+
+    async def finish(self, mission_id, user_id, expected_version, *, status, phase, short_status, plan=None, error=None):
+        m = await self.get_for_user(mission_id, user_id)
+        if m is None:
+            raise NotFoundError(str(mission_id))
+        if m.version != expected_version:
+            raise ConcurrencyError(f"expected version {expected_version}, have {m.version}")
+        rec = m.model_copy(update={
+            "status": status, "phase": phase, "short_status": short_status,
+            "plan": plan, "error": error, "version": m.version + 1,
+        })
         self.store.missions[mission_id] = rec
         return rec
 
@@ -320,6 +337,37 @@ class PostgresMissionRepository:
             raise NotFoundError(str(mission_id))
         raise ConcurrencyError(f"expected version {expected_version}, have {existing.version}")
 
+    async def finish(self, mission_id, user_id, expected_version, *, status, phase, short_status, plan=None, error=None):
+        async with user_session(user_id) as s:
+            res = await s.execute(
+                update(schema.Mission)
+                .where(
+                    schema.Mission.id == mission_id,
+                    schema.Mission.user_id == user_id,
+                    schema.Mission.version == expected_version,
+                )
+                .values(
+                    status=status, phase=phase, short_status=short_status,
+                    plan=plan, error=error, version=schema.Mission.version + 1,
+                )
+            )
+            if res.rowcount == 1:
+                s.add(schema.MissionPhaseEvent(
+                    user_id=user_id, mission_id=mission_id, phase=phase, short_status=short_status
+                ))
+                row = (
+                    await s.execute(
+                        select(schema.Mission).where(
+                            schema.Mission.id == mission_id, schema.Mission.user_id == user_id
+                        )
+                    )
+                ).scalar_one()
+                return _mission_rec(row)
+        existing = await self.get_for_user(mission_id, user_id)
+        if existing is None:
+            raise NotFoundError(str(mission_id))
+        raise ConcurrencyError(f"expected version {expected_version}, have {existing.version}")
+
     async def list_for_user(self, user_id: UUID) -> list[MissionRecord]:
         async with user_session(user_id) as s:
             rows = (
@@ -330,6 +378,7 @@ class PostgresMissionRepository:
 
 class UserRepository(Protocol):
     async def ensure(self, user_id: UUID, *, auth_provider: str = "supabase", email: str | None = None) -> None: ...
+    async def delete(self, user_id: UUID) -> None: ...
 
 
 class PostgresUserRepository:
@@ -343,3 +392,9 @@ class PostgresUserRepository:
             if existing is None:
                 s.add(schema.User(id=user_id, auth_provider=auth_provider, email=email))
                 await s.flush()
+
+    async def delete(self, user_id: UUID) -> None:
+        # Deletes the user's own row (RLS: id = app_current_user()); FK ON DELETE CASCADE
+        # removes all rows they own. This is the account-deletion path.
+        async with user_session(user_id) as s:
+            await s.execute(delete(schema.User).where(schema.User.id == user_id))
