@@ -41,10 +41,18 @@ def test_cuts_filler_openers():
     assert "reaching out to" not in out.lower()
     assert "worth noting" not in out.lower()
     assert "take a moment" not in out.lower()
-    # following words re-capitalized after the cut
-    assert out.startswith("Express my interest.")
+    # infinitive-openers are REPLACED (grammar kept), not deleted into a fragment
+    assert out.startswith("I am writing to express my interest.")
+    assert "I wanted to thank you." in out
+    # clause-leading filler is deleted and the next word re-capitalized
     assert "Your lab is active." in out
-    assert "Thank you." in out
+
+
+def test_infinitive_opener_is_not_stranded():
+    # Regression: deleting "I am reaching out to" used to strand the verb ("Inquire about...").
+    out = humanize_body("I am reaching out to inquire about research opportunities.")
+    assert out == "I am writing to inquire about research opportunities."
+    assert not out.startswith("Inquire")
 
 
 def test_quoted_title_left_byte_for_byte():
@@ -94,7 +102,7 @@ def test_greeting_and_signature_are_never_touched():
     assert out.endswith("Best regards,\nDhruv Meticulous")
     # the middle line was still humanized
     assert "reaching out to" not in out.lower()
-    assert "Use a moment" in out  # filler cut re-capitalizes, then 'utilize'->'use'
+    assert "I am writing to use a moment" in out  # opener replaced (not deleted), 'utilize'->'use'
 
 
 def test_full_assembled_body_matches_drafting_shape():

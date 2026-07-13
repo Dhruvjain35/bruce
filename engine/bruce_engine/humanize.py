@@ -19,6 +19,15 @@ import re
 # "testament"). Word-boundary anchoring keeps inflections from colliding.
 # ---------------------------------------------------------------------------
 _PHRASE_REPLACEMENTS: list[tuple[str, str]] = [
+    # Cliché openers that END IN an infinitive ("...to <verb>"): REPLACE to keep grammar,
+    # never delete, or the following verb is stranded ("Inquire about..."). Longer first.
+    ("i am writing to reach out to", "i am writing to"),
+    ("i wanted to reach out to", "i wanted to"),
+    ("i just wanted to take a moment to", "i just wanted to"),
+    ("i wanted to take a moment to", "i wanted to"),
+    ("i would like to take a moment to", "i would like to"),
+    ("i am reaching out to", "i am writing to"),
+    ("i'm reaching out to", "i'm writing to"),
     ("delve into", "look at"),
     ("delves into", "looks at"),
     ("delved into", "looked at"),
@@ -60,16 +69,11 @@ _WORD_REPLACEMENTS: list[tuple[str, str]] = [
 
 # Filler openers to cut wholesale. When one leads a sentence the following word is
 # re-capitalized; mid-sentence occurrences are simply removed.
+# Only fillers that lead a FULL CLAUSE are safe to delete + re-capitalize. Openers ending in
+# an infinitive are grammatical REPLACEMENTS in _PHRASE_REPLACEMENTS above, not deletions.
 _FILLERS: list[str] = [
-    "i am reaching out to",
-    "i'm reaching out to",
-    "i am writing to reach out to",
-    "i wanted to reach out to",
     "it is worth noting that",
     "it's worth noting that",
-    "i wanted to take a moment to",
-    "i just wanted to take a moment to",
-    "i would like to take a moment to",
 ]
 
 _GREETING_LINE_RE = re.compile(

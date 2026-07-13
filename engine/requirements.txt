@@ -6,6 +6,8 @@ pydantic-ai-slim[openai]>=2.9   # agent framework: validated structured output (
 httpx>=0.27            # async HTTP for scholarly APIs (OpenAlex, ROR) + PDF fetch
 pdfplumber>=0.11       # extract corresponding-author emails from open-access PDFs
 python-dotenv>=1.0     # load API keys from .env (never committed) at the entrypoint
+fastapi>=0.115         # API service exposing the engine to clients
+uvicorn[standard]>=0.30  # ASGI server for local/prod serving
 
 # dev
 pytest>=8.0
