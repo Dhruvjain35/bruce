@@ -20,6 +20,7 @@ separate, out-of-band step and is never guessed.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from datetime import datetime, timezone
 
 import httpx
@@ -219,7 +220,7 @@ async def enrich_candidate(
     for w in list(deduped.values())[:4]:
         title = (w.get("display_name") or "").strip()
         doi = w.get("doi")
-        oa_url = (w.get("open_access") or {}).get("oa_url") or w.get("id")
+        oa_pdf = (w.get("open_access") or {}).get("oa_url")  # open-access PDF (for email extraction)
         venue = ((w.get("primary_location") or {}).get("source") or {}).get("display_name")
         abstract = reconstruct_abstract(w.get("abstract_inverted_index"))
         author_names = [
@@ -235,7 +236,8 @@ async def enrich_candidate(
                 venue=venue,
                 doi=doi,
                 url=doi or w.get("id"),
-                abstract_snippet=abstract[:400] if abstract else None,
+                pdf_url=oa_pdf,
+                abstract_snippet=abstract if abstract else None,  # full abstract — grounding rigor
                 source="openalex",
             )
         )
@@ -250,24 +252,73 @@ async def enrich_candidate(
             )
         )
 
-    last_known = author.get("last_known_institutions") or []
-    institution = (last_known[0].get("display_name") if last_known else None) or seed.get(
-        "institution"
-    ) or "Unknown"
+    # --- Affiliation: modal current affiliation from THIS author's own recent works. ---
+    # OpenAlex last_known_institutions is noisy (it mislabels e.g. Huo); the institution
+    # attributed to the author across their recent papers is a better "current" signal.
+    aff_counter: Counter[str] = Counter()
+    aff_ror: dict[str, str | None] = {}
+    for w in recent:
+        for a in w.get("authorships") or []:
+            if (a.get("author") or {}).get("id") == seed["author_id"]:
+                for inst in a.get("institutions") or []:
+                    nm = inst.get("display_name")
+                    if nm:
+                        aff_counter[nm] += 1
+                        aff_ror.setdefault(nm, inst.get("ror"))
+    if aff_counter:
+        institution = aff_counter.most_common(1)[0][0]
+        institution_ror = aff_ror.get(institution)
+    else:
+        last_known = author.get("last_known_institutions") or []
+        institution = (last_known[0].get("display_name") if last_known else None) or seed.get(
+            "institution"
+        ) or "Unknown"
+        institution_ror = last_known[0].get("ror") if last_known else None
+
     stats = author.get("summary_stats") or {}
     h_index = stats.get("h_index")
+    works_count = author.get("works_count")
     count = seed["count"]
+
+    # --- Seniority + fit-gating (heuristic; h-index is absolute here, not field-relative). ---
+    if h_index is None:
+        seniority = "unknown"
+    elif h_index >= 60:
+        seniority = "titan"
+    elif h_index >= 25:
+        seniority = "senior"
+    elif h_index >= 10:
+        seniority = "mid"
+    else:
+        seniority = "early_career"
+
+    depth = min(count / 5, 1.0)
+    seniority_factor = {"titan": 0.30, "senior": 0.65, "mid": 1.0, "early_career": 1.0, "unknown": 0.80}[seniority]
+    fit_score = round(0.55 * depth + 0.45 * seniority_factor, 2)
+    recommend_send = fit_score >= 0.45 and seniority != "titan"
+
+    fit_flags: list[str] = []
+    if seniority == "titan":
+        fit_flags.append(
+            "Very high-profile PI — likely little bandwidth for a beginner; consider their "
+            "postdocs/PhD students instead."
+        )
+    if seniority == "early_career":
+        fit_flags.append("Early-career researcher — often more bandwidth to mentor a student.")
+    if count < 2:
+        fit_flags.append("Only one recent paper on this topic — confirm it's a current focus.")
 
     uncertainties: list[str] = []
     if institution == "Unknown":
         uncertainties.append("Current affiliation not confirmed — verify before contacting.")
-    uncertainties.append("Email not resolved — scholarly APIs do not provide emails (never guessed).")
+    uncertainties.append("Email not resolved — scholarly APIs don't provide emails (never guessed).")
 
     return ProfessorCandidate(
         name=author.get("display_name") or seed["name"] or "(unknown)",
         title=None,
         department=None,
         institution=institution,
+        institution_ror=institution_ror,
         profile_url=author.get("id"),
         research_summary=(
             f"Active on {topic_display}: {count} recent paper(s) on this topic"
@@ -275,8 +326,13 @@ async def enrich_candidate(
             + "."
         ),
         recent_work=papers,
-        fit_rationale=f"{count} recent paper(s) on {topic_display} (2024+).",
-        fit_score=min(count / 3, 1.0),
+        fit_rationale=f"{count} recent paper(s) on {topic_display} (2024+); seniority={seniority}.",
+        fit_score=fit_score,
+        h_index=h_index,
+        works_count=works_count,
+        seniority=seniority,
+        recommend_send=recommend_send,
+        fit_flags=fit_flags,
         contact_email=None,
         email_source=None,
         email_verified=False,

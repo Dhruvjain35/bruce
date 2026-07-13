@@ -1,26 +1,43 @@
-"""Engine orchestration: the deterministic spine.
+"""Engine orchestration: the deterministic spine of one outreach mission.
 
-    discover  ->  verify  ->  draft
+    discover  ->  (per candidate) resolve email  +  grounded draft  ->  verify
 
-The LLM proposes (discovery ranking, drafting); grounding + verification gate what reaches
-the student. This ordering is the whole safety story: nothing is drafted about a professor
-whose existence and cited work haven't been confirmed.
+Discovery finds real professors + grounded papers. For each candidate we resolve an email
+(out of band, never guessed), draft a grounded email, and run the fails-closed verification
+gate. Nothing is sent — the student reviews, adds their own question, and sends.
 """
 
 from __future__ import annotations
 
-from . import discovery, drafting, verify
+from . import discovery, drafting, email_resolver, verify
 from .models import OutreachGoal, OutreachPlan, StudentProfile
 
 
-async def build_outreach_plan(student: StudentProfile, goal: OutreachGoal) -> OutreachPlan:
-    # 1. Grounded discovery of real professors matching the goal.
-    result = await discovery.discover_professors(student, goal)
+async def build_outreach_plan(
+    student: StudentProfile,
+    goal: OutreachGoal,
+    *,
+    limit: int = 8,
+    resolve_emails: bool = True,
+    verify_drafts: bool = True,
+) -> OutreachPlan:
+    result = await discovery.discover_professors(student, goal, limit=limit)
 
-    # 2. Verify every candidate + their cited work actually exist (anti-hallucination gate).
-    result = await verify.verify_candidates(result)
+    drafts = []
+    for candidate in result.candidates:
+        if resolve_emails:
+            await email_resolver.resolve_email(candidate)  # mutates candidate; leaves None if not grounded
 
-    # 3. Draft one genuinely personalized email per verified candidate. Never sent here.
-    drafts = await drafting.draft_all(student, goal, result.candidates)
+        draft = await drafting.draft_one(student, candidate)
+
+        if verify_drafts and draft.body:
+            verdict = await verify.verify_draft(draft, candidate)
+            if verdict.ready:
+                draft.flags.append("Verification passed: claims grounded in the cited paper.")
+            else:
+                detail = "; ".join(verdict.problems) if verdict.problems else verdict.entailment
+                draft.flags.append(f"BLOCKED by verification ({verdict.entailment}): {detail}")
+
+        drafts.append(draft)
 
     return OutreachPlan(student=student, goal=goal, discovery=result, drafts=drafts)

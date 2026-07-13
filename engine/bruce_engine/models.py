@@ -77,6 +77,7 @@ class PaperRef(BaseModel):
     venue: str | None = None
     doi: str | None = None
     url: HttpUrl | None = None
+    pdf_url: HttpUrl | None = Field(default=None, description="open-access PDF URL, if any (for email extraction)")
     abstract_snippet: str | None = None
     source: str = Field(description="which API/page this was retrieved from")
 
@@ -114,11 +115,17 @@ class ProfessorCandidate(BaseModel):
     title: str | None = None
     department: str | None = None
     institution: str
+    institution_ror: str | None = Field(default=None, description="ROR id (for email-domain validation)")
     profile_url: HttpUrl | None = None
     research_summary: str = Field(description="grounded summary of their work, from evidence")
     recent_work: list[PaperRef] = Field(default_factory=list)
     fit_rationale: str = Field(description="why this professor fits the student, tied to evidence")
     fit_score: float = Field(ge=0.0, le=1.0)
+    h_index: int | None = None
+    works_count: int | None = None
+    seniority: str | None = Field(default=None, description="early_career | mid | senior | titan | unknown")
+    recommend_send: bool = True
+    fit_flags: list[str] = Field(default_factory=list, description="human-readable fit notes (e.g. titan bandwidth warning)")
     contact_email: str | None = None
     email_source: str | None = Field(
         default=None, description="where the email was found — NEVER guessed; None if not found"
