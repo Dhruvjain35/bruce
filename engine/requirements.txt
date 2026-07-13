@@ -2,7 +2,7 @@
 # Loose lower bounds for now; pin exact versions from the resolved lockfile after first install.
 
 pydantic>=2.7          # typed data contracts — the grounding backbone
-pydantic-ai>=0.0.14    # agent framework: structured outputs, typed tools, provider-neutral (spec's chosen framework — under evaluation)
+pydantic-ai-slim[openai]>=2.9   # agent framework: validated structured output (PromptedOutput), provider-neutral
 anthropic>=0.40        # LLM provider for drafting (behind a provider-neutral interface)
 httpx>=0.27            # async HTTP for grounded academic-data APIs (OpenAlex, etc.)
 python-dotenv>=1.0     # load ANTHROPIC_API_KEY etc. from .env (never committed)
