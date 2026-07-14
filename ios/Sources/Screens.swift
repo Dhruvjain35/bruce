@@ -69,13 +69,21 @@ struct GhostButton: View {
 // MARK: - Mission detail
 
 struct MissionDetailView: View {
-    let m: Mission
+    let mission: Mission
     @State private var showApproval = false
+    @State private var goPerson = false
     @EnvironmentObject private var app: AppState
+    @Environment(BruceStore.self) private var store
+
+    /// Live view of the mission — reflects store mutations (e.g. after approval).
+    private var m: Mission { store.mission(mission.id) ?? mission }
+
+    private var reviewable: Bool { m.draft != nil && m.status == .needsYou }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: 22) {
+                // A. Header + current state
                 VStack(alignment: .leading, spacing: 10) {
                     Text(m.title).font(.system(size: 28, weight: .bold)).foregroundStyle(Theme.text)
                     Text(m.stateSentence).font(.system(size: 17)).foregroundStyle(Theme.textSecondary)
@@ -83,27 +91,24 @@ struct MissionDetailView: View {
                     Text("Updated \(m.updated)").font(.caption).foregroundStyle(Theme.textTertiary)
                 }
 
-                // NOW — the dominant element.
-                VStack(alignment: .leading, spacing: 8) {
-                    SectionLabel(text: "Now")
-                    Text(m.now).font(.system(size: 22, weight: .bold)).foregroundStyle(Theme.text)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if let c = m.count {
-                        Text("\(c.done) of \(c.total) \(c.noun) collected")
-                            .font(.subheadline.weight(.medium)).foregroundStyle(Theme.silver)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(18)
-                .glass(18)
+                // B. Current action (dominant)
+                ActionModule(
+                    now: m.now, count: m.count,
+                    primaryTitle: reviewable ? "Review email" : (m.status == .failed ? "Retry the upload" : nil),
+                    primaryIcon: reviewable ? "envelope" : "arrow.clockwise",
+                    primaryAction: { if reviewable { showApproval = true } }
+                )
 
-                if !m.next.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        SectionLabel(text: "Next")
-                        Text(m.next).font(.system(size: 16)).foregroundStyle(Theme.textSecondary)
-                    }
-                }
+                // C. Mission contents (varies by mission type)
+                if m.status == .failed { RecoveryModule() }
+                if let p = m.person { PersonModule(p: p) }
+                if let d = m.draft { DraftEmailModule(draft: d) { showApproval = true } }
+                if !m.documents.isEmpty { ChecklistModule(count: m.count, items: m.documents) }
+                if !m.afterApproval.isEmpty { AfterModule(steps: m.afterApproval, followUp: m.followUp) {} }
+                if !m.evidence.isEmpty { EvidenceModule(evidence: m.evidence) }
+                if !m.timeline.isEmpty { TimelineModule(events: m.timeline) }
 
+                // Completed (dimmed, low in the hierarchy)
                 VStack(alignment: .leading, spacing: 10) {
                     SectionLabel(text: "Completed")
                     ForEach(m.completed, id: \.self) { step in
@@ -114,13 +119,7 @@ struct MissionDetailView: View {
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 12) {
-                    SectionLabel(text: "Grounded in")
-                    VStack(spacing: 4) { ForEach(m.evidence) { EvidenceRow(e: $0) } }
-                        .padding(12).glass(16)
-                }
-
-                Color.clear.frame(height: (m.draft != nil || m.status == .failed) ? 96 : 40)
+                Color.clear.frame(height: 30)
             }
             .padding(.horizontal, 20)
             .padding(.top, 8)
@@ -132,29 +131,22 @@ struct MissionDetailView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button { } label: { Label("Pause mission", systemImage: "pause.circle") }
+                    Button { } label: { Label("Notification preferences", systemImage: "bell") }
+                    Button { } label: { Label("Export receipt", systemImage: "square.and.arrow.up") }
                     Button(role: .destructive) { } label: { Label("Cancel mission", systemImage: "xmark.circle") }
                 } label: {
                     Image(systemName: "ellipsis").font(.system(size: 16, weight: .bold)).foregroundStyle(Theme.text)
                 }
             }
         }
-        .safeAreaInset(edge: .bottom) {
-            if m.draft != nil {
-                SilverButton(title: "Review email", icon: "hand.raised.fill") { showApproval = true }
-                    .padding(.horizontal, 20).padding(.bottom, 10)
-                    .background(.ultraThinMaterial)
-            } else if m.status == .failed {
-                SilverButton(title: "Retry the upload", icon: "arrow.clockwise") {}
-                    .padding(.horizontal, 20).padding(.bottom, 10)
-                    .background(.ultraThinMaterial)
-            }
-        }
         .sheet(isPresented: $showApproval) {
-            if let d = m.draft { ApprovalSheet(draft: d) }
+            if let d = m.draft { ApprovalSheet(draft: d).environment(store) }
         }
+        .navigationDestination(isPresented: $goPerson) { if let p = m.person { PersonView(p: p) } }
         .onAppear {
             app.hideTabBar = true
-            if ProcessInfo.processInfo.environment["BRUCE_PRESENT"] == "approval" { showApproval = true }
+            if Demo.present == "approval" { showApproval = true }
+            if Demo.present == "person" { goPerson = true }
         }
         .onDisappear { app.hideTabBar = false }
     }
@@ -165,6 +157,7 @@ struct MissionDetailView: View {
 struct ApprovalSheet: View {
     let draft: DraftEmail
     @Environment(\.dismiss) private var dismiss
+    @Environment(BruceStore.self) private var store
     @State private var sent = false
 
     var body: some View {
@@ -228,6 +221,7 @@ struct ApprovalSheet: View {
             VStack(spacing: 10) {
                 SilverButton(title: "Approve & send", icon: "paperplane.fill") {
                     Haptics.success()
+                    store.approveEmail()
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { sent = true }
                 }
                 HStack(spacing: 10) {
@@ -415,15 +409,16 @@ struct HandoffSheet: View {
 // MARK: - Missions tab
 
 struct MissionsView: View {
+    @Environment(BruceStore.self) private var store
     @State private var filter = 0
     private let filters = ["All", "Needs you", "Working", "Done"]
 
     private var shown: [Mission] {
         switch filter {
-        case 1: return Mock.needsYou
-        case 2: return Mock.working
+        case 1: return store.needsYou
+        case 2: return store.working
         case 3: return []
-        default: return Mock.missions
+        default: return store.missions
         }
     }
 
@@ -456,7 +451,7 @@ struct MissionsView: View {
                     } else {
                         VStack(spacing: 12) {
                             ForEach(shown) { m in
-                                NavigationLink { MissionDetailView(m: m) } label: { MissionListRow(m: m) }
+                                NavigationLink { MissionDetailView(mission: m) } label: { MissionListRow(m: m) }
                                     .buttonStyle(.plain)
                             }
                         }
@@ -475,6 +470,7 @@ struct MissionsView: View {
 
 struct CalendarView: View {
     var body: some View {
+      NavigationStack {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -486,28 +482,31 @@ struct CalendarView: View {
 
                 VStack(spacing: 12) {
                     ForEach(Mock.calendar) { c in
-                        HStack(spacing: 14) {
-                            VStack(spacing: 2) {
-                                Text(c.mon).font(.caption2.weight(.bold)).foregroundStyle(Theme.textSecondary)
-                                Text(c.num).font(.system(size: 20, weight: .bold, design: .rounded)).foregroundStyle(Theme.silver)
-                            }
-                            .frame(width: 52).padding(.vertical, 8)
-                            .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(c.title).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text).lineLimit(1)
-                                Text("\(c.time) · \(c.source)").font(.caption).foregroundStyle(Theme.textSecondary).lineLimit(1)
-                                HStack(spacing: 5) {
-                                    Image(systemName: c.state.symbol).font(.system(size: 11, weight: .bold))
-                                    Text(c.state.text).font(.caption2.weight(.semibold))
+                        NavigationLink { DateDetailView(c: c) } label: {
+                            HStack(spacing: 14) {
+                                VStack(spacing: 2) {
+                                    Text(c.mon).font(.caption2.weight(.bold)).foregroundStyle(Theme.textSecondary)
+                                    Text(c.num).font(.system(size: 20, weight: .bold, design: .rounded)).foregroundStyle(Theme.silver)
                                 }
-                                .foregroundStyle(c.state.color)
-                                .padding(.top, 1)
+                                .frame(width: 52).padding(.vertical, 8)
+                                .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(c.title).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text).lineLimit(1)
+                                    Text("\(c.time) · \(c.source)").font(.caption).foregroundStyle(Theme.textSecondary).lineLimit(1)
+                                    HStack(spacing: 5) {
+                                        Image(systemName: c.state.symbol).font(.system(size: 11, weight: .bold))
+                                        Text(c.state.text).font(.caption2.weight(.semibold))
+                                    }
+                                    .foregroundStyle(c.state.color)
+                                    .padding(.top, 1)
+                                }
+                                Spacer(minLength: 4)
+                                Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
                             }
-                            Spacer(minLength: 4)
-                        }
-                        .padding(16)
-                        .glass(18)
+                            .padding(16)
+                            .glass(18)
+                        }.buttonStyle(PressStyle())
                     }
                 }
                 Color.clear.frame(height: 96)
@@ -515,66 +514,71 @@ struct CalendarView: View {
             .padding(.horizontal, 20)
         }
         .scrollIndicators(.hidden)
+        .background(Theme.Backdrop())
+      }
     }
 }
 
 // MARK: - Decisions tab
 
 struct DecisionsView: View {
+    @Environment(BruceStore.self) private var store
+    @State private var goDecision = false
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text("Decisions").font(.system(size: 30, weight: .bold)).foregroundStyle(Theme.text)
-                        Text("\(Mock.decisions.count)").font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.amber)
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text("Decisions").font(.system(size: 30, weight: .bold)).foregroundStyle(Theme.text)
+                            if !store.decisions.isEmpty {
+                                Text("\(store.decisions.count)").font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.amber)
+                            }
+                        }
+                        Text("The only things Bruce needs you for. Everything else it handles.")
+                            .font(.subheadline).foregroundStyle(Theme.textSecondary)
                     }
-                    Text("The only things Bruce needs you for. Everything else it handles.")
-                        .font(.subheadline).foregroundStyle(Theme.textSecondary)
-                }
-                .padding(.top, 6)
+                    .padding(.top, 6)
 
-                VStack(spacing: 12) {
-                    ForEach(Mock.decisions) { d in DecisionRow(d: d) }
+                    if store.decisions.isEmpty {
+                        EmptyStateView(icon: "checkmark.seal", title: "All clear",
+                                       message: "Nothing needs you right now. Bruce is handling the rest.")
+                    } else {
+                        VStack(spacing: 12) {
+                            ForEach(store.decisions) { d in
+                                NavigationLink { DecisionDetailView(d: d) } label: { DecisionRow(d: d) }
+                                    .buttonStyle(PressStyle())
+                            }
+                        }
+                    }
+                    Color.clear.frame(height: 96)
                 }
-                Color.clear.frame(height: 96)
+                .padding(.horizontal, 20)
             }
-            .padding(.horizontal, 20)
+            .scrollIndicators(.hidden)
+            .background(Theme.Backdrop())
+            .navigationDestination(isPresented: $goDecision) {
+                if let d = store.decisions.first { DecisionDetailView(d: d) }
+            }
+            .onAppear { if Demo.present == "decisiondetail" { goDecision = true } }
         }
-        .scrollIndicators(.hidden)
     }
 }
 
 struct DecisionRow: View {
     let d: Decision
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(d.title).font(.system(size: 17, weight: .semibold)).foregroundStyle(Theme.text)
-                    Text(d.source).font(.caption).foregroundStyle(Theme.textTertiary)
-                }
-                Spacer()
-                Menu {
-                    Button { } label: { Label("Remind me later", systemImage: "clock") }
-                    Button(role: .destructive) { } label: { Label("Dismiss", systemImage: "xmark") }
-                } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 15, weight: .bold)).foregroundStyle(Theme.textTertiary)
-                        .frame(width: 30, height: 30)
-                }
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(d.title).font(.system(size: 17, weight: .semibold)).foregroundStyle(Theme.text)
+                Text(d.source).font(.caption).foregroundStyle(Theme.textTertiary)
+                Text(d.context).font(.subheadline).foregroundStyle(Theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(d.cta).font(.subheadline.weight(.semibold)).foregroundStyle(Theme.amber)
+                    .padding(.top, 2)
             }
-            Text(d.context).font(.subheadline).foregroundStyle(Theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let detail = d.detail {
-                Text(detail).font(.caption).foregroundStyle(Theme.textTertiary)
-                    .padding(.vertical, 8).padding(.horizontal, 12).frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
-            Button { Haptics.tap() } label: {
-                Text(d.cta).font(.system(size: 15, weight: .bold)).foregroundStyle(Theme.bg)
-                    .padding(.vertical, 11).padding(.horizontal, 22)
-                    .background(Theme.silver, in: Capsule())
-            }.buttonStyle(PressStyle())
+            Spacer(minLength: 4)
+            Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
         }
         .padding(16)
         .glass(18)
@@ -584,10 +588,13 @@ struct DecisionRow: View {
 // MARK: - You / settings tab
 
 struct YouView: View {
+    @Environment(BruceStore.self) private var store
     @State private var showDelete = Demo.present == "delete"
+    @State private var goAutomation = false
     var body: some View {
+      NavigationStack {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 22) {
                 HStack(spacing: 14) {
                     Text("D").font(.system(size: 26, weight: .bold, design: .rounded)).foregroundStyle(Theme.bg)
                         .frame(width: 64, height: 64).background(Theme.silver, in: Circle())
@@ -599,15 +606,43 @@ struct YouView: View {
                 }
                 .padding(.top, 6)
 
-                settingsGroup("Your data", [
-                    ("lock.fill", "Privacy & what Bruce stores", true),
-                    ("clock.arrow.circlepath", "Auto-delete forwarded content", true),
-                    ("square.and.arrow.up", "Export everything", false),
+                // Automation — surfaced prominently, shows current mode.
+                NavigationLink { AutomationView() } label: {
+                    HStack(spacing: 13) {
+                        Image(systemName: "wand.and.stars").font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.silver)
+                            .frame(width: 42, height: 42)
+                            .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Automation").font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                            Text(store.autoPaused ? "Paused" : store.automationMode.rawValue)
+                                .font(.subheadline).foregroundStyle(store.autoPaused ? Theme.amber : Theme.textSecondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
+                    }
+                    .padding(14).glass(18)
+                }.buttonStyle(PressStyle())
+
+                settingsGroup("Connections", [
+                    ("calendar", "Calendar"),
+                    ("envelope.fill", "Email"),
+                    ("graduationcap.fill", "Classroom / LMS"),
+                    ("arrowshape.turn.up.right.fill", "Forwarding address"),
                 ])
                 settingsGroup("Bruce", [
-                    ("bell.fill", "Notifications", true),
-                    ("envelope.fill", "Connected accounts", true),
-                    ("questionmark.circle.fill", "Help", false),
+                    ("bell.fill", "Notifications"),
+                    ("list.bullet.rectangle", "Personal protocols"),
+                    ("text.bubble.fill", "Communication style"),
+                ])
+                settingsGroup("Privacy", [
+                    ("lock.fill", "What Bruce stores"),
+                    ("clock.arrow.circlepath", "Auto-delete policy"),
+                    ("square.and.arrow.up", "Export data"),
+                ])
+                settingsGroup("Support", [
+                    ("questionmark.circle.fill", "Help"),
+                    ("exclamationmark.bubble", "Report a problem"),
+                    ("info.circle", "About Bruce"),
                 ])
 
                 Button { showDelete = true } label: {
@@ -616,41 +651,44 @@ struct YouView: View {
                         Text("Delete my account & all data").font(.system(size: 16, weight: .semibold))
                         Spacer()
                     }
-                    .foregroundStyle(Color(hex: 0xFF6B6B))
+                    .foregroundStyle(Theme.red)
                     .padding(16)
-                    .background(Color(hex: 0xFF6B6B).opacity(0.08), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color(hex: 0xFF6B6B).opacity(0.2)))
+                    .background(Theme.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Theme.red.opacity(0.2)))
                 }.buttonStyle(.plain)
 
                 Text("Bruce keeps forwarded content only as long as a mission needs it, then deletes it.")
                     .font(.caption).foregroundStyle(Theme.textTertiary)
                 Color.clear.frame(height: 96)
             }
-            .padding(.horizontal, 18)
+            .padding(.horizontal, 20)
         }
         .scrollIndicators(.hidden)
+        .background(Theme.Backdrop())
+        .navigationDestination(isPresented: $goAutomation) { AutomationView() }
         .sheet(isPresented: $showDelete) { DeleteAccountSheet() }
+        .onAppear { if Demo.present == "automation" { goAutomation = true } }
+      }
     }
 
-    private func settingsGroup(_ title: String, _ rows: [(String, String, Bool)]) -> some View {
+    private func settingsGroup(_ title: String, _ rows: [(String, String)]) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(title).font(.system(size: 19, weight: .bold)).foregroundStyle(Theme.text)
-            GlassCard(padding: 6) {
-                VStack(spacing: 0) {
-                    ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
-                        HStack(spacing: 13) {
-                            Image(systemName: r.0).font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.silver)
-                                .frame(width: 34, height: 34)
-                                .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            Text(r.1).font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.text)
-                            Spacer()
-                            Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(Theme.textTertiary)
-                        }
-                        .padding(.horizontal, 10).padding(.vertical, 12)
-                        if i < rows.count - 1 { Divider().overlay(Theme.stroke).padding(.leading, 57) }
+            SectionLabel(text: title)
+            VStack(spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
+                    HStack(spacing: 13) {
+                        Image(systemName: r.0).font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.silver)
+                            .frame(width: 34, height: 34)
+                            .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        Text(r.1).font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.text)
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(Theme.textTertiary)
                     }
+                    .padding(.horizontal, 10).padding(.vertical, 13)
+                    if i < rows.count - 1 { Divider().overlay(Theme.stroke).padding(.leading, 57) }
                 }
             }
+            .padding(6).glass(18)
         }
     }
 }
