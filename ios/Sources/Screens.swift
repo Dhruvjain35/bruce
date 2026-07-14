@@ -591,6 +591,7 @@ struct YouView: View {
     @Environment(BruceStore.self) private var store
     @State private var showDelete = Demo.present == "delete"
     @State private var goAutomation = false
+    @State private var goIntegrations = false
     var body: some View {
       NavigationStack {
         ScrollView {
@@ -607,21 +608,13 @@ struct YouView: View {
                 .padding(.top, 6)
 
                 // Automation — surfaced prominently, shows current mode.
-                NavigationLink { AutomationView() } label: {
-                    HStack(spacing: 13) {
-                        Image(systemName: "wand.and.stars").font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.silver)
-                            .frame(width: 42, height: 42)
-                            .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Automation").font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
-                            Text(store.autoPaused ? "Paused" : store.automationMode.rawValue)
-                                .font(.subheadline).foregroundStyle(store.autoPaused ? Theme.amber : Theme.textSecondary)
-                        }
-                        Spacer()
-                        Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
-                    }
-                    .padding(14).glass(18)
-                }.buttonStyle(PressStyle())
+                bigRow(icon: "wand.and.stars", title: "Automation",
+                       sub: store.autoPaused ? "Paused" : store.automationMode.rawValue,
+                       subAmber: store.autoPaused) { AutomationView() }
+
+                // Integrations — surfaced prominently.
+                bigRow(icon: "square.grid.2x2.fill", title: "Integrations",
+                       sub: "Calendar, email, school systems, files") { IntegrationsView() }
 
                 settingsGroup("Connections", [
                     ("calendar", "Calendar"),
@@ -666,9 +659,31 @@ struct YouView: View {
         .scrollIndicators(.hidden)
         .background(Theme.Backdrop())
         .navigationDestination(isPresented: $goAutomation) { AutomationView() }
+        .navigationDestination(isPresented: $goIntegrations) { IntegrationsView() }
         .sheet(isPresented: $showDelete) { DeleteAccountSheet() }
-        .onAppear { if Demo.present == "automation" { goAutomation = true } }
+        .onAppear {
+            if Demo.present == "automation" { goAutomation = true }
+            if Demo.present == "integrations" { goIntegrations = true }
+        }
       }
+    }
+
+    private func bigRow<D: View>(icon: String, title: String, sub: String, subAmber: Bool = false,
+                                 @ViewBuilder destination: @escaping () -> D) -> some View {
+        NavigationLink { destination() } label: {
+            HStack(spacing: 13) {
+                Image(systemName: icon).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.silver)
+                    .frame(width: 42, height: 42)
+                    .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                    Text(sub).font(.subheadline).foregroundStyle(subAmber ? Theme.amber : Theme.textSecondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
+            }
+            .padding(14).glass(18)
+        }.buttonStyle(PressStyle())
     }
 
     private func settingsGroup(_ title: String, _ rows: [(String, String)]) -> some View {

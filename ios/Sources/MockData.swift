@@ -47,23 +47,71 @@ struct DraftEmail {
     let grounded: [String]
 }
 
+// MARK: - Canonical objects referenced across the app
+
+struct Person: Identifiable {
+    let id = UUID()
+    let name: String
+    let role: String
+    let institution: String
+    let relevance: String        // "Strong match"
+    let topics: [String]
+    let facultyURL: String
+    let verified: Bool
+    let paper: EvidenceSource
+    let alternates: [String]
+}
+
+struct DocItem: Identifiable {
+    let id = UUID()
+    let name: String
+    let done: Bool
+    let note: String             // "Requested" / "Drafted" / "Needs you"
+}
+
+struct TimelineEvent: Identifiable {
+    let id = UUID()
+    let time: String
+    let text: String
+}
+
+struct FollowUp {
+    let waitDays: Int
+    let maxFollowUps: Int
+    let stopCondition: String
+    let enabled: Bool
+}
+
+struct Receipt {
+    let to: String
+    let deliveredAt: String
+    let note: String
+}
+
 // MARK: - Mission (phase-based, no arbitrary percentages)
 
 struct Mission: Identifiable {
     let id = UUID()
     let title: String
-    let status: Status
-    let statusText: String    // "Needs your approval" · "Checking your submitted form…"
-    let homeLine: String      // contextual line shown in Home sections
-    let listLine: String      // one-liner shown in the Missions list
-    let stateSentence: String // one sentence at the top of the detail
+    var status: Status
+    var statusText: String     // mutated live as the mission progresses
+    var homeLine: String
+    let listLine: String
+    let stateSentence: String
     let completed: [String]
-    let now: String
-    let next: String          // "" when there's no concrete next step yet
+    var now: String
+    let next: String           // "" when there's no concrete next step yet
     let evidence: [EvidenceSource]
     let draft: DraftEmail?
-    let count: MissionCount?  // real numeric progress ONLY (e.g. 3 of 5 documents)
-    let updated: String       // "12s ago"
+    let count: MissionCount?   // real numeric progress ONLY (e.g. 3 of 5 documents)
+    let updated: String
+    // Workspace modules (defaulted so existing call sites are unaffected):
+    var person: Person? = nil
+    var documents: [DocItem] = []
+    var afterApproval: [String] = []
+    var timeline: [TimelineEvent] = []
+    var followUp: FollowUp? = nil
+    var receipt: Receipt? = nil
 }
 
 struct MissionCount { let done: Int; let total: Int; let noun: String }
@@ -122,6 +170,24 @@ struct ComingUp: Identifiable {
     let when: String
 }
 
+// MARK: - Automation policy
+
+enum AutomationMode: String, CaseIterable, Identifiable {
+    case reviewAll = "Review everything"
+    case smartAuto = "Smart Auto"
+    case custom = "Custom"
+    var id: String { rawValue }
+    var blurb: String {
+        switch self {
+        case .reviewAll: return "Bruce prepares work and waits for your approval."
+        case .smartAuto: return "Bruce handles safe, reversible actions. It asks before messages, uploads, submissions, sharing data, or uncertain decisions."
+        case .custom: return "Choose rules for each action type."
+        }
+    }
+}
+
+struct AutoAction: Identifiable { let id = UUID(); let title: String; let when: String }
+
 /// Dev-only hooks so each screen/state can be screenshotted deterministically via SIMCTL_CHILD_*.
 enum Demo {
     static let env = ProcessInfo.processInfo.environment
@@ -163,7 +229,25 @@ enum Mock {
                 ]
             ),
             count: nil,
-            updated: "12s ago"
+            updated: "12s ago",
+            person: Person(
+                name: "Pengfei Huo", role: "Associate Professor of Chemistry",
+                institution: "University of Rochester", relevance: "Strong match",
+                topics: ["Polariton chemistry", "Vibrational strong coupling", "Cavity QED"],
+                facultyURL: "chem.rochester.edu/people/faculty/huo", verified: true,
+                paper: EvidenceSource(icon: "doc.text.fill", kind: "Paper",
+                                      title: "Cavity-modified reactivity in polaritonic chemistry",
+                                      meta: "OpenAlex · Huo et al. · 2025"),
+                alternates: ["A. Mandal — Penn State", "J. Yuen-Zhou — UC San Diego"]
+            ),
+            afterApproval: ["Send the email", "Confirm delivery", "Watch for a reply for 5 days"],
+            timeline: [
+                TimelineEvent(time: "9:03 PM", text: "Mission started"),
+                TimelineEvent(time: "9:04 PM", text: "Faculty match found"),
+                TimelineEvent(time: "9:04 PM", text: "Paper verified on OpenAlex"),
+                TimelineEvent(time: "9:05 PM", text: "Draft prepared"),
+            ],
+            followUp: FollowUp(waitDays: 5, maxFollowUps: 1, stopCondition: "Stop after any reply", enabled: true)
         ),
         Mission(
             title: "Science Fair registration",
@@ -197,7 +281,20 @@ enum Mock {
             ],
             draft: nil,
             count: MissionCount(done: 3, total: 5, noun: "documents"),
-            updated: "1h ago"
+            updated: "1h ago",
+            documents: [
+                DocItem(name: "Personal essay", done: true, note: "Drafted"),
+                DocItem(name: "Activity résumé", done: true, note: "Drafted"),
+                DocItem(name: "Transcript", done: true, note: "Requested"),
+                DocItem(name: "Recommendation letter", done: false, note: "Needs you — pick a teacher"),
+                DocItem(name: "Parent signature", done: false, note: "Needs you"),
+            ],
+            afterApproval: ["Compare each item against the rubric", "Assemble the package", "Ask before submitting"],
+            timeline: [
+                TimelineEvent(time: "Jul 9", text: "Requirements read"),
+                TimelineEvent(time: "Jul 10", text: "Essays drafted"),
+                TimelineEvent(time: "Jul 11", text: "Transcript requested"),
+            ]
         ),
         Mission(
             title: "Volunteer hours log",
@@ -271,7 +368,61 @@ enum Mock {
         "Important school email",
     ]
 
+    // Automation
+    static let canAuto = [
+        "Add conflict-free deadlines",
+        "Create internal tasks",
+        "Organize forwarded content",
+        "Update mission status",
+        "Send scheduled Bruce notifications",
+    ]
+    static let alwaysAsk = [
+        "Send an email",
+        "Upload files externally",
+        "Share personal data",
+        "Submit a form or application",
+        "Contact a new person",
+        "Anything irreversible",
+    ]
+    static let recentAuto = [
+        AutoAction(title: "Added Science Fair deadline", when: "2h ago"),
+        AutoAction(title: "Organized summer-program documents", when: "1h ago"),
+        AutoAction(title: "Moved a study block after a conflict", when: "12m ago"),
+    ]
+
     struct Integration: Identifiable { let id = UUID(); let name: String; let icon: String; let status: String }
+
+    // Full integrations catalog for the Integrations page (grouped).
+    struct IntegrationItem: Identifiable { let id = UUID(); let name: String; let icon: String; let status: String; let detail: String }
+    struct IntegrationSection: Identifiable { let id = UUID(); let title: String; let items: [IntegrationItem] }
+    static let integrationCatalog: [IntegrationSection] = [
+        IntegrationSection(title: "Calendar", items: [
+            IntegrationItem(name: "Apple Calendar", icon: "calendar", status: "Connected", detail: "Deadlines and events"),
+            IntegrationItem(name: "Google Calendar", icon: "calendar", status: "Available", detail: "Deadlines and events"),
+        ]),
+        IntegrationSection(title: "Email", items: [
+            IntegrationItem(name: "Gmail", icon: "envelope.fill", status: "Connected", detail: "Reads important school mail"),
+            IntegrationItem(name: "Outlook", icon: "envelope.fill", status: "Available", detail: "Reads important school mail"),
+            IntegrationItem(name: "Forward-to-Bruce address", icon: "arrowshape.turn.up.right.fill", status: "Available", detail: "Forward anything to your Bruce inbox"),
+        ]),
+        IntegrationSection(title: "School systems", items: [
+            IntegrationItem(name: "Google Classroom", icon: "graduationcap.fill", status: "Available", detail: "Assignments and due dates"),
+            IntegrationItem(name: "Canvas", icon: "book.closed.fill", status: "Requires school approval", detail: "Assignments and due dates"),
+            IntegrationItem(name: "Microsoft Teams", icon: "person.2.fill", status: "Coming later", detail: "Class messages"),
+        ]),
+        IntegrationSection(title: "Files", items: [
+            IntegrationItem(name: "Google Drive", icon: "folder.fill", status: "Available", detail: "Attach documents to missions"),
+            IntegrationItem(name: "iCloud Drive", icon: "icloud.fill", status: "Available", detail: "Attach documents to missions"),
+        ]),
+    ]
+    static func integrationColor(_ s: String) -> Color {
+        switch s {
+        case "Connected": return Theme.green
+        case "Requires school approval": return Theme.amber
+        case "Coming later": return Theme.textTertiary
+        default: return Theme.textSecondary
+        }
+    }
     static let integrations: [Integration] = [
         Integration(name: "Google Classroom", icon: "graduationcap.fill", status: "Available"),
         Integration(name: "Canvas", icon: "book.closed.fill", status: "Requires school approval"),
