@@ -4,7 +4,7 @@ import SwiftUI
 struct BruceApp: App {
     var body: some Scene {
         WindowGroup {
-            HomeView()
+            RootFlow()
         }
     }
 }

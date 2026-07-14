@@ -33,4 +33,5 @@ app/**/DerivedData/
 ios/build/
 ios/Bruce.xcodeproj/
 ios/*.png
+ios/shots/
 ios/**/xcuserdata/
