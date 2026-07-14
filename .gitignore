@@ -28,3 +28,9 @@ build/
 app/**/xcuserdata/
 app/**/*.xcuserstate
 app/**/DerivedData/
+
+# iOS client — xcodegen regenerates the project; don't commit build artifacts/screenshots
+ios/build/
+ios/Bruce.xcodeproj/
+ios/*.png
+ios/**/xcuserdata/

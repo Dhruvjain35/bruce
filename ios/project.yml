@@ -1,0 +1,28 @@
+name: Bruce
+options:
+  bundleIdPrefix: com.brucedev
+  deploymentTarget:
+    iOS: "18.0"
+targets:
+  Bruce:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Bruce
+        UILaunchScreen: {}
+        # dev only: allow http to the local engine on 127.0.0.1
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.brucedev.Bruce
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Sources/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGNING_ALLOWED: NO
