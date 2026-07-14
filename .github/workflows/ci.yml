@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Real PostgreSQL 16 — the isolation/durability gate runs from a clean database on every PR.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      BRUCE_JWT_SECRET: ci-hs256-secret-at-least-32-bytes-long!!
+      BRUCE_JWT_AUDIENCE: authenticated
+      # owner (privileged) runs migrations; the app connects as the restricted bruce_app role.
+      BRUCE_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
+      BRUCE_APP_DATABASE_URL: postgresql+asyncpg://bruce_app:bruce_dev_pw@localhost:5432/bruce_test
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      # Full suite: offline unit tests + real-Postgres adversarial integration tests.
+      # The conftest fixture provisions/migrates a disposable bruce_test db and the bruce_app role.
+      - run: python -m pytest -q
