@@ -20,12 +20,14 @@ struct RootFlow: View {
 struct OnboardingView: View {
     let onDone: () -> Void
     @State private var step = Int(Demo.env["BRUCE_ONBOARD_STEP"] ?? "") ?? 0
-    private let steps = 7
+    private let steps = 9
 
     // mock selections
     @State private var grade = "11th grade"
     @State private var gradYear = "2027"
     @State private var focus: Set<String> = ["Deadlines and assignments", "Opportunities and scholarships"]
+    @State private var gradeSystem = "Home Access Center (Frisco ISD)"
+    @State private var protocols: Set<String> = ["Ask before anything costs money", "Always show me the source"]
 
     var body: some View {
         ZStack {
@@ -36,10 +38,12 @@ struct OnboardingView: View {
                     switch step {
                     case 0: identity
                     case 1: context
-                    case 2: focusPick
-                    case 3: connectCalendar
-                    case 4: optionalSystems
-                    case 5: notifications
+                    case 2: gradeSystemStep
+                    case 3: focusPick
+                    case 4: protocolsStep
+                    case 5: connectCalendar
+                    case 6: optionalSystems
+                    case 7: notifications
                     default: firstAction
                     }
                 }
@@ -115,6 +119,73 @@ struct OnboardingView: View {
                     Text("Time zone").font(.subheadline).foregroundStyle(Theme.textSecondary)
                     Spacer()
                     Text("Eastern Time · detected").font(.subheadline.weight(.medium)).foregroundStyle(Theme.text)
+                }
+            }
+        }
+    }
+
+    private var gradeSystemStep: some View {
+        stepScaffold(title: "How do you check your grades?",
+                     subtitle: "Districts use different systems. Tell Bruce yours so it can pull grades and your GPA.",
+                     cta: "Continue", action: advance) {
+            VStack(alignment: .leading, spacing: 16) {
+                fieldStub("School district", "e.g. Frisco ISD")
+                VStack(spacing: 10) {
+                    gradeOption("Home Access Center (Frisco ISD)", "Bruce uses Gradeway")
+                    gradeOption("PowerSchool", "")
+                    gradeOption("Skyward", "")
+                    gradeOption("Infinite Campus", "")
+                    gradeOption("Canvas Grades", "")
+                    gradeOption("My district isn't listed", "Bruce will adapt")
+                }
+            }
+        }
+    }
+
+    private func gradeOption(_ title: String, _ sub: String) -> some View {
+        let on = gradeSystem == title
+        return Button { Haptics.select(); gradeSystem = title } label: {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: on ? "largecircle.fill.circle" : "circle")
+                    .font(.system(size: 20)).foregroundStyle(on ? AnyShapeStyle(Theme.silver) : AnyShapeStyle(Theme.textTertiary))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                    if !sub.isEmpty { Text(sub).font(.caption).foregroundStyle(sub.contains("Gradeway") ? Theme.green : Theme.textSecondary) }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(16)
+            .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(on ? AnyShapeStyle(Theme.silver.opacity(0.4)) : AnyShapeStyle(Theme.stroke)))
+        }.buttonStyle(PressStyle())
+    }
+
+    private var protocolsStep: some View {
+        let rules = ["Ask before anything costs money", "Never send emails after 9 PM",
+                     "CC my counselor on official emails", "Prefer opportunities with no essay",
+                     "Always show me the source"]
+        return stepScaffold(title: "Set your ground rules",
+                     subtitle: "Standing rules Bruce follows on every mission. Change them anytime.",
+                     cta: "Continue", action: advance) {
+            VStack(spacing: 10) {
+                ForEach(rules, id: \.self) { r in
+                    let on = protocols.contains(r)
+                    Button {
+                        Haptics.select()
+                        if on { protocols.remove(r) } else { protocols.insert(r) }
+                    } label: {
+                        HStack {
+                            Text(r).font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.text)
+                            Spacer()
+                            Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 20)).foregroundStyle(on ? AnyShapeStyle(Theme.silver) : AnyShapeStyle(Theme.textTertiary))
+                        }
+                        .padding(16)
+                        .background(Theme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .strokeBorder(on ? AnyShapeStyle(Theme.silver.opacity(0.4)) : AnyShapeStyle(Theme.stroke)))
+                    }.buttonStyle(PressStyle())
                 }
             }
         }
