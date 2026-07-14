@@ -7,6 +7,7 @@ final class AppState: ObservableObject {
 
 struct RootView: View {
     @StateObject private var app = AppState()
+    @State private var store = BruceStore()
     @State private var tab = Int(ProcessInfo.processInfo.environment["BRUCE_TAB"] ?? "") ?? 0
     private let tabs: [(icon: String, label: String)] = [
         ("house.fill", "Home"),
@@ -34,6 +35,7 @@ struct RootView: View {
             }
         }
         .environmentObject(app)
+        .environment(store)
         .animation(.easeInOut(duration: 0.25), value: app.hideTabBar)
         .preferredColorScheme(.dark)
     }
@@ -48,7 +50,7 @@ struct RootView: View {
                     VStack(spacing: 4) {
                         Image(systemName: t.icon).font(.system(size: 17, weight: .semibold))
                             .overlay(alignment: .topTrailing) {
-                                if i == 3 && !Mock.decisions.isEmpty {
+                                if i == 3 && !store.decisions.isEmpty {
                                     Circle().fill(Theme.amber).frame(width: 7, height: 7).offset(x: 4, y: -2)
                                 }
                             }

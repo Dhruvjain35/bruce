@@ -44,3 +44,15 @@ struct Shimmer: ViewModifier {
     }
 }
 extension View { func shimmer() -> some View { modifier(Shimmer()) } }
+
+// MARK: - Hide the floating tab bar on pushed detail pages
+
+struct HidesTabBar: ViewModifier {
+    @EnvironmentObject private var app: AppState
+    func body(content: Content) -> some View {
+        content
+            .onAppear { app.hideTabBar = true }
+            .onDisappear { app.hideTabBar = false }
+    }
+}
+extension View { func hidesTabBar() -> some View { modifier(HidesTabBar()) } }
