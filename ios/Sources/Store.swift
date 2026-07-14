@@ -11,7 +11,8 @@ import Observation
 
     var needsYou: [Mission] { missions.filter { $0.status == .needsYou || $0.status == .failed } }
     var working: [Mission] { missions.filter { $0.status == .working } }
-    var activeCount: Int { missions.count }
+    var done: [Mission] { missions.filter { $0.status == .verified } }
+    var activeCount: Int { missions.filter { $0.status != .verified }.count }
 
     func mission(_ id: UUID) -> Mission? { missions.first { $0.id == id } }
 

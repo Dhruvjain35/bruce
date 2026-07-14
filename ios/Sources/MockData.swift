@@ -313,6 +313,24 @@ enum Mock {
             count: nil,
             updated: "20m ago"
         ),
+        Mission(
+            title: "Teacher rec request",
+            status: .verified,
+            statusText: "Verified · sent",
+            homeLine: "Sent to Ms. Rivera",
+            listLine: "Recommendation requested",
+            stateSentence: "Bruce sent the request and confirmed Ms. Rivera received it.",
+            completed: ["Drafted the ask", "You approved it", "Sent and confirmed delivery"],
+            now: "Done — nothing left for you",
+            next: "",
+            evidence: [
+                EvidenceSource(icon: "envelope.fill", kind: "Sent", title: "Request to Ms. Rivera", meta: "Delivered · yesterday 4:31 PM"),
+            ],
+            draft: nil,
+            count: nil,
+            updated: "yesterday",
+            receipt: Receipt(to: "Ms. Rivera", deliveredAt: "Yesterday, 4:31 PM", note: "No attachment")
+        ),
     ]
 
     static var failureMission: Mission { missions.first { $0.status == .failed } ?? missions[0] }

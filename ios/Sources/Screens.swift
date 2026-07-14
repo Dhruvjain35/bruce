@@ -99,9 +99,16 @@ struct MissionDetailView: View {
                 // B. Current action (dominant)
                 ActionModule(
                     now: m.now, count: m.count,
-                    primaryTitle: reviewable ? "Review email" : (m.status == .failed ? "Retry the upload" : nil),
-                    primaryIcon: reviewable ? "envelope" : "arrow.clockwise",
-                    primaryAction: { if reviewable { showApproval = true } }
+                    primaryTitle: reviewable ? "Review email"
+                        : m.status == .failed ? "Retry the upload"
+                        : m.status == .verified ? "View receipt" : nil,
+                    primaryIcon: reviewable ? "envelope"
+                        : m.status == .failed ? "arrow.clockwise" : "checkmark.seal.fill",
+                    primaryAction: {
+                        if reviewable { showApproval = true }
+                        else if m.status == .failed { store.retryMission(m.id) }
+                        else if m.status == .verified { goReceipt = true }
+                    }
                 )
 
                 // C. Mission contents (varies by mission type)
@@ -436,7 +443,7 @@ struct MissionsView: View {
         switch filter {
         case 1: return store.needsYou
         case 2: return store.working
-        case 3: return []
+        case 3: return store.done
         default: return store.missions
         }
     }
