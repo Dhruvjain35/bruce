@@ -49,11 +49,13 @@ struct PersonView: View {
                 Module(label: "Alternate matches") {
                     VStack(spacing: 12) {
                         ForEach(p.alternates, id: \.self) { a in
-                            HStack {
-                                Text(a).font(.system(size: 15)).foregroundStyle(Theme.textSecondary)
-                                Spacer()
-                                Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
-                            }
+                            Button { Haptics.tap() } label: {
+                                HStack {
+                                    Text(a).font(.system(size: 15)).foregroundStyle(Theme.textSecondary)
+                                    Spacer()
+                                    Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
+                                }
+                            }.buttonStyle(PressStyle())
                         }
                     }
                 }
