@@ -9,10 +9,11 @@ gate. Nothing is sent — the student reviews, adds their own question, and send
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 
 from . import antispam, discovery, drafting, email_resolver, verify
-from .models import MissionPhase, OutreachGoal, OutreachPlan, StudentProfile
+from .models import DraftStatus, MissionPhase, OutreachDraft, OutreachGoal, OutreachPlan, StudentProfile
 
 
 async def build_outreach_plan(
@@ -22,31 +23,43 @@ async def build_outreach_plan(
     limit: int = 8,
     resolve_emails: bool = True,
     verify_drafts: bool = True,
-    on_phase: Callable[[MissionPhase], None] | None = None,
+    on_phase: Callable[[MissionPhase], Awaitable[None]] | None = None,
 ) -> OutreachPlan:
-    emit = on_phase or (lambda _p: None)
+    async def emit(phase: MissionPhase) -> None:
+        if on_phase is not None:
+            await on_phase(phase)
 
-    emit(MissionPhase.understanding)
+    await emit(MissionPhase.understanding)
     result = await discovery.discover_professors(student, goal, limit=limit)
 
-    emit(MissionPhase.executing)
-    drafts = []
-    for candidate in result.candidates:
-        if resolve_emails:
-            await email_resolver.resolve_email(candidate)  # mutates candidate; leaves None if not grounded
+    await emit(MissionPhase.executing)
 
-        draft = await drafting.draft_one(student, candidate)
+    async def process(candidate) -> OutreachDraft:
+        # Per-candidate: resolve email + draft + verify. Wrapped so one failure never sinks the mission.
+        try:
+            if resolve_emails:
+                await email_resolver.resolve_email(candidate)
+            draft = await drafting.draft_one(student, candidate)
+            if verify_drafts and draft.body:
+                verdict = await verify.verify_draft(draft, candidate)
+                if verdict.ready:
+                    draft.flags.append("Verification passed: claims grounded in the cited paper.")
+                else:
+                    detail = "; ".join(verdict.problems) if verdict.problems else verdict.entailment
+                    draft.flags.append(f"BLOCKED by verification ({verdict.entailment}): {detail}")
+            return draft
+        except Exception as exc:
+            return OutreachDraft(
+                candidate_name=candidate.name, institution=candidate.institution,
+                subject="", body="", personalization_points=[], word_count=0,
+                flags=[f"Could not prepare this one ({type(exc).__name__}) — skipped."],
+                status=DraftStatus.draft,
+            )
 
-        if verify_drafts and draft.body:
-            verdict = await verify.verify_draft(draft, candidate)
-            if verdict.ready:
-                draft.flags.append("Verification passed: claims grounded in the cited paper.")
-            else:
-                detail = "; ".join(verdict.problems) if verdict.problems else verdict.entailment
-                draft.flags.append(f"BLOCKED by verification ({verdict.entailment}): {detail}")
+    # Candidates processed CONCURRENTLY — wall-clock ~= slowest single candidate, not the sum.
+    drafts = list(await asyncio.gather(*(process(c) for c in result.candidates)))
 
-        drafts.append(draft)
-
+    await emit(MissionPhase.verifying)
     antispam.flag_spam(drafts)  # name-swap + >2-per-institution flags, appended in place
 
     return OutreachPlan(student=student, goal=goal, discovery=result, drafts=drafts)

@@ -14,6 +14,13 @@ final class HomeModel: ObservableObject {
         missions = (try? await api.listMissions()) ?? missions
     }
 
+    func autoRefresh() async {
+        while !Task.isCancelled {
+            await refresh()
+            try? await Task.sleep(for: .seconds(2))  // live phase updates while a mission runs
+        }
+    }
+
     func handoff() async {
         let t = topic.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
@@ -89,7 +96,7 @@ struct HomeView: View {
                 }
             }
             .refreshable { await model.refresh() }
-            .task { await model.refresh() }
+            .task { await model.autoRefresh() }
         }
     }
 

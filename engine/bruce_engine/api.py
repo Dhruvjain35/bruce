@@ -95,18 +95,27 @@ def _view(rec: MissionRecord) -> MissionView:
 
 
 async def _run_mission(mission_id: UUID, user_id: UUID, req: MissionRequest) -> None:
-    """Background worker — runs under EXPLICIT user context (repo uses user_session(user_id))."""
+    """Background worker — runs under EXPLICIT user context; persists each phase so the UI shows progress."""
+    version = 1  # created row is v1
+
+    async def on_phase(phase: MissionPhase) -> None:
+        nonlocal version
+        rec = await _mission_repo.update_phase(
+            mission_id, user_id, version, phase.value, _PHASE_STATUS.get(phase, "Working…")
+        )
+        version = rec.version
+
     try:
-        plan = await build_outreach_plan(req.student, req.goal, limit=req.limit)
+        plan = await build_outreach_plan(req.student, req.goal, limit=req.limit, on_phase=on_phase)
         await _mission_repo.finish(
-            mission_id, user_id, expected_version=1, status=MissionStatus.succeeded.value,
+            mission_id, user_id, version, status=MissionStatus.succeeded.value,
             phase=MissionPhase.succeeded.value, short_status=_PHASE_STATUS[MissionPhase.succeeded],
             plan=plan.model_dump(mode="json"),
         )
     except Exception as exc:
         try:
             await _mission_repo.finish(
-                mission_id, user_id, expected_version=1, status=MissionStatus.failed.value,
+                mission_id, user_id, version, status=MissionStatus.failed.value,
                 phase=MissionPhase.failed.value, short_status=_PHASE_STATUS[MissionPhase.failed],
                 error=f"{type(exc).__name__}: {exc}",
             )
