@@ -72,6 +72,7 @@ struct MissionDetailView: View {
     let mission: Mission
     @State private var showApproval = false
     @State private var goPerson = false
+    @State private var showEditPlan = false
     @EnvironmentObject private var app: AppState
     @Environment(BruceStore.self) private var store
 
@@ -104,7 +105,7 @@ struct MissionDetailView: View {
                 if let p = m.person { PersonModule(p: p) }
                 if let d = m.draft { DraftEmailModule(draft: d) { showApproval = true } }
                 if !m.documents.isEmpty { ChecklistModule(count: m.count, items: m.documents) }
-                if !m.afterApproval.isEmpty { AfterModule(steps: m.afterApproval, followUp: m.followUp) {} }
+                if !m.afterApproval.isEmpty { AfterModule(steps: m.afterApproval, followUp: m.followUp) { showEditPlan = true } }
                 if !m.evidence.isEmpty { EvidenceModule(evidence: m.evidence) }
                 if !m.timeline.isEmpty { TimelineModule(events: m.timeline) }
 
@@ -143,10 +144,12 @@ struct MissionDetailView: View {
             if let d = m.draft { ApprovalSheet(draft: d).environment(store) }
         }
         .navigationDestination(isPresented: $goPerson) { if let p = m.person { PersonView(p: p) } }
+        .sheet(isPresented: $showEditPlan) { EditPlanView(mission: m).environment(store) }
         .onAppear {
             app.hideTabBar = true
             if Demo.present == "approval" { showApproval = true }
             if Demo.present == "person" { goPerson = true }
+            if Demo.present == "editplan" { showEditPlan = true }
         }
         .onDisappear { app.hideTabBar = false }
     }

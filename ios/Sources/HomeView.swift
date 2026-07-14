@@ -2,6 +2,7 @@ import SwiftUI
 
 struct HomeView: View {
     var onSelectTab: (Int) -> Void = { _ in }
+    @Environment(BruceStore.self) private var store
     @State private var showHandoff = false
     @State private var autoDetail = false
 
@@ -14,11 +15,11 @@ struct HomeView: View {
 
                 section("Today") { today }
 
-                if !Mock.needsYou.isEmpty {
+                if !store.needsYou.isEmpty {
                     section("Needs you") {
                         VStack(spacing: 10) {
-                            ForEach(Mock.needsYou) { m in
-                                NavigationLink { MissionDetailView(m: m) } label: { HomeMissionRow(m: m) }
+                            ForEach(store.needsYou) { m in
+                                NavigationLink { MissionDetailView(mission: m) } label: { HomeMissionRow(m: m) }
                                     .buttonStyle(PressStyle())
                             }
                         }
@@ -27,11 +28,11 @@ struct HomeView: View {
 
                 section("Coming up") { comingUp }
 
-                if !Mock.working.isEmpty {
+                if !store.working.isEmpty {
                     section("Working") {
                         VStack(spacing: 10) {
-                            ForEach(Mock.working) { m in
-                                NavigationLink { MissionDetailView(m: m) } label: { HomeMissionRow(m: m) }
+                            ForEach(store.working) { m in
+                                NavigationLink { MissionDetailView(mission: m) } label: { HomeMissionRow(m: m) }
                                     .buttonStyle(PressStyle())
                             }
                         }
@@ -53,13 +54,13 @@ struct HomeView: View {
         }
         .toolbar(.hidden, for: .navigationBar)
         .navigationDestination(isPresented: $autoDetail) {
-            MissionDetailView(m: Demo.present == "failure" ? Mock.failureMission : Mock.missions[0])
+            MissionDetailView(mission: Demo.present == "failure" ? Mock.failureMission : Mock.missions[0])
         }
         .sheet(isPresented: $showHandoff) { HandoffSheet() }
         .onAppear {
             switch Demo.present {
             case "handoff", "clarify": showHandoff = true
-            case "detail", "approval", "failure": autoDetail = true
+            case "detail", "approval", "failure", "person", "editplan": autoDetail = true
             default: break
             }
         }
@@ -93,9 +94,9 @@ struct HomeView: View {
         HStack(spacing: 10) {
             Button { onSelectTab(2) } label: { TodayChip(n: Mock.todayDeadlines, label: Mock.todayDeadlines == 1 ? "deadline" : "deadlines") }
                 .buttonStyle(PressStyle())
-            Button { onSelectTab(3) } label: { TodayChip(n: Mock.todayDecisions, label: Mock.todayDecisions == 1 ? "decision" : "decisions") }
+            Button { onSelectTab(3) } label: { TodayChip(n: store.decisions.count, label: store.decisions.count == 1 ? "decision" : "decisions") }
                 .buttonStyle(PressStyle())
-            Button { onSelectTab(1) } label: { TodayChip(n: Mock.activeMissions, label: "active") }
+            Button { onSelectTab(1) } label: { TodayChip(n: store.activeCount, label: "active") }
                 .buttonStyle(PressStyle())
             Spacer(minLength: 0)
         }
