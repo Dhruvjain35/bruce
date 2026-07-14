@@ -44,6 +44,11 @@ enum Theme {
         colors: [Color(hex: 0x1E1F28), Color(hex: 0x111117)],
         startPoint: .top, endPoint: .bottom
     )
+    /// Fade scrolling content into the background behind a bottom action bar — no gray material band.
+    static let bottomFade = LinearGradient(
+        colors: [bg.opacity(0), bg, bg],
+        startPoint: .top, endPoint: .bottom
+    )
 
     /// Ambient dark background with a cool silver/graphite glow (replaces the purple gradient).
     struct Backdrop: View {

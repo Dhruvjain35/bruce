@@ -144,7 +144,7 @@ struct DecisionDetailView: View {
                 GhostButton(title: "Not now") { dismiss() }
             }
             .padding(.horizontal, 20).padding(.bottom, 10)
-            .background(.ultraThinMaterial)
+            .background(Theme.bottomFade)
         }
         .sheet(isPresented: $showApproval) {
             if let draft = store.missions.first(where: { $0.draft != nil })?.draft {
@@ -206,7 +206,7 @@ struct DateDetailView: View {
                     SilverButton(title: "Add to calendar", icon: "calendar.badge.plus") { dismiss() }
                 }
             }
-            .padding(.horizontal, 20).padding(.bottom, 10).background(.ultraThinMaterial)
+            .padding(.horizontal, 20).padding(.bottom, 10).background(Theme.bottomFade)
         }
     }
     private func detailRow(_ k: String, _ v: String) -> some View {

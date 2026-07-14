@@ -451,6 +451,7 @@ struct DeleteAccountSheet: View {
             .padding(.horizontal, 22).padding(.bottom, 16)
         }
         .presentationDetents([.large])
+        .presentationBackground(Theme.bg)
         .preferredColorScheme(.dark)
     }
     private func bullet(_ t: String) -> some View {

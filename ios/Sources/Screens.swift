@@ -191,6 +191,7 @@ struct ApprovalSheet: View {
             if sent { sentState } else { reviewState }
         }
         .presentationDetents([.large])
+        .presentationBackground(Theme.bg)
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showEdit) { EditDraftView(draft: draft) }
     }
@@ -256,7 +257,7 @@ struct ApprovalSheet: View {
                 }
             }
             .padding(.horizontal, 18).padding(.bottom, 12)
-            .background(.ultraThinMaterial)
+            .background(Theme.bottomFade)
         }
     }
 
@@ -321,6 +322,7 @@ struct HandoffSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+        .presentationBackground(Theme.bg)
         .preferredColorScheme(.dark)
     }
 

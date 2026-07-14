@@ -56,10 +56,11 @@ struct EditDraftView: View {
             }
         }
         .presentationDetents([.large])
+        .presentationBackground(Theme.bg)
         .preferredColorScheme(.dark)
         .safeAreaInset(edge: .bottom) {
             SilverButton(title: "Save changes", icon: "checkmark") { dismiss() }
-                .padding(.horizontal, 18).padding(.bottom, 12).background(.ultraThinMaterial)
+                .padding(.horizontal, 18).padding(.bottom, 12).background(Theme.bottomFade)
         }
     }
 }

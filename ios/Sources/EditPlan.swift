@@ -77,14 +77,15 @@ struct EditPlanView: View {
 
                 Color.clear.frame(height: 90)
             }
-            .padding(.horizontal, 20).padding(.top, 8)
+            .padding(.horizontal, 20).padding(.top, 30)
         }
         .scrollIndicators(.hidden)
         .background(Theme.Backdrop())
-        .navigationBarTitleDisplayMode(.inline)
+        .presentationBackground(Theme.bg)
+        .presentationDragIndicator(.visible)
         .safeAreaInset(edge: .bottom) {
             SilverButton(title: "Save plan", icon: "checkmark") { save(); dismiss() }
-                .padding(.horizontal, 20).padding(.bottom, 10).background(.ultraThinMaterial)
+                .padding(.horizontal, 20).padding(.top, 14).padding(.bottom, 10).background(Theme.bottomFade)
         }
     }
 

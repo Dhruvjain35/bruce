@@ -47,7 +47,7 @@ struct ChooseRecommenderView: View {
                 if selected != nil { dismiss() }
             }
             .opacity(selected == nil ? 0.5 : 1)
-            .padding(.horizontal, 20).padding(.bottom, 10).background(.ultraThinMaterial)
+            .padding(.horizontal, 20).padding(.bottom, 10).background(Theme.bottomFade)
         }
     }
 
@@ -102,7 +102,7 @@ struct DatesReviewView: View {
         .hidesTabBar()
         .safeAreaInset(edge: .bottom) {
             SilverButton(title: "Add the 2 conflict-free dates", icon: "calendar.badge.plus") { dismiss() }
-                .padding(.horizontal, 20).padding(.bottom, 10).background(.ultraThinMaterial)
+                .padding(.horizontal, 20).padding(.bottom, 10).background(Theme.bottomFade)
         }
     }
 }
