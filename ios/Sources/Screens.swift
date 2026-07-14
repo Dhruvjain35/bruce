@@ -550,6 +550,7 @@ struct CalendarView: View {
 struct DecisionsView: View {
     @Environment(BruceStore.self) private var store
     @State private var goDecision = false
+    @State private var goChooseDemo = false
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -586,7 +587,11 @@ struct DecisionsView: View {
             .navigationDestination(isPresented: $goDecision) {
                 if let d = store.decisions.first { DecisionDetailView(d: d) }
             }
-            .onAppear { if Demo.present == "decisiondetail" { goDecision = true } }
+            .navigationDestination(isPresented: $goChooseDemo) { ChooseRecommenderView() }
+            .onAppear {
+                if Demo.present == "decisiondetail" { goDecision = true }
+                if Demo.present == "choose" { goChooseDemo = true }
+            }
         }
     }
 }
@@ -618,6 +623,7 @@ struct YouView: View {
     @State private var showDelete = Demo.present == "delete"
     @State private var goAutomation = false
     @State private var goIntegrations = false
+    @State private var goNotifsDemo = false
     var body: some View {
       NavigationStack {
         ScrollView {
@@ -686,10 +692,12 @@ struct YouView: View {
         .background(Theme.Backdrop())
         .navigationDestination(isPresented: $goAutomation) { AutomationView() }
         .navigationDestination(isPresented: $goIntegrations) { IntegrationsView() }
+        .navigationDestination(isPresented: $goNotifsDemo) { NotificationsSettingsView() }
         .sheet(isPresented: $showDelete) { DeleteAccountSheet() }
         .onAppear {
             if Demo.present == "automation" { goAutomation = true }
             if Demo.present == "integrations" { goIntegrations = true }
+            if Demo.present == "notifications" { goNotifsDemo = true }
         }
       }
     }
