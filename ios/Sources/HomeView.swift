@@ -81,7 +81,7 @@ struct HomeView: View {
                 Text(Mock.studentName).font(.system(size: 30, weight: .bold)).foregroundStyle(Theme.text)
             }
             Spacer()
-            Button { onSelectTab(4) } label: {
+            NavigationLink { NotificationsSettingsView() } label: {
                 Image(systemName: "bell")
                     .font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
                     .frame(width: 42, height: 42)
