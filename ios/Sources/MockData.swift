@@ -390,6 +390,13 @@ enum Mock {
         AutoAction(title: "Moved a study block after a conflict", when: "12m ago"),
     ]
 
+    struct Recommender: Identifiable { let id = UUID(); let name: String; let subject: String; let note: String }
+    static let recommenders = [
+        Recommender(name: "Ms. Rivera", subject: "AP Chemistry", note: "Knows your lab work best"),
+        Recommender(name: "Mr. Osei", subject: "AP Calculus BC", note: "Strong writer, replies quickly"),
+        Recommender(name: "Dr. Lang", subject: "Research seminar", note: "Can speak to your project directly"),
+    ]
+
     struct Integration: Identifiable { let id = UUID(); let name: String; let icon: String; let status: String }
 
     // Full integrations catalog for the Integrations page (grouped).

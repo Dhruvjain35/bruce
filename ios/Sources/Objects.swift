@@ -89,6 +89,8 @@ struct DecisionDetailView: View {
     @Environment(BruceStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @State private var showApproval = false
+    @State private var goChoose = false
+    @State private var goDates = false
     private var ctaIcon: String {
         switch d.cta {
         case "Review email": return "envelope"
@@ -130,12 +132,14 @@ struct DecisionDetailView: View {
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 10) {
                 SilverButton(title: d.cta, icon: ctaIcon) {
-                    if d.cta == "Review email" { showApproval = true }
+                    switch d.cta {
+                    case "Review email": showApproval = true
+                    case "Choose": goChoose = true
+                    case "Review dates": goDates = true
+                    default: break
+                    }
                 }
-                HStack(spacing: 10) {
-                    GhostButton(title: "Edit") {}
-                    GhostButton(title: "Reject") { dismiss() }
-                }
+                GhostButton(title: "Not now") { dismiss() }
             }
             .padding(.horizontal, 20).padding(.bottom, 10)
             .background(.ultraThinMaterial)
@@ -145,6 +149,8 @@ struct DecisionDetailView: View {
                 ApprovalSheet(draft: draft).environment(store)
             }
         }
+        .navigationDestination(isPresented: $goChoose) { ChooseRecommenderView() }
+        .navigationDestination(isPresented: $goDates) { DatesReviewView() }
     }
 }
 
