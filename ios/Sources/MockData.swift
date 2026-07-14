@@ -419,8 +419,14 @@ enum Mock {
 
     // Full integrations catalog for the Integrations page (grouped).
     struct IntegrationItem: Identifiable { let id = UUID(); let name: String; let icon: String; let status: String; let detail: String }
+    struct CustomIntegration: Identifiable { let id = UUID(); let name: String; let url: String }
     struct IntegrationSection: Identifiable { let id = UUID(); let title: String; let items: [IntegrationItem] }
     static let integrationCatalog: [IntegrationSection] = [
+        IntegrationSection(title: "Grades", items: [
+            IntegrationItem(name: "Gradeway", icon: "chart.bar.fill", status: "Available", detail: "Grades + GPA from your district's Home Access Center"),
+            IntegrationItem(name: "PowerSchool", icon: "chart.bar.fill", status: "Available", detail: "Grades and report cards"),
+            IntegrationItem(name: "Skyward", icon: "chart.bar.fill", status: "Available", detail: "Grades and attendance"),
+        ]),
         IntegrationSection(title: "Calendar", items: [
             IntegrationItem(name: "Apple Calendar", icon: "calendar", status: "Connected", detail: "Deadlines and events"),
             IntegrationItem(name: "Google Calendar", icon: "calendar", status: "Available", detail: "Deadlines and events"),
@@ -432,8 +438,17 @@ enum Mock {
         ]),
         IntegrationSection(title: "School systems", items: [
             IntegrationItem(name: "Google Classroom", icon: "graduationcap.fill", status: "Available", detail: "Assignments and due dates"),
-            IntegrationItem(name: "Canvas", icon: "book.closed.fill", status: "Requires school approval", detail: "Assignments and due dates"),
+            IntegrationItem(name: "Canvas", icon: "book.closed.fill", status: "Available", detail: "Assignments and due dates"),
+            IntegrationItem(name: "Schoology", icon: "book.closed.fill", status: "Available", detail: "Assignments and grades"),
             IntegrationItem(name: "Microsoft Teams", icon: "person.2.fill", status: "Coming later", detail: "Class messages"),
+        ]),
+        IntegrationSection(title: "Notes & study", items: [
+            IntegrationItem(name: "Notion", icon: "note.text", status: "Available", detail: "Pull tasks and notes into missions"),
+            IntegrationItem(name: "Google Docs", icon: "doc.fill", status: "Available", detail: "Attach and draft documents"),
+            IntegrationItem(name: "Quizlet", icon: "rectangle.on.rectangle", status: "Available", detail: "Study sets before tests"),
+            IntegrationItem(name: "Khan Academy", icon: "play.rectangle.fill", status: "Available", detail: "Practice and assignments"),
+            IntegrationItem(name: "Desmos", icon: "function", status: "Available", detail: "Graphing for math classes"),
+            IntegrationItem(name: "Grammarly", icon: "checkmark.bubble.fill", status: "Available", detail: "Polish before you send"),
         ]),
         IntegrationSection(title: "Files", items: [
             IntegrationItem(name: "Google Drive", icon: "folder.fill", status: "Available", detail: "Attach documents to missions"),
@@ -449,8 +464,10 @@ enum Mock {
         }
     }
     static let integrations: [Integration] = [
+        Integration(name: "Gradeway (grades + GPA)", icon: "chart.bar.fill", status: "Available"),
         Integration(name: "Google Classroom", icon: "graduationcap.fill", status: "Available"),
-        Integration(name: "Canvas", icon: "book.closed.fill", status: "Requires school approval"),
+        Integration(name: "Canvas", icon: "book.closed.fill", status: "Available"),
+        Integration(name: "Notion", icon: "note.text", status: "Available"),
         Integration(name: "School email", icon: "envelope.fill", status: "Available"),
         Integration(name: "Microsoft Teams", icon: "person.2.fill", status: "Coming later"),
         Integration(name: "Forward-to-Bruce address", icon: "arrowshape.turn.up.right.fill", status: "Available"),

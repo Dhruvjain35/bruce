@@ -8,6 +8,12 @@ import Observation
     var decisions: [Decision] = Mock.decisions
     var automationMode: AutomationMode = .smartAuto
     var autoPaused = false
+    var customIntegrations: [Mock.CustomIntegration] = []
+    var gradeSystem: String? = nil   // e.g. "Home Access Center (Frisco ISD)"
+
+    func addCustomIntegration(name: String, url: String) {
+        customIntegrations.append(Mock.CustomIntegration(name: name, url: url))
+    }
 
     var needsYou: [Mission] { missions.filter { $0.status == .needsYou || $0.status == .failed } }
     var working: [Mission] { missions.filter { $0.status == .working } }
