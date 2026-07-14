@@ -34,4 +34,12 @@ import Observation
     }
 
     func cancelMission(_ id: UUID) { missions.removeAll { $0.id == id } }
+
+    func retryMission(_ id: UUID) {
+        guard let i = missions.firstIndex(where: { $0.id == id }) else { return }
+        missions[i].status = .working
+        missions[i].statusText = "Retrying the upload…"
+        missions[i].homeLine = "Retrying the upload…"
+        missions[i].now = "Retrying the upload"
+    }
 }
