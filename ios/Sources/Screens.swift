@@ -105,7 +105,7 @@ struct MissionDetailView: View {
                 )
 
                 // C. Mission contents (varies by mission type)
-                if m.status == .failed { RecoveryModule() }
+                if m.status == .failed { RecoveryModule { store.retryMission(m.id) } }
                 if let p = m.person { PersonModule(p: p) }
                 if let d = m.draft { DraftEmailModule(draft: d) { showApproval = true } }
                 if !m.documents.isEmpty { ChecklistModule(count: m.count, items: m.documents) }
@@ -176,6 +176,7 @@ struct ApprovalSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(BruceStore.self) private var store
     @State private var sent = false
+    @State private var showEdit = false
 
     var body: some View {
         ZStack {
@@ -184,6 +185,7 @@ struct ApprovalSheet: View {
         }
         .presentationDetents([.large])
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showEdit) { EditDraftView(draft: draft) }
     }
 
     private var reviewState: some View {
@@ -242,7 +244,7 @@ struct ApprovalSheet: View {
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { sent = true }
                 }
                 HStack(spacing: 10) {
-                    GhostButton(title: "Edit", icon: "pencil") {}
+                    GhostButton(title: "Edit", icon: "pencil") { showEdit = true }
                     GhostButton(title: "Decline", icon: "xmark") { dismiss() }
                 }
             }
