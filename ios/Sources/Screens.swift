@@ -694,19 +694,35 @@ struct YouView: View {
             SectionLabel(text: title)
             VStack(spacing: 0) {
                 ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
-                    HStack(spacing: 13) {
-                        Image(systemName: r.0).font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.silver)
-                            .frame(width: 34, height: 34)
-                            .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        Text(r.1).font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.text)
-                        Spacer()
-                        Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(Theme.textTertiary)
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 13)
+                    NavigationLink { destination(for: r.1) } label: {
+                        HStack(spacing: 13) {
+                            Image(systemName: r.0).font(.system(size: 14, weight: .semibold)).foregroundStyle(Theme.silver)
+                                .frame(width: 34, height: 34)
+                                .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            Text(r.1).font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.text)
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(Theme.textTertiary)
+                        }
+                        .padding(.horizontal, 10).padding(.vertical, 13)
+                    }.buttonStyle(PressStyle())
                     if i < rows.count - 1 { Divider().overlay(Theme.stroke).padding(.leading, 57) }
                 }
             }
             .padding(6).glass(18)
+        }
+    }
+
+    @ViewBuilder private func destination(for title: String) -> some View {
+        switch title {
+        case "Calendar", "Email", "Classroom / LMS", "Forwarding address": IntegrationsView()
+        case "Notifications": NotificationsSettingsView()
+        case "Personal protocols": PersonalProtocolsView()
+        case "Communication style": CommunicationStyleView()
+        case "What Bruce stores", "Auto-delete policy", "Export data": PrivacyView()
+        case "Help": HelpView()
+        case "Report a problem": ReportProblemView()
+        case "About Bruce": AboutView()
+        default: PrivacyView()
         }
     }
 }
