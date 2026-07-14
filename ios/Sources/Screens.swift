@@ -73,6 +73,10 @@ struct MissionDetailView: View {
     @State private var showApproval = false
     @State private var goPerson = false
     @State private var showEditPlan = false
+    @State private var goNotifs = false
+    @State private var goReceipt = false
+    @State private var confirmCancel = false
+    @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var app: AppState
     @Environment(BruceStore.self) private var store
 
@@ -131,10 +135,10 @@ struct MissionDetailView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
-                    Button { } label: { Label("Pause mission", systemImage: "pause.circle") }
-                    Button { } label: { Label("Notification preferences", systemImage: "bell") }
-                    Button { } label: { Label("Export receipt", systemImage: "square.and.arrow.up") }
-                    Button(role: .destructive) { } label: { Label("Cancel mission", systemImage: "xmark.circle") }
+                    Button { Haptics.tap(); store.pauseMission(m.id) } label: { Label("Pause mission", systemImage: "pause.circle") }
+                    Button { goNotifs = true } label: { Label("Notification preferences", systemImage: "bell") }
+                    Button { goReceipt = true } label: { Label("Export receipt", systemImage: "square.and.arrow.up") }
+                    Button(role: .destructive) { confirmCancel = true } label: { Label("Cancel mission", systemImage: "xmark.circle") }
                 } label: {
                     Image(systemName: "ellipsis").font(.system(size: 16, weight: .bold)).foregroundStyle(Theme.text)
                 }
@@ -144,7 +148,17 @@ struct MissionDetailView: View {
             if let d = m.draft { ApprovalSheet(draft: d).environment(store) }
         }
         .navigationDestination(isPresented: $goPerson) { if let p = m.person { PersonView(p: p) } }
+        .navigationDestination(isPresented: $goNotifs) { NotificationsSettingsView() }
+        .navigationDestination(isPresented: $goReceipt) {
+            ReceiptView(r: m.receipt ?? Receipt(to: m.person?.name ?? m.title,
+                                                deliveredAt: "Not sent yet",
+                                                note: "Draft prepared · updated \(m.updated)"))
+        }
         .sheet(isPresented: $showEditPlan) { EditPlanView(mission: m).environment(store) }
+        .confirmationDialog("Cancel this mission?", isPresented: $confirmCancel, titleVisibility: .visible) {
+            Button("Cancel mission", role: .destructive) { store.cancelMission(m.id); dismiss() }
+            Button("Keep it", role: .cancel) {}
+        } message: { Text("Bruce will stop working on it and remove it from your list.") }
         .onAppear {
             app.hideTabBar = true
             if Demo.present == "approval" { showApproval = true }
