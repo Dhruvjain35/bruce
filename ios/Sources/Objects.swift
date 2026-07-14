@@ -158,6 +158,8 @@ struct DecisionDetailView: View {
 
 struct DateDetailView: View {
     let c: CalProposal
+    @Environment(\.dismiss) private var dismiss
+    @State private var goCompare = false
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
@@ -188,16 +190,76 @@ struct DateDetailView: View {
         .background(Theme.Backdrop())
         .navigationBarTitleDisplayMode(.inline)
         .hidesTabBar()
+        .navigationDestination(isPresented: $goCompare) { ConflictCompareView(c: c) }
         .safeAreaInset(edge: .bottom) {
-            (c.state == .added
-                ? AnyView(HStack(spacing: 10) { GhostButton(title: "Open in Calendar", icon: "calendar") {}; GhostButton(title: "Remove", icon: "trash") {} })
-                : AnyView(SilverButton(title: c.state == .conflict ? "Compare options" : "Add to calendar", icon: "plus") {}))
-                .padding(.horizontal, 20).padding(.bottom, 10).background(.ultraThinMaterial)
+            Group {
+                if c.state == .added {
+                    HStack(spacing: 10) {
+                        GhostButton(title: "Open in Calendar", icon: "calendar") { Haptics.tap() }
+                        GhostButton(title: "Remove", icon: "trash") { dismiss() }
+                    }
+                } else if c.state == .conflict {
+                    SilverButton(title: "Compare options", icon: "arrow.left.arrow.right") { goCompare = true }
+                } else {
+                    SilverButton(title: "Add to calendar", icon: "calendar.badge.plus") { dismiss() }
+                }
+            }
+            .padding(.horizontal, 20).padding(.bottom, 10).background(.ultraThinMaterial)
         }
     }
     private func detailRow(_ k: String, _ v: String) -> some View {
         HStack { Text(k).font(.subheadline).foregroundStyle(Theme.textSecondary); Spacer()
             Text(v).font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.text).multilineTextAlignment(.trailing) }
+    }
+}
+
+// MARK: - Conflict resolution
+
+struct ConflictCompareView: View {
+    let c: CalProposal
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Resolve conflict").font(.system(size: 28, weight: .bold)).foregroundStyle(Theme.text)
+                    Text("These two overlap. Pick how to handle it — Bruce won't change anything on its own.")
+                        .font(.subheadline).foregroundStyle(Theme.textSecondary)
+                }
+                eventCard("Existing", "Chemistry Review", "3:30 – 4:15 PM", Theme.textSecondary)
+                eventCard("Proposed", c.title, c.time, Theme.amber)
+                VStack(spacing: 12) {
+                    option("Reschedule the call", "Bruce asks Prof. Huo for a later slot")
+                    option("Keep both", "Accept the overlap")
+                    option("Skip the call", "Don't add it")
+                }
+                Color.clear.frame(height: 20)
+            }
+            .padding(.horizontal, 20).padding(.top, 8)
+        }
+        .scrollIndicators(.hidden)
+        .background(Theme.Backdrop())
+        .navigationBarTitleDisplayMode(.inline)
+        .hidesTabBar()
+    }
+    private func eventCard(_ tag: String, _ title: String, _ time: String, _ color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(tag.uppercased()).font(.system(size: 10, weight: .bold)).tracking(0.8).foregroundStyle(color)
+            Text(title).font(.system(size: 17, weight: .semibold)).foregroundStyle(Theme.text)
+            Text(time).font(.subheadline).foregroundStyle(Theme.textSecondary)
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(16).glass(18)
+    }
+    private func option(_ title: String, _ sub: String) -> some View {
+        Button { Haptics.tap(); dismiss() } label: {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                    Text(sub).font(.caption).foregroundStyle(Theme.textSecondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
+            }.padding(16).glass(16)
+        }.buttonStyle(PressStyle())
     }
 }
 
