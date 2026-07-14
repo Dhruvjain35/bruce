@@ -396,7 +396,7 @@ struct OnboardingView: View {
 
     private func statusColor(_ s: String) -> Color {
         switch s {
-        case "Requires school approval": return Theme.amber
+        case "Requires school access": return Theme.amber
         case "Coming later": return Theme.textTertiary
         default: return Theme.textSecondary
         }

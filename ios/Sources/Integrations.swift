@@ -41,15 +41,15 @@ struct IntegrationsView: View {
                     }
                 }
 
-                // Add-your-own entry.
+                // Add a source.
                 Button { showAdd = true } label: {
                     HStack(spacing: 13) {
                         Image(systemName: "plus").font(.system(size: 16, weight: .bold)).foregroundStyle(Theme.silver)
                             .frame(width: 42, height: 42)
                             .background(Theme.surfaceHi, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Add your own").font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
-                            Text("Any app or website with a link").font(.caption).foregroundStyle(Theme.textSecondary)
+                            Text("Add a source").font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
+                            Text("A website, calendar feed, forwarding rule, or folder").font(.caption).foregroundStyle(Theme.textSecondary)
                         }
                         Spacer()
                         Image(systemName: "chevron.right").font(.footnote.weight(.bold)).foregroundStyle(Theme.textTertiary)
@@ -103,29 +103,54 @@ struct IntegrationsView: View {
                 Text("Connected").font(.caption.weight(.semibold))
             }.foregroundStyle(Theme.green)
         case "Available":
-            Button { Haptics.tap() } label: {
-                Text("Connect").font(.system(size: 14, weight: .bold)).foregroundStyle(Theme.bg)
-                    .padding(.vertical, 8).padding(.horizontal, 16).background(Theme.silver, in: Capsule())
-            }.buttonStyle(PressStyle())
-        default:
-            Text(item.status).font(.caption.weight(.semibold)).foregroundStyle(Mock.integrationColor(item.status))
-                .multilineTextAlignment(.trailing).frame(maxWidth: 120, alignment: .trailing)
+            pill("Connect", fill: true) {}
+        case "Requires school access":
+            pill("Request access", fill: false, tint: Theme.amber) {}
+        case "Import only":
+            pill("Import", fill: false) {}
+        default: // Coming later
+            Text("Coming later").font(.caption.weight(.semibold)).foregroundStyle(Theme.textTertiary)
+                .frame(maxWidth: 110, alignment: .trailing)
         }
     }
+
+    private func pill(_ title: String, fill: Bool, tint: Color = Theme.textSecondary, action: @escaping () -> Void = {}) -> some View {
+        Button { Haptics.tap(); action() } label: {
+            Text(title).font(.system(size: 13, weight: .bold))
+                .foregroundStyle(fill ? Theme.bg : tint)
+                .padding(.vertical, 8).padding(.horizontal, 14)
+                .background(fill ? AnyShapeStyle(Theme.silver) : AnyShapeStyle(Theme.surfaceHi), in: Capsule())
+                .overlay(Capsule().strokeBorder(fill ? Color.clear : tint.opacity(0.35)))
+        }.buttonStyle(PressStyle())
+    }
+}
+
+struct AddSourceKind: Identifiable {
+    let id = UUID(); let name: String; let icon: String; let field: String; let placeholder: String; let keyboard: UIKeyboardType
 }
 
 struct AddCustomIntegrationView: View {
     @Environment(BruceStore.self) private var store
     @Environment(\.dismiss) private var dismiss
+    @State private var kind = 0
     @State private var name = ""
-    @State private var url = ""
+    @State private var value = ""
+
+    private let kinds: [AddSourceKind] = [
+        AddSourceKind(name: "Website", icon: "globe", field: "LINK", placeholder: "https://…", keyboard: .URL),
+        AddSourceKind(name: "Calendar feed", icon: "calendar", field: "ICS URL", placeholder: "webcal://… or https://…​.ics", keyboard: .URL),
+        AddSourceKind(name: "Forwarding rule", icon: "arrowshape.turn.up.right.fill", field: "FORWARD TO", placeholder: "you@school.edu → bruce", keyboard: .emailAddress),
+        AddSourceKind(name: "Shared folder", icon: "folder.fill", field: "FOLDER LINK", placeholder: "https://…", keyboard: .URL),
+        AddSourceKind(name: "RSS feed", icon: "dot.radiowaves.up.forward", field: "FEED URL", placeholder: "https://…/feed", keyboard: .URL),
+    ]
+    private var k: AddSourceKind { kinds[kind] }
 
     var body: some View {
         ZStack {
             Theme.Backdrop()
             VStack(spacing: 0) {
                 HStack {
-                    Text("Add integration").font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.text)
+                    Text("Add a source").font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.text)
                     Spacer()
                     Button { dismiss() } label: {
                         Image(systemName: "xmark").font(.system(size: 14, weight: .bold)).foregroundStyle(Theme.textSecondary)
@@ -136,11 +161,27 @@ struct AddCustomIntegrationView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        Text("Give Bruce any app or website. When you say “do this in \(name.isEmpty ? "…" : name),” Bruce opens this link and gets to work.")
+                        Text("Give Bruce a website, calendar feed, forwarding rule, or folder to watch.")
                             .font(.subheadline).foregroundStyle(Theme.textSecondary)
 
-                        field("APP OR WEBSITE NAME", placeholder: "e.g. Naviance", text: $name)
-                        field("LINK", placeholder: "https://…", text: $url, keyboard: .URL)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(Array(kinds.enumerated()), id: \.element.id) { i, kd in
+                                    Button { Haptics.select(); kind = i } label: {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: kd.icon).font(.system(size: 12, weight: .semibold))
+                                            Text(kd.name).font(.subheadline.weight(.semibold))
+                                        }
+                                        .foregroundStyle(kind == i ? Theme.bg : Theme.textSecondary)
+                                        .padding(.horizontal, 13).padding(.vertical, 9)
+                                        .background(kind == i ? AnyShapeStyle(Theme.silver) : AnyShapeStyle(Theme.surfaceHi), in: Capsule())
+                                    }.buttonStyle(PressStyle())
+                                }
+                            }
+                        }
+
+                        field("NAME", placeholder: "e.g. Robotics club site", text: $name)
+                        field(k.field, placeholder: k.placeholder, text: $value, keyboard: k.keyboard)
 
                         Color.clear.frame(height: 90)
                     }
@@ -153,12 +194,12 @@ struct AddCustomIntegrationView: View {
         .presentationBackground(Theme.bg)
         .preferredColorScheme(.dark)
         .safeAreaInset(edge: .bottom) {
-            SilverButton(title: "Add integration", icon: "checkmark") {
+            SilverButton(title: "Add source", icon: "checkmark") {
                 let n = name.trimmingCharacters(in: .whitespaces)
-                let u = url.trimmingCharacters(in: .whitespaces)
-                if !n.isEmpty && !u.isEmpty { store.addCustomIntegration(name: n, url: u); dismiss() }
+                let u = value.trimmingCharacters(in: .whitespaces)
+                if !n.isEmpty && !u.isEmpty { store.addCustomIntegration(name: "\(n) · \(k.name)", url: u); dismiss() }
             }
-            .opacity(name.trimmingCharacters(in: .whitespaces).isEmpty || url.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
+            .opacity(name.trimmingCharacters(in: .whitespaces).isEmpty || value.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
             .padding(.horizontal, 20).padding(.top, 14).padding(.bottom, 12).background(Theme.bottomFade)
         }
     }
@@ -168,7 +209,7 @@ struct AddCustomIntegrationView: View {
             Text(label).font(.system(size: 10, weight: .bold)).tracking(0.8).foregroundStyle(Theme.textTertiary)
             TextField("", text: text, prompt: Text(placeholder).foregroundColor(Theme.textTertiary))
                 .font(.system(size: 16)).foregroundStyle(Theme.text).tint(Theme.silver)
-                .keyboardType(keyboard).autocorrectionDisabled().textInputAutocapitalization(keyboard == .URL ? .never : .words)
+                .keyboardType(keyboard).autocorrectionDisabled().textInputAutocapitalization(keyboard == .default ? .words : .never)
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(14).glass(16)
     }

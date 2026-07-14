@@ -421,55 +421,47 @@ enum Mock {
     struct IntegrationItem: Identifiable { let id = UUID(); let name: String; let icon: String; let status: String; let detail: String }
     struct CustomIntegration: Identifiable { let id = UUID(); let name: String; let url: String }
     struct IntegrationSection: Identifiable { let id = UUID(); let title: String; let items: [IntegrationItem] }
+    // Honest states: Connected · Available (Connect) · Requires school access (Request access) · Import only · Coming later
     static let integrationCatalog: [IntegrationSection] = [
-        IntegrationSection(title: "Grades", items: [
-            IntegrationItem(name: "Gradeway", icon: "chart.bar.fill", status: "Available", detail: "Grades + GPA from your district's Home Access Center"),
-            IntegrationItem(name: "PowerSchool", icon: "chart.bar.fill", status: "Available", detail: "Grades and report cards"),
-            IntegrationItem(name: "Skyward", icon: "chart.bar.fill", status: "Available", detail: "Grades and attendance"),
-        ]),
-        IntegrationSection(title: "Calendar", items: [
+        IntegrationSection(title: "Available now", items: [
             IntegrationItem(name: "Apple Calendar", icon: "calendar", status: "Connected", detail: "Deadlines and events"),
             IntegrationItem(name: "Google Calendar", icon: "calendar", status: "Available", detail: "Deadlines and events"),
-        ]),
-        IntegrationSection(title: "Email", items: [
-            IntegrationItem(name: "Gmail", icon: "envelope.fill", status: "Connected", detail: "Reads important school mail"),
-            IntegrationItem(name: "Outlook", icon: "envelope.fill", status: "Available", detail: "Reads important school mail"),
+            IntegrationItem(name: "Gmail", icon: "envelope.fill", status: "Available", detail: "Reads important school mail"),
+            IntegrationItem(name: "Google Drive", icon: "folder.fill", status: "Available", detail: "Attach documents to missions"),
             IntegrationItem(name: "Forward-to-Bruce address", icon: "arrowshape.turn.up.right.fill", status: "Available", detail: "Forward anything to your Bruce inbox"),
         ]),
-        IntegrationSection(title: "School systems", items: [
-            IntegrationItem(name: "Google Classroom", icon: "graduationcap.fill", status: "Available", detail: "Assignments and due dates"),
-            IntegrationItem(name: "Canvas", icon: "book.closed.fill", status: "Available", detail: "Assignments and due dates"),
-            IntegrationItem(name: "Schoology", icon: "book.closed.fill", status: "Available", detail: "Assignments and grades"),
-            IntegrationItem(name: "Microsoft Teams", icon: "person.2.fill", status: "Coming later", detail: "Class messages"),
+        IntegrationSection(title: "School connections", items: [
+            IntegrationItem(name: "Google Classroom", icon: "graduationcap.fill", status: "Requires school access", detail: "Assignments and due dates · beta"),
+            IntegrationItem(name: "Canvas", icon: "book.closed.fill", status: "Requires school access", detail: "Assignments and due dates · beta"),
+            IntegrationItem(name: "Schoology", icon: "book.closed.fill", status: "Requires school access", detail: "Only on supported schools"),
+            IntegrationItem(name: "PowerSchool", icon: "chart.bar.fill", status: "Coming later", detail: "Grades and report cards"),
+            IntegrationItem(name: "Skyward", icon: "chart.bar.fill", status: "Coming later", detail: "Grades and attendance"),
         ]),
-        IntegrationSection(title: "Notes & study", items: [
-            IntegrationItem(name: "Notion", icon: "note.text", status: "Available", detail: "Pull tasks and notes into missions"),
-            IntegrationItem(name: "Google Docs", icon: "doc.fill", status: "Available", detail: "Attach and draft documents"),
-            IntegrationItem(name: "Quizlet", icon: "rectangle.on.rectangle", status: "Available", detail: "Study sets before tests"),
-            IntegrationItem(name: "Khan Academy", icon: "play.rectangle.fill", status: "Available", detail: "Practice and assignments"),
-            IntegrationItem(name: "Desmos", icon: "function", status: "Available", detail: "Graphing for math classes"),
-            IntegrationItem(name: "Grammarly", icon: "checkmark.bubble.fill", status: "Available", detail: "Polish before you send"),
+        IntegrationSection(title: "Grades", items: [
+            IntegrationItem(name: "Gradeway (Home Access Center)", icon: "chart.bar.fill", status: "Coming later", detail: "Grades + GPA · not an official connection yet"),
         ]),
-        IntegrationSection(title: "Files", items: [
-            IntegrationItem(name: "Google Drive", icon: "folder.fill", status: "Available", detail: "Attach documents to missions"),
-            IntegrationItem(name: "iCloud Drive", icon: "icloud.fill", status: "Available", detail: "Attach documents to missions"),
+        IntegrationSection(title: "Import from", items: [
+            IntegrationItem(name: "Files", icon: "doc.fill", status: "Import only", detail: "Pick a document to hand Bruce"),
+            IntegrationItem(name: "iCloud Drive", icon: "icloud.fill", status: "Import only", detail: "Pick a document to hand Bruce"),
+            IntegrationItem(name: "Google Docs", icon: "doc.richtext.fill", status: "Import only", detail: "Import a doc, no account link"),
+            IntegrationItem(name: "Notion", icon: "note.text", status: "Import only", detail: "Import an exported page"),
+            IntegrationItem(name: "Shared links", icon: "link", status: "Import only", detail: "Paste any link to a page"),
         ]),
     ]
     static func integrationColor(_ s: String) -> Color {
         switch s {
         case "Connected": return Theme.green
-        case "Requires school approval": return Theme.amber
+        case "Requires school access": return Theme.amber
+        case "Import only": return Theme.textSecondary
         case "Coming later": return Theme.textTertiary
         default: return Theme.textSecondary
         }
     }
     static let integrations: [Integration] = [
-        Integration(name: "Gradeway (grades + GPA)", icon: "chart.bar.fill", status: "Available"),
-        Integration(name: "Google Classroom", icon: "graduationcap.fill", status: "Available"),
-        Integration(name: "Canvas", icon: "book.closed.fill", status: "Available"),
-        Integration(name: "Notion", icon: "note.text", status: "Available"),
-        Integration(name: "School email", icon: "envelope.fill", status: "Available"),
-        Integration(name: "Microsoft Teams", icon: "person.2.fill", status: "Coming later"),
+        Integration(name: "Google Calendar", icon: "calendar", status: "Available"),
         Integration(name: "Forward-to-Bruce address", icon: "arrowshape.turn.up.right.fill", status: "Available"),
+        Integration(name: "Google Classroom", icon: "graduationcap.fill", status: "Requires school access"),
+        Integration(name: "Canvas", icon: "book.closed.fill", status: "Requires school access"),
+        Integration(name: "Gradeway (grades)", icon: "chart.bar.fill", status: "Coming later"),
     ]
 }
