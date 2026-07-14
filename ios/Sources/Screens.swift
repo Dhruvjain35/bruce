@@ -271,6 +271,9 @@ struct ApprovalSheet: View {
             Text("Sent to Prof. Huo").font(.system(size: 22, weight: .bold)).foregroundStyle(Theme.text)
             Text("Bruce will confirm delivery and watch for a reply.\nYou'll see it in your activity.")
                 .font(.subheadline).foregroundStyle(Theme.textSecondary).multilineTextAlignment(.center)
+            Label("A sent email can't be unsent — that's why Bruce asked first.", systemImage: "lock.fill")
+                .font(.caption).foregroundStyle(Theme.textTertiary).multilineTextAlignment(.center)
+                .padding(.top, 2)
             Spacer()
             SilverButton(title: "Done") { dismiss() }.padding(.horizontal, 18).padding(.bottom, 16)
         }

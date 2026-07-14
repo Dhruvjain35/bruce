@@ -49,7 +49,8 @@ struct HomeView: View {
         .safeAreaInset(edge: .top) { if Demo.state == "offline" { OfflineBanner() } }
         .overlay(alignment: .bottom) {
             if Demo.state == "undo" {
-                Toast(text: "Sent to Prof. Huo", action: "Undo").padding(.bottom, 108)
+                // Undo is only for reversible actions — never for a sent email.
+                Toast(text: "Added Science Fair deadline", action: "Undo").padding(.bottom, 108)
             }
         }
         .toolbar(.hidden, for: .navigationBar)
