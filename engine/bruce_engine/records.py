@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -13,6 +14,18 @@ class SourceRecord(BaseModel):
     kind: str
     content_sha256: str | None = None
     raw_text: str | None = None
+    expires_at: datetime.datetime | None = None
+    idempotency_key: str | None = None
+    version: int = 1
+
+
+class SourceSpanRecord(BaseModel):
+    """A verbatim span of a source — the grounding anchor a task points back to."""
+
+    id: UUID | None = None
+    user_id: UUID
+    source_id: UUID
+    span_text: str
     version: int = 1
 
 
@@ -24,6 +37,7 @@ class TaskRecord(BaseModel):
     due: str | None = None
     status: str = "open"
     source_id: UUID | None = None
+    span_id: UUID | None = None  # the exact span this task was grounded in (source -> span -> task)
     required_items: list = Field(default_factory=list)
     idempotency_key: str | None = None
     version: int = 1

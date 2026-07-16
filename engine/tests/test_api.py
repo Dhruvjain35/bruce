@@ -21,6 +21,7 @@ from bruce_engine.models import (
     Task,
     TaskKind,
 )
+from bruce_engine.intake_store import PersistedIntake
 from bruce_engine.repositories import InMemoryMissionRepository, InMemoryStore
 
 SECRET = "test-secret"
@@ -91,6 +92,8 @@ def test_account_delete_requires_auth():
 
 
 def test_intake_endpoint(monkeypatch):
+    """Offline contract check: response SHAPE only. Real persistence is covered against real
+    Postgres in test_intake_persistence.py — this suite must not need a database."""
     fake = ExtractedIntake(
         source_kind=IntakeSourceKind.text, title="Science Fair",
         deadlines=[ExtractedDeadline(label="Registration", date="2026-02-28", source_span="x", confidence=0.9)],
@@ -99,10 +102,34 @@ def test_intake_endpoint(monkeypatch):
     async def fake_extract(text, source_kind=IntakeSourceKind.text):
         return fake
 
+    async def fake_persist(*, user_id, text, source_kind, extract, idempotency_key=None):
+        return PersistedIntake(
+            intake=await extract(text, source_kind),
+            source_id=uuid4(), span_ids=[uuid4()], task_ids=[uuid4()],
+        )
+
     monkeypatch.setattr(api, "extract_from_text", fake_extract)
+    monkeypatch.setattr(api, "_persist_intake", fake_persist)
     r = client.post("/v1/intake", json={"text": "Registration closes Feb 28, 2026."}, headers=_auth(uuid4()))
     assert r.status_code == 200 and r.json()["title"] == "Science Fair"
+    # additive contract: the extraction still sits at its original paths, ids are new
+    assert r.json()["deadlines"][0]["label"] == "Registration"
+    assert r.json()["source_id"] and len(r.json()["task_ids"]) == 1
     assert client.post("/v1/intake", json={"text": "x"}).status_code == 401  # auth required
+
+
+def test_intake_failure_leaks_no_content(monkeypatch):
+    """A failed extraction must surface the exception TYPE only — never the student's raw text."""
+    secret = "SECRET essay text and parent phone 555-0100"
+
+    async def boom(*a, **k):
+        raise ValueError(secret)
+
+    monkeypatch.setattr(api, "_persist_intake", boom)
+    r = client.post("/v1/intake", json={"text": secret}, headers=_auth(uuid4()))
+    assert r.status_code == 502
+    assert secret not in r.text and "555-0100" not in r.text
+    assert r.json()["detail"] == "extraction failed: ValueError"
 
 
 def test_opportunities_endpoint(monkeypatch):

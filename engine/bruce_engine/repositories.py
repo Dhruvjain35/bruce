@@ -154,14 +154,16 @@ class InMemoryMissionRepository:
 def _source_rec(row: schema.Source) -> SourceRecord:
     return SourceRecord(
         id=row.id, user_id=row.user_id, kind=row.kind, content_sha256=row.content_sha256,
-        raw_text=row.raw_text, version=row.version,
+        raw_text=row.raw_text, expires_at=row.expires_at, idempotency_key=row.idempotency_key,
+        version=row.version,
     )
 
 
 def _task_rec(row: schema.TaskRow) -> TaskRecord:
     return TaskRecord(
         id=row.id, user_id=row.user_id, kind=row.kind, title=row.title, due=row.due,
-        status=row.status, source_id=row.source_id, required_items=row.required_items or [],
+        status=row.status, source_id=row.source_id, span_id=row.span_id,
+        required_items=row.required_items or [],
         idempotency_key=row.idempotency_key, version=row.version,
     )
 
@@ -180,6 +182,7 @@ class PostgresSourceRepository:
             row = schema.Source(
                 user_id=source.user_id, kind=source.kind,
                 content_sha256=source.content_sha256, raw_text=source.raw_text,
+                expires_at=source.expires_at, idempotency_key=source.idempotency_key,
             )
             s.add(row)
             await s.flush()
@@ -225,7 +228,7 @@ class PostgresTaskRepository:
                     return _task_rec(existing)
             row = schema.TaskRow(
                 user_id=task.user_id, kind=task.kind, title=task.title, due=task.due,
-                status=task.status, source_id=task.source_id,
+                status=task.status, source_id=task.source_id, span_id=task.span_id,
                 required_items=task.required_items, idempotency_key=task.idempotency_key,
             )
             s.add(row)

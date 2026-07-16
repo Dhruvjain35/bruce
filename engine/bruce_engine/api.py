@@ -2,9 +2,13 @@
 
 Every endpoint derives the user from a verified JWT (never from client input). Missions are
 persisted in Postgres and scoped to the authenticated user (404 on wrong owner); the background
-worker runs under explicit user context. Phase-1 compute endpoints (intake/opportunities/tasks/
-calendar/brief) are stateless today but still require auth. In-memory store (missions) is gone —
-missions survive restart. Run: PYTHONPATH=. python scripts/run_api.py
+worker runs under explicit user context. /v1/intake is persistence-backed too: it durably writes
+source -> spans -> tasks under RLS, atomically and idempotently (see intake_store).
+
+STILL STATELESS (honest status): /v1/opportunities, /v1/tasks, /v1/calendar and /v1/brief compute
+from request input and persist nothing — /v1/tasks and /v1/brief still require the CLIENT to hand
+back the state on every call. They are being migrated one at a time, in that order; do not read
+their auth-gating as persistence. Run: PYTHONPATH=. python scripts/run_api.py
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from . import calendar_build
+from . import intake_store
 from . import tasks as tasks_mod
 from .auth import AuthenticatedUser, current_user
 from .briefing import compose_brief
@@ -39,9 +44,10 @@ from .repositories import PostgresMissionRepository, PostgresUserRepository
 
 app = FastAPI(title="Bruce Engine API", version="0.2.0")
 
-# Swappable for tests (monkeypatch to in-memory implementations).
+# Swappable for tests (monkeypatch to in-memory implementations). Production is Postgres-only.
 _mission_repo = PostgresMissionRepository()
 _user_repo = PostgresUserRepository()
+_persist_intake = intake_store.persist_intake
 
 
 class MissionStatus(str, Enum):
@@ -166,14 +172,49 @@ async def delete_account(user: AuthenticatedUser = Depends(current_user)) -> dic
 class IntakeRequest(BaseModel):
     text: str = Field(min_length=1)
     source_kind: IntakeSourceKind = IntakeSourceKind.text
+    # Optional: a retry with the same key is idempotent. Omit it and the key is derived from the
+    # content itself, so a double-tap in the app is already safe without client cooperation.
+    idempotency_key: str | None = Field(default=None, max_length=intake_store.MAX_CLIENT_KEY)
 
 
-@app.post("/v1/intake", response_model=ExtractedIntake)
-async def intake(req: IntakeRequest, user: AuthenticatedUser = Depends(current_user)) -> ExtractedIntake:
+class IntakeResponse(ExtractedIntake):
+    """The extraction (unchanged, every field at its original path) PLUS the ids it durably created.
+
+    Additive by design: existing clients reading title/deadlines/required_items are unaffected; the
+    Swift client gets stable ids it can fetch back. source_id -> span_ids -> task_ids is the real
+    lineage, not a display convenience.
+    """
+
+    source_id: UUID
+    span_ids: list[UUID] = Field(default_factory=list)
+    task_ids: list[UUID] = Field(default_factory=list)
+
+
+@app.post("/v1/intake", response_model=IntakeResponse)
+async def intake(req: IntakeRequest, user: AuthenticatedUser = Depends(current_user)) -> IntakeResponse:
+    """Extract a raw student input AND durably persist source -> spans -> tasks for that user.
+
+    user_id comes only from the verified token. Persistence is atomic: a failed extraction leaves
+    no source behind. Retries return the original ids and the original extraction.
+    """
+    await _user_repo.ensure(user.user_id, auth_provider=user.auth_provider)
     try:
-        return await extract_from_text(req.text, source_kind=req.source_kind)
+        result = await _persist_intake(
+            user_id=user.user_id,
+            text=req.text,
+            source_kind=req.source_kind,
+            extract=extract_from_text,  # resolved here (not at import) so tests can patch it
+            idempotency_key=req.idempotency_key,
+        )
     except Exception as exc:
+        # Type only — never the message: it can quote the student's raw content.
         raise HTTPException(status_code=502, detail=f"extraction failed: {type(exc).__name__}")
+    return IntakeResponse(
+        **result.intake.model_dump(),
+        source_id=result.source_id,
+        span_ids=result.span_ids,
+        task_ids=result.task_ids,
+    )
 
 
 class OpportunityRequest(BaseModel):

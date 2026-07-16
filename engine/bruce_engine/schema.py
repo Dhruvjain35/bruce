@@ -75,7 +75,14 @@ class Source(Base, TSV):
     content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)  # temporary; cleared per retention
     expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Derived+minimized extraction (ExtractedIntake JSON): replayed on idempotent retry so a retry
+    # can't return a fresh LLM result contradicting the spans/tasks already stored. Durable like
+    # spans/tasks — the retention sweep clears raw_text only.
+    extracted: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     meta: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    # The DB-level guarantee that one intake can never create two sources (see 0003).
+    __table_args__ = (UniqueConstraint("user_id", "idempotency_key", name="uq_source_idem"),)
 
 
 class SourceSpan(Base, TSV):
@@ -88,6 +95,9 @@ class SourceSpan(Base, TSV):
         UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"), nullable=False, index=True
     )
     span_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Which extracted item (0-based) this span grounds. The ONLY stable ordering for a source's
+    # spans: they are all written in one transaction, so created_at ties exactly and id is random.
+    ordinal: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class Opportunity(Base, TSV):

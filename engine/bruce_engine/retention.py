@@ -39,6 +39,7 @@ Never log deleted content: nothing here prints, returns, or persists ``raw_text`
 from __future__ import annotations
 
 import datetime
+import os
 from uuid import UUID
 
 import asyncpg
@@ -49,6 +50,32 @@ from . import schema
 from .db import user_session
 
 _RETENTION_EVENT = "source_retention"
+
+# THE raw-content retention policy. This module is its only home: writers MUST stamp expires_at via
+# expires_at_for() rather than inventing a window, so the sweep below and the writers can never
+# disagree. 30 days is a deliberate default, not a derived one — long enough that a student can
+# still open the original email/PDF Bruce acted on, short enough that raw content isn't kept
+# indefinitely for a product that only needs it long enough to extract grounded spans/tasks.
+# Override per-deployment with BRUCE_RAW_RETENTION_DAYS. Shortening it is safe and retroactive:
+# the sweep selects on expires_at < now, so already-written rows expire earlier automatically.
+DEFAULT_RAW_RETENTION_DAYS = 30
+
+
+def raw_retention_days() -> int:
+    """Active retention window in days (env-overridable). Read per call so tests can vary it."""
+    raw = os.environ.get("BRUCE_RAW_RETENTION_DAYS")
+    if not raw:
+        return DEFAULT_RAW_RETENTION_DAYS
+    try:
+        days = int(raw)
+    except ValueError:
+        return DEFAULT_RAW_RETENTION_DAYS
+    return days if days >= 0 else DEFAULT_RAW_RETENTION_DAYS
+
+
+def expires_at_for(now: datetime.datetime) -> datetime.datetime:
+    """When raw_text written at ``now`` must be erased. The only way writers should set expires_at."""
+    return now + datetime.timedelta(days=raw_retention_days())
 
 
 async def _owner_conn() -> asyncpg.Connection:
