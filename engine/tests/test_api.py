@@ -64,7 +64,13 @@ def _goal():
 
 
 def test_health_is_public():
-    assert client.get("/health").json() == {"status": "ok"}
+    """Public liveness. Additive since deployment: it now also reports commit/region so a live URL
+    can be tied to an exact revision. status stays 'ok'; it must never require auth or leak config."""
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok" and body["service"] == "bruce-engine"
+    assert set(body) == {"status", "service", "commit", "region"}  # nothing else escapes
 
 
 def test_mission_requires_auth():

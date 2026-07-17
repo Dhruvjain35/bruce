@@ -1,0 +1,83 @@
+# Bruce engine -> Alibaba Cloud Function Compute 3.0 (Singapore / ap-southeast-1)
+#
+# Deployed with Serverless Devs:  s deploy -t deploy/s.yaml
+#
+# WHY FUNCTION COMPUTE: new users get a 150,000 CU/month trial for 3 months, and there is no
+# always-on instance to pay for — a request-driven hackathon API is exactly the shape FC bills well.
+#
+# STATUS — READ THIS BEFORE TRUSTING THIS FILE:
+# This configuration has NOT been applied. As of 2026-07-16 the Alibaba Cloud account is under
+# RISK.RISK_CONTROL_REJECTION (see docs/deployment-verification.md), and no RAM AccessKey has been
+# issued to this workspace, so `s deploy` has never run. The values below follow the documented
+# FC 3.0 / fc3-component schema but are UNVALIDATED against a live deployment. Treat every field as
+# a proposal until docs/deployment-verification.md records a real deployment.
+#
+# SECRETS: every credential below is a ${env(...)} reference resolved from the DEPLOYER's shell at
+# deploy time and stored by Function Compute. Nothing secret is committed here, and nothing secret
+# is baked into the image (see engine/.dockerignore). Rotate by updating the FC environment
+# variable, not by rebuilding.
+
+edition: 3.0.0
+name: bruce-engine
+access: default
+
+vars:
+  region: ap-southeast-1
+  # ACR image. FC requires the image to live in Alibaba Container Registry in the SAME region and
+  # SAME account as the function — a Docker Hub / ghcr image will not work.
+  image: ${env(BRUCE_IMAGE)}
+
+resources:
+  bruce-api:
+    component: fc3
+    props:
+      region: ${vars.region}
+      functionName: bruce-engine
+      description: Bruce — student-life action engine (hackathon vertical slice)
+      runtime: custom-container
+      # 1 vCPU / 2GB: the intake path holds a DB transaction across a model call, so it is
+      # latency-bound, not CPU-bound. Raise memorySize before cpu if cold starts hurt.
+      cpu: 1
+      memorySize: 2048
+      diskSize: 512
+      # Generous: an intake does image transcription + extraction + DB writes in one request.
+      timeout: 120
+      # Required — the function must reach Qwen Cloud, Google Calendar, and ApsaraDB.
+      internetAccess: true
+      customContainerConfig:
+        image: ${vars.image}
+        port: 9000
+      environmentVariables:
+        BRUCE_REGION: ${vars.region}
+        BRUCE_COMMIT: ${env(BRUCE_COMMIT)}
+        # --- auth (JWT verification stays ON in the deployment; never disabled for a demo) ---
+        BRUCE_JWT_SECRET: ${env(BRUCE_JWT_SECRET)}
+        BRUCE_JWT_AUDIENCE: ${env(BRUCE_JWT_AUDIENCE)}
+        # --- Postgres stays EXTERNAL (ApsaraDB RDS). The app connects as the restricted
+        #     bruce_app role so RLS is enforced by the database, exactly as it is locally.
+        #     There is no in-memory fallback: that would discard the persistence architecture. ---
+        BRUCE_DATABASE_URL: ${env(BRUCE_DATABASE_URL)}
+        BRUCE_APP_DATABASE_URL: ${env(BRUCE_APP_DATABASE_URL)}
+        # --- Qwen Cloud. Configured, and deliberately NOT failed-over to another provider:
+        #     while inference is blocked the intake path returns 503 provider_unavailable. ---
+        BRUCE_INTAKE_PROVIDER: qwen
+        DASHSCOPE_API_KEY: ${env(DASHSCOPE_API_KEY)}
+        QWEN_BASE_URL: ${env(QWEN_BASE_URL)}
+        QWEN_INTAKE_MODEL: ${env(QWEN_INTAKE_MODEL)}
+        # --- Google Calendar (execute-once + read-back verification) ---
+        GOOGLE_CLIENT_ID: ${env(GOOGLE_CLIENT_ID)}
+        GOOGLE_CLIENT_SECRET: ${env(GOOGLE_CLIENT_SECRET)}
+        GOOGLE_REFRESH_TOKEN: ${env(GOOGLE_REFRESH_TOKEN)}
+        GOOGLE_CALENDAR_ID: ${env(GOOGLE_CALENDAR_ID)}
+      triggers:
+        - triggerName: httpTrigger
+          triggerType: http
+          triggerConfig:
+            # anonymous at the GATEWAY only. Authorization is Bruce's own JWT verification on every
+            # /v1/* route — FC signature auth would break normal bearer-token clients. /health is
+            # the only genuinely public route; everything else 401s without a valid token.
+            authType: anonymous
+            methods:
+              - GET
+              - POST
+              - DELETE

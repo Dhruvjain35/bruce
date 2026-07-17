@@ -1,0 +1,25 @@
+# SECRETS — must never reach an image layer. .env holds DASHSCOPE_API_KEY / JWT secret / DB URLs.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local-only / not needed at runtime
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Tests and fixtures stay out of the deployed image: they add weight, and fixtures are sample
+# student-style documents that have no business being shipped to a public endpoint.
+tests/
+scripts/
+
+# Docs / VCS
+.git/
+.github/
+README.md

@@ -14,15 +14,22 @@ their auth-gating as persistence. Run: PYTHONPATH=. python scripts/run_api.py
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import date
 from enum import Enum
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from pydantic_ai import Agent
+from sqlalchemy import text as sa_text
+
+from .db import user_session
 
 from . import calendar_build
 from . import intake_store
+from . import llm
+from . import provider_status
 from . import tasks as tasks_mod
 from .auth import AuthenticatedUser, current_user
 from .briefing import compose_brief
@@ -131,7 +138,79 @@ async def _run_mission(mission_id: UUID, user_id: UUID, req: MissionRequest) -> 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    """PUBLIC liveness probe — no auth, no secrets, no user data.
+
+    Deliberately dumb: it proves the process is up and serving, nothing more. It must never touch
+    the database or a provider, or a provider outage would make the platform think the service is
+    dead and recycle it. Deeper checks live behind auth on /v1/diagnostics.
+
+    BRUCE_COMMIT is injected at build time so a deployed URL can be tied to an exact commit — the
+    hackathon submission has to prove which code is running.
+    """
+    return {
+        "status": "ok",
+        "service": "bruce-engine",
+        "commit": os.environ.get("BRUCE_COMMIT", "unknown"),
+        "region": os.environ.get("BRUCE_REGION", "unknown"),
+    }
+
+
+class ProviderReport(BaseModel):
+    provider: str
+    model: str
+    configured: bool
+    live: bool
+    detail: str
+
+
+class Diagnostics(BaseModel):
+    commit: str
+    region: str
+    database: str
+    intake_provider: ProviderReport
+
+
+@app.get("/v1/diagnostics", response_model=Diagnostics)
+async def diagnostics(user: AuthenticatedUser = Depends(current_user)) -> Diagnostics:
+    """AUTHENTICATED deployment verification: is this deployment actually wired to anything real?
+
+    Requires a valid JWT — it reports infrastructure state, which is not public information. It
+    returns NO student data and NO secrets: provider/model names and reachability only.
+
+    `live` is the honest bit. It is True only if a real inference call to the configured provider
+    succeeds right now. While Qwen Cloud is account-blocked this returns live=false with the real
+    reason, and it must stay that way until a genuine call succeeds.
+    """
+    db_state = "unknown"
+    try:
+        async with user_session(user.user_id) as s:
+            await s.execute(sa_text("SELECT 1"))
+        db_state = "connected"
+    except Exception as exc:
+        db_state = f"unavailable ({type(exc).__name__})"
+
+    provider, model = llm.intake_provider(), llm.qwen_intake_model_id()
+    live, detail = False, ""
+    try:
+        agent = Agent(llm.intake_model())
+        await agent.run("ping")
+        live, detail = True, "a real inference call succeeded"
+    except Exception as exc:
+        unavailable = provider_status.classify(exc, provider=provider, model=model)
+        detail = unavailable.reason if unavailable else f"unexpected: {type(exc).__name__}"
+
+    return Diagnostics(
+        commit=os.environ.get("BRUCE_COMMIT", "unknown"),
+        region=os.environ.get("BRUCE_REGION", "unknown"),
+        database=db_state,
+        intake_provider=ProviderReport(
+            provider=provider,
+            model=model,
+            configured=bool(os.environ.get("DASHSCOPE_API_KEY")),
+            live=live,
+            detail=detail,
+        ),
+    )
 
 
 @app.post("/v1/missions", response_model=MissionCreated)
@@ -207,6 +286,16 @@ async def intake(req: IntakeRequest, user: AuthenticatedUser = Depends(current_u
             idempotency_key=req.idempotency_key,
         )
     except Exception as exc:
+        # A provider outage is reported as exactly that — 503 provider_unavailable, naming the
+        # provider and the real cause. It is NOT retried against a different provider: silently
+        # answering with OpenAI while claiming a Qwen-powered workflow would be a lie. And it is
+        # never turned into an empty-but-successful intake, which would read to the student as
+        # "Bruce read your flyer and found nothing".
+        unavailable = provider_status.classify(
+            exc, provider=llm.intake_provider(), model=llm.qwen_intake_model_id()
+        )
+        if unavailable is not None:
+            raise HTTPException(status_code=503, detail=unavailable.as_detail())
         # Type only — never the message: it can quote the student's raw content.
         raise HTTPException(status_code=502, detail=f"extraction failed: {type(exc).__name__}")
     return IntakeResponse(
