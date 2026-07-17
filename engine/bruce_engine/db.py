@@ -51,3 +51,25 @@ async def user_session(user_id: UUID) -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+
+
+@asynccontextmanager
+async def worker_session() -> AsyncIterator[AsyncSession]:
+    """Session for the intake worker's QUEUE operations ONLY (claim/lease/status transitions).
+
+    Sets the transaction-local ``app.worker='on'`` flag, which the intake_jobs RLS policy admits so
+    the worker can claim jobs across users. This is set ONLY here, in server worker code — never in a
+    request handler, never from user input — so it can never widen a user's visibility. It grants
+    access to the intake_jobs table alone; all CONTENT writes (sources/spans/tasks) still go through
+    user_session(job.user_id) and stay fully tenant-scoped.
+    """
+    get_engine()
+    assert _sessionmaker is not None
+    async with _sessionmaker() as session:
+        await session.execute(text("SELECT set_config('app.worker', 'on', true)"))
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise

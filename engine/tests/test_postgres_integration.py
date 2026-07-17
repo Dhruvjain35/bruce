@@ -65,6 +65,10 @@ _RLS_TABLES = [
     "users", "sources", "source_spans", "opportunities", "tasks", "calendar_proposals",
     "briefs", "missions", "mission_phase_events", "approvals", "receipts", "model_costs",
     "audit_events",
+    # Added 0004. integrations holds ENCRYPTED Google refresh tokens and oauth_states holds
+    # single-use PKCE verifiers — a new table that quietly missed RLS would be the worst possible
+    # place for the gap, so they are covered by the same all-tables guarantee as everything else.
+    "integrations", "oauth_states",
 ]
 
 

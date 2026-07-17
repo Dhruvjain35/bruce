@@ -32,6 +32,17 @@ Bias: permissive licenses only for anything shipped in a hosted/commercial Bruce
 
 ## Inference / models
 
+> **PRODUCTION ROUTING UPDATE (2026-07-17) — this supersedes the Featherless-primary plan below.**
+> Production runs entirely on **OpenAI `gpt-5.4-mini`**: vision transcription (image/scanned-PDF →
+> text), structured task/date extraction, drafting, and verification. Selectable-PDF text is local
+> **pdfplumber**; ambiguous fields go to student review. This is a **latency** decision — live
+> measurement put the Featherless serverless path at ~34s steady-state with a **252s cold-start
+> tail**, and one four-minute wait destroys the "hand it to Bruce and it works" promise; tail, not
+> average, is the enemy. **Featherless is now offline-only** (eval, batch, model comparison,
+> backfills), **disabled by default** behind `BRUCE_ENABLE_FEATHERLESS`, and never on a synchronous
+> request path or a silent fallback. The provider-neutral factory is kept for exactly those offline
+> jobs. Alibaba Qwen Cloud is not used. Authoritative routing lives in `engine/bruce_engine/llm.py`.
+
 - **Featherless** (OpenAI-compatible, `https://api.featherless.ai/v1`) for the cheap/high-volume steps. Confirmed live: key valid, 22k+ models, `Qwen/Qwen3-30B-A3B-Instruct-2507` returns completions. Bills by **concurrent units, not tokens** (70B = 4 units). Use **Qwen3 / Kimi-K2** for structured output. Model IDs verified against the live `/v1/models` list (do not trust memorized IDs).
 - **Model per engine step:** intent/topic parse → small Qwen3; finding extraction → Qwen3-32B; grounded drafting → Qwen3-32B/larger (or Llama-3.3-70B for warmer prose); **verification/entailment → frontier Claude** (Anthropic direct, separate Agent, low-volume, safety-critical). Claude needs an Anthropic key we don't have yet — until then, run verification on a strong open model and treat it as provisional.
 - **Structured-output caveat (empirical, resolved):** PydanticAI's default tool-calling structured output returned a 500 from Featherless on the Qwen3-30B MoE. **Confirmed fix:** PydanticAI **PromptedOutput** mode (prompted JSON, no tool-calling) works on both `Qwen/Qwen3-32B` and `Qwen/Qwen3-30B-A3B-Instruct-2507`; `Qwen3-32B` also handles default tool-calling, but we standardize on **PromptedOutput** for robustness. Codified in `engine/bruce_engine/llm.py`. (Kimi-K2 was 503/cold at test time.)

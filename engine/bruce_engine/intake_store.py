@@ -50,7 +50,7 @@ from sqlalchemy.exc import IntegrityError
 from . import retention, schema
 from . import tasks as tasks_mod
 from .db import user_session
-from .models import ExtractedIntake, IntakeSourceKind
+from .models import ExtractedIntake, IntakeSourceKind, MissionPhase
 
 # Client-supplied keys are bounded so the derived per-task key ("<source key>:t<n>") still fits
 # tasks.idempotency_key (String(128)).
@@ -247,3 +247,243 @@ async def _replay_after_race(user_id: UUID, source_key: str) -> PersistedIntake:
         if row is None:  # pragma: no cover — the constraint that rejected us guarantees a winner
             raise RuntimeError("intake insert conflicted but no source is visible for this user")
         return await _load_persisted(s, row)
+
+
+# =================================================================================================
+# ASYNC INTAKE — two-phase durable write (see docs + intake_jobs.py)
+#
+# Phase 1 (create_pending_intake): a SHORT transaction commits source(pending) + mission(understanding)
+#   + phase event + intake_job(pending). No model call, no transaction held over the network — the
+#   request returns 202 immediately.
+# Phase 2 (complete_intake_extraction): the worker runs the existing extraction service OUTSIDE any
+#   transaction, then persists spans/tasks + advances the mission in one user-scoped transaction.
+#   Idempotent: if the content already landed (a reclaimed job), it advances the mission and returns
+#   without duplicating anything.
+# =================================================================================================
+
+
+class PendingIntake(BaseModel):
+    """What phase 1 durably created. The request returns these ids immediately (202)."""
+
+    source_id: UUID
+    mission_id: UUID
+    job_id: UUID
+    state: str  # canonical mission phase, e.g. "understanding"
+    display_status: str
+    replayed: bool = False  # True => idempotent retry; nothing new was written
+
+
+_INTAKE_PHASE_STATUS = {
+    MissionPhase.understanding: {
+        IntakeSourceKind.image: "Understanding your flyer…",
+        IntakeSourceKind.pdf: "Reading your document…",
+    },
+    MissionPhase.extracting: "Reading the details…",
+    MissionPhase.awaiting_approval: "Ready — review what I found",
+    MissionPhase.blocked: "Hit a snag — will retry",
+    MissionPhase.failed: "Couldn't read that one",
+}
+
+
+def understanding_status(source_kind: IntakeSourceKind) -> str:
+    by_kind = _INTAKE_PHASE_STATUS[MissionPhase.understanding]
+    return by_kind.get(source_kind, "Understanding what you sent…")
+
+
+def phase_status(phase: MissionPhase, source_kind: IntakeSourceKind = IntakeSourceKind.text) -> str:
+    if phase is MissionPhase.understanding:
+        return understanding_status(source_kind)
+    return _INTAKE_PHASE_STATUS.get(phase, "Working…")
+
+
+def derive_key_bytes(data: bytes, source_kind: IntakeSourceKind) -> str:
+    digest = hashlib.sha256(source_kind.value.encode() + b"\n" + (data or b"")).hexdigest()
+    return f"intake:{digest}"
+
+
+async def _advance_mission(s, mission_id: UUID, user_id: UUID, phase: MissionPhase, short_status: str,
+                           *, error: str | None = None) -> None:
+    """Update the mission's phase + append a durable phase event, in the caller's transaction.
+
+    Phase events are the ordered, append-only log the client polls; the mission row is the current
+    snapshot. Written together so a reader never sees a phase the log doesn't record.
+    """
+    mission = (
+        await s.execute(
+            select(schema.Mission).where(schema.Mission.id == mission_id, schema.Mission.user_id == user_id)
+        )
+    ).scalar_one_or_none()
+    if mission is None:  # pragma: no cover — caller owns the mission it just created
+        raise RuntimeError("mission not visible to its owner")
+    mission.phase = phase.value
+    mission.short_status = short_status
+    mission.version = (mission.version or 1) + 1
+    if error is not None:
+        mission.error = error
+    if phase in (MissionPhase.succeeded,):
+        mission.status = "succeeded"
+    elif phase is MissionPhase.failed:
+        mission.status = "failed"
+    s.add(schema.MissionPhaseEvent(user_id=user_id, mission_id=mission_id, phase=phase.value, short_status=short_status))
+
+
+async def create_pending_intake(
+    *,
+    user_id: UUID,
+    source_kind: IntakeSourceKind,
+    text: str | None = None,
+    input_bytes: bytes | None = None,
+    mime: str | None = None,
+    idempotency_key: str | None = None,
+    max_attempts: int = 3,
+    now: datetime.datetime | None = None,
+) -> PendingIntake:
+    """Phase 1: durably record the intake and return immediately. NO model call here.
+
+    Idempotent: a retry with the same key (or same content) returns the original mission/source/job
+    without creating anything new — a double-tap in the app can never spawn a second mission.
+    """
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if text is not None:
+        key = (idempotency_key or derive_key(text, source_kind))[:MAX_CLIENT_KEY]
+        sha = content_sha256(text)
+    else:
+        key = (idempotency_key or derive_key_bytes(input_bytes or b"", source_kind))[:MAX_CLIENT_KEY]
+        sha = hashlib.sha256(input_bytes or b"").hexdigest()
+
+    display = understanding_status(source_kind)
+
+    async with user_session(user_id) as s:
+        existing = (
+            await s.execute(
+                select(schema.Source).where(schema.Source.user_id == user_id, schema.Source.idempotency_key == key)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return await _load_pending(s, user_id, key)
+
+        source = schema.Source(
+            user_id=user_id, kind=source_kind.value, content_sha256=sha,
+            raw_text=text,  # image/pdf: NULL until the worker transcribes it
+            expires_at=retention.expires_at_for(now), idempotency_key=key,
+        )
+        s.add(source)
+        try:
+            await s.flush()  # assign source.id; UNIQUE(user_id, key) rejects a concurrent duplicate
+        except IntegrityError:
+            await s.rollback()
+            async with user_session(user_id) as s2:
+                return await _load_pending(s2, user_id, key)
+        mission = schema.Mission(
+            user_id=user_id, kind="intake", status="running",
+            phase=MissionPhase.understanding.value, short_status=display,
+            goal={"intent": "intake", "source_kind": source_kind.value, "source_id": str(source.id)},
+            idempotency_key=key,
+        )
+        s.add(mission)
+        await s.flush()  # assign mission.id (source's unique key already won the race above)
+
+        s.add(schema.MissionPhaseEvent(
+            user_id=user_id, mission_id=mission.id, phase=MissionPhase.understanding.value, short_status=display,
+        ))
+        job = schema.IntakeJob(
+            user_id=user_id, source_id=source.id, mission_id=mission.id,
+            status="pending", source_kind=source_kind.value, mime=mime,
+            input_text=text, input_bytes=input_bytes, max_attempts=max_attempts, idempotency_key=key,
+        )
+        s.add(job)
+        await s.flush()
+        return PendingIntake(
+            source_id=source.id, mission_id=mission.id, job_id=job.id,
+            state=MissionPhase.understanding.value, display_status=display, replayed=False,
+        )
+
+
+async def _load_pending(s, user_id: UUID, key: str) -> PendingIntake:
+    """Rebuild the PendingIntake for an idempotent retry from the already-committed rows."""
+    source = (await s.execute(
+        select(schema.Source).where(schema.Source.user_id == user_id, schema.Source.idempotency_key == key)
+    )).scalar_one()
+    mission = (await s.execute(
+        select(schema.Mission).where(schema.Mission.user_id == user_id, schema.Mission.idempotency_key == key)
+    )).scalar_one()
+    job = (await s.execute(
+        select(schema.IntakeJob).where(schema.IntakeJob.user_id == user_id, schema.IntakeJob.idempotency_key == key)
+    )).scalar_one()
+    return PendingIntake(
+        source_id=source.id, mission_id=mission.id, job_id=job.id,
+        state=mission.phase, display_status=mission.short_status, replayed=True,
+    )
+
+
+def _write_spans_and_tasks(s, source, intake: ExtractedIntake, source_key: str, user_id: UUID):
+    """Shared span+task writer (same shape as persist_intake steps 3-5). Returns (spans, task_rows)."""
+    span_for_deadline: list[schema.SourceSpan] = []
+    for i, deadline in enumerate(intake.deadlines):
+        span = schema.SourceSpan(user_id=user_id, source_id=source.id, span_text=deadline.source_span, ordinal=i)
+        s.add(span)
+        span_for_deadline.append(span)
+    derived = tasks_mod.intake_to_tasks(intake, source=str(source.id))
+    task_rows: list[schema.TaskRow] = []
+    for i, task in enumerate(derived):
+        span = span_for_deadline[i] if i < len(span_for_deadline) else None
+        row = schema.TaskRow(
+            user_id=user_id, source_id=source.id, span_id=span.id if span is not None else None,
+            kind=task.kind.value, title=task.title, course_or_org=task.course_or_org, due=task.due,
+            status=task.status.value, workload_minutes=task.workload_minutes,
+            required_items=[item.model_dump(mode="json") for item in task.required_items],
+            notes=task.notes, idempotency_key=_task_key(source_key, i),
+        )
+        s.add(row)
+        task_rows.append(row)
+    return span_for_deadline, task_rows
+
+
+async def complete_intake_extraction(
+    *, user_id: UUID, source_id: UUID, mission_id: UUID, source_key: str,
+    intake: ExtractedIntake, transcript: str | None = None,
+) -> PersistedIntake:
+    """Phase 2: persist an already-computed extraction and advance the mission to awaiting_approval.
+
+    IDEMPOTENT: if the source already has an extraction stored (a reclaimed job whose content landed
+    before the worker recorded completion), it does NOT rewrite spans/tasks — it just ensures the
+    mission is at awaiting_approval and returns the existing ids. This is what makes a worker crash
+    between "content committed" and "job marked completed" safe.
+    """
+    async with user_session(user_id) as s:
+        source = (await s.execute(
+            select(schema.Source).where(schema.Source.id == source_id, schema.Source.user_id == user_id)
+        )).scalar_one()
+
+        if source.extracted is not None:  # already persisted — idempotent no-op on content
+            persisted = await _load_persisted(s, source)
+            await _advance_mission(s, mission_id, user_id, MissionPhase.awaiting_approval,
+                                   phase_status(MissionPhase.awaiting_approval, IntakeSourceKind(source.kind)))
+            return persisted
+
+        if transcript is not None and source.raw_text is None:
+            source.raw_text = transcript  # image/pdf: store what vision read, for grounding provenance
+        spans, tasks = _write_spans_and_tasks(s, source, intake, source_key, user_id)
+        source.extracted = intake.model_dump(mode="json")
+        await _advance_mission(s, mission_id, user_id, MissionPhase.awaiting_approval,
+                               phase_status(MissionPhase.awaiting_approval, IntakeSourceKind(source.kind)))
+        await s.flush()
+        return PersistedIntake(
+            intake=intake, source_id=source.id,
+            span_ids=[sp.id for sp in spans], task_ids=[t.id for t in tasks], replayed=False,
+        )
+
+
+async def advance_intake_phase(*, user_id: UUID, mission_id: UUID, phase: MissionPhase,
+                               source_kind: IntakeSourceKind = IntakeSourceKind.text) -> None:
+    """Move an intake mission to a non-terminal phase (e.g. extracting) + append the phase event."""
+    async with user_session(user_id) as s:
+        await _advance_mission(s, mission_id, user_id, phase, phase_status(phase, source_kind))
+
+
+async def fail_intake_mission(*, user_id: UUID, mission_id: UUID, phase: MissionPhase, reason: str,
+                              source_kind: IntakeSourceKind = IntakeSourceKind.text) -> None:
+    """Move a mission to blocked (recoverable) or failed (terminal). reason is a TYPE/short cause,
+    never student content — it is stored on the mission and shown to the user."""
+    async with user_session(user_id) as s:
+        await _advance_mission(s, mission_id, user_id, phase, phase_status(phase, source_kind), error=reason[:200])

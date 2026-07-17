@@ -20,7 +20,9 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -231,6 +233,60 @@ class AuditEvent(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class Integration(Base, TSV):
+    """A connected external account (Google Calendar today). Holds the ENCRYPTED refresh token.
+
+    Security shape, deliberate:
+      * ``refresh_token_encrypted`` is Fernet ciphertext (see bruce_engine.crypto) — never plaintext,
+        never logged, never returned by any endpoint, never put in a model prompt. The DB is
+        encrypted at rest by the provider, but a refresh token is a bearer credential for a
+        student's real calendar; a dump or a stray log line must not hand it over.
+      * There is deliberately NO access_token column. Access tokens are short-lived and are fetched
+        on demand from the refresh token — persisting them widens the blast radius for no gain.
+      * RLS scopes rows to the owning user like every other table; account deletion cascades.
+    """
+
+    __tablename__ = "integrations"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)  # "google_calendar"
+    # Who the provider says this is (e.g. the Google account email). Shown in Settings so a student
+    # can see WHICH account Bruce is writing to — a real safety property, not decoration.
+    provider_account_id: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    scopes: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    refresh_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    selected_calendar_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="connected")
+    revoked_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_integration_user_provider"),)
+
+
+class OAuthState(Base):
+    """One-time CSRF state for an OAuth authorization-code flow.
+
+    This table IS the security boundary of the connect flow. The callback arrives from the user's
+    browser and its query parameters are attacker-controllable, so identity is NEVER read from them
+    — it is read from the row this state points at. Each row is:
+      * bound to the authenticated user who started the flow,
+      * short-lived (``expires_at``),
+      * single-use (``consumed_at`` — a replayed state must fail, not re-authorize),
+      * carrier of the PKCE ``code_verifier``, which never leaves the server.
+    """
+
+    __tablename__ = "oauth_states"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The opaque value handed to Google. Unique so a replay cannot create a second row.
+    state: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    code_verifier: Mapped[str] = mapped_column(String(128), nullable=False)  # PKCE; server-only
+    redirect_uri: Mapped[str] = mapped_column(String(500), nullable=False)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ModelCost(Base):
     __tablename__ = "model_costs"
     id = _pk()
@@ -244,6 +300,48 @@ class ModelCost(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IntakeJob(Base, TSV):
+    """A durable unit of intake work: transcribe + extract, done OUTSIDE the request lifecycle.
+
+    The request commits this row (status='pending') plus its source + mission, then returns 202. A
+    worker later claims it with a lease, runs the model work, and persists results — so a process
+    restart never loses accepted work (the row survives; the lease expires and any worker reclaims
+    it). The raw input bytes/text live HERE (transient, cleared when the job finishes) so no new blob
+    table is needed; the durable content lands in sources/spans/tasks under the owner's RLS context.
+
+    RLS is custom (see migration 0005): the owner sees their own jobs (API status reads), and a
+    worker session (app.worker='on', set only by server worker code, never from a request) may claim
+    across users. Content writes still happen under user_session(user_id), fully tenant-scoped.
+    """
+
+    __tablename__ = "intake_jobs"
+    id = _pk()
+    user_id = _owner()
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    mission_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("missions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # pending -> processing -> completed | retryable_failed (-> reclaimed) | terminal_failed
+    status: Mapped[str] = mapped_column(String(24), nullable=False, server_default="pending", index=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)  # IntakeSourceKind
+    mime: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_text: Mapped[str | None] = mapped_column(Text, nullable=True)  # text sources; cleared on finish
+    input_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)  # image/pdf; cleared on finish
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)  # TYPE/reason only, no content
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_intake_job_idem"),
+        # The claim query filters on status + lease_expires_at; index it for the worker hot path.
+        Index("ix_intake_jobs_claimable", "status", "lease_expires_at"),
+    )
 
 
 # user-owned tables that get row-level security (users handled separately: a user sees only self)

@@ -107,7 +107,7 @@ def test_successful_authenticated_intake_persists_source_spans_tasks(clean_db, m
     _patch_extract(monkeypatch)
     uid = uuid4()
 
-    r = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid))
+    r = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid))
     assert r.status_code == 200
     body = r.json()
 
@@ -130,7 +130,7 @@ def test_successful_authenticated_intake_persists_source_spans_tasks(clean_db, m
 
 def test_unauthenticated_intake_is_401_and_writes_nothing(clean_db):
     """No token -> 401 before anything is computed or written."""
-    r = client.post("/v1/intake", json={"text": RAW})
+    r = client.post("/v1/intake/sync", json={"text": RAW})
     assert r.status_code == 401
 
     async def check():
@@ -149,7 +149,7 @@ def test_student_A_cannot_access_student_B_intake_records(clean_db, monkeypatch)
     _patch_extract(monkeypatch)
     a, b = uuid4(), uuid4()
 
-    body = client.post("/v1/intake", json={"text": RAW}, headers=_auth(b)).json()
+    body = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(b)).json()
     b_source = UUID(body["source_id"])
     b_task = UUID(body["task_ids"][0])
 
@@ -173,7 +173,7 @@ def test_persisted_intake_survives_server_restart(clean_db, monkeypatch):
     """Dispose+reset the engine (simulated restart); source, spans and tasks are still there."""
     _patch_extract(monkeypatch)
     uid = uuid4()
-    body = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid)).json()
+    body = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid)).json()
     source_id = UUID(body["source_id"])
     task_ids = [UUID(t) for t in body["task_ids"]]
 
@@ -199,8 +199,8 @@ def test_duplicate_request_is_idempotent(clean_db, monkeypatch):
     _patch_extract(monkeypatch)
     uid = uuid4()
 
-    first = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid)).json()
-    second = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid)).json()
+    first = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid)).json()
+    second = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid)).json()
 
     assert first["source_id"] == second["source_id"]
     # ORDER matters, not just membership: a replay that returns the same ids shuffled would break
@@ -260,8 +260,8 @@ def test_same_content_from_two_users_are_separate_intakes(clean_db, monkeypatch)
     _patch_extract(monkeypatch)
     a, b = uuid4(), uuid4()
 
-    ra = client.post("/v1/intake", json={"text": RAW}, headers=_auth(a)).json()
-    rb = client.post("/v1/intake", json={"text": RAW}, headers=_auth(b)).json()
+    ra = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(a)).json()
+    rb = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(b)).json()
     assert ra["source_id"] != rb["source_id"]
 
     async def check():
@@ -283,7 +283,7 @@ def test_malformed_extraction_rolls_back_cleanly(clean_db, monkeypatch):
     monkeypatch.setattr(api, "extract_from_text", boom)
     uid = uuid4()
 
-    r = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid))
+    r = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid))
     assert r.status_code == 502
     assert r.json()["detail"] == "extraction failed: ValueError"
 
@@ -309,7 +309,7 @@ def test_no_partial_records_after_forced_failure_mid_write(clean_db, monkeypatch
 
     monkeypatch.setattr(intake_store.tasks_mod, "intake_to_tasks", explode)
 
-    r = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid))
+    r = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid))
     assert r.status_code == 502
 
     async def check():
@@ -327,7 +327,7 @@ def test_source_spans_point_at_the_correct_source(clean_db, monkeypatch):
     """Every span belongs to THIS source, carries the verbatim grounding text, and is owned by the user."""
     _patch_extract(monkeypatch)
     uid = uuid4()
-    body = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid)).json()
+    body = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid)).json()
     source_id = UUID(body["source_id"])
 
     async def check():
@@ -359,7 +359,7 @@ def test_tasks_point_to_valid_source_evidence(clean_db, monkeypatch):
     """source -> span -> task lineage holds: each task's span belongs to that same source."""
     _patch_extract(monkeypatch)
     uid = uuid4()
-    body = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid)).json()
+    body = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid)).json()
     source_id = UUID(body["source_id"])
 
     async def check():
@@ -391,7 +391,7 @@ def test_umbrella_task_without_deadline_is_honest_about_having_no_span(clean_db,
         ),
     )
     uid = uuid4()
-    body = client.post("/v1/intake", json={"text": "Send a transcript."}, headers=_auth(uid)).json()
+    body = client.post("/v1/intake/sync", json={"text": "Send a transcript."}, headers=_auth(uid)).json()
     assert body["span_ids"] == [] and len(body["task_ids"]) == 1
 
     async def check():
@@ -410,7 +410,7 @@ def test_expired_content_metadata_is_set_from_the_retention_policy(clean_db, mon
     _patch_extract(monkeypatch)
     uid = uuid4()
     before = datetime.datetime.now(datetime.timezone.utc)
-    body = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid)).json()
+    body = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid)).json()
 
     async def check():
         rec = await sources.get_for_user(UUID(body["source_id"]), uid)
@@ -432,7 +432,7 @@ def test_retention_sweep_erases_intake_raw_text_but_keeps_lineage(clean_db, monk
     """End-to-end with the existing sweep: raw_text goes, source/spans/tasks lineage stays."""
     _patch_extract(monkeypatch)
     uid = uuid4()
-    body = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid)).json()
+    body = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid)).json()
 
     async def check():
         future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
@@ -456,7 +456,7 @@ def test_response_ids_are_fetchable_through_authenticated_repository_methods(cle
     """Every id the API returned resolves through the RLS-scoped repos — for the owner, and only them."""
     _patch_extract(monkeypatch)
     uid = uuid4()
-    body = client.post("/v1/intake", json={"text": RAW}, headers=_auth(uid)).json()
+    body = client.post("/v1/intake/sync", json={"text": RAW}, headers=_auth(uid)).json()
 
     async def check():
         src = await sources.get_for_user(UUID(body["source_id"]), uid)
