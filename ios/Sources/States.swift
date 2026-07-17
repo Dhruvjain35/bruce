@@ -3,8 +3,9 @@ import SwiftUI
 // MARK: - Root flow (onboarding gate)
 
 struct RootFlow: View {
-    // Onboarding shows on every launch for now (testing). BRUCE_SKIP_ONBOARD=1 jumps straight to the app.
-    @State private var onboarded = Demo.env["BRUCE_SKIP_ONBOARD"] == "1"
+    // A returning signed-in user (JWT in Keychain) skips onboarding. BRUCE_SKIP_ONBOARD=1 also jumps
+    // straight to the app for dev. Otherwise onboarding runs and gates on Sign in with Apple.
+    @State private var onboarded = Demo.env["BRUCE_SKIP_ONBOARD"] == "1" || AppSession.shared.isSignedIn
 
     var body: some View {
         if onboarded {
@@ -21,6 +22,8 @@ struct OnboardingView: View {
     let onDone: () -> Void
     @State private var step = Int(Demo.env["BRUCE_ONBOARD_STEP"] ?? "") ?? 0
     private let steps = 9
+    @State private var signingIn = false
+    @State private var authError: String? = nil
 
     // mock selections
     @State private var grade = "11th grade"
@@ -54,6 +57,22 @@ struct OnboardingView: View {
     }
 
     private func advance() { withAnimation(.easeInOut(duration: 0.25)) { step += 1 } }
+
+    /// Real Sign in with Apple. In a local dev build (DEBUG + BRUCE_DEV_AUTH=1) the dev token is in
+    /// use, so we skip the Apple flow and proceed. Otherwise we run the real exchange; on success we
+    /// advance, on cancel we stay put, on error we show it. Guarded against double taps.
+    private func startSignIn() {
+        Haptics.tap()
+        authError = nil
+        if AppConfig.devToken != nil { advance(); return }
+        guard !signingIn else { return }
+        signingIn = true
+        Task {
+            let ok = await AppSession.shared.signInWithApple()
+            signingIn = false
+            if ok { advance() } else { authError = AppSession.shared.lastError?.errorDescription }
+        }
+    }
 
     private var stepBar: some View {
         HStack(spacing: 8) {
@@ -91,17 +110,25 @@ struct OnboardingView: View {
             }
             Spacer(); Spacer()
             VStack(spacing: 12) {
-                Button { Haptics.tap(); advance() } label: {
+                Button { startSignIn() } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: "apple.logo").font(.system(size: 17, weight: .medium))
-                        Text("Continue with Apple").font(.system(size: 17, weight: .semibold))
+                        if signingIn { ProgressView().tint(.black) }
+                        else {
+                            Image(systemName: "apple.logo").font(.system(size: 17, weight: .medium))
+                            Text("Continue with Apple").font(.system(size: 17, weight: .semibold))
+                        }
                     }
                     .foregroundStyle(.black).frame(maxWidth: .infinity).padding(.vertical, 15)
                     .background(.white, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                }.buttonStyle(PressStyle())
-                Button { advance() } label: {
+                }.buttonStyle(PressStyle()).disabled(signingIn)
+                    .accessibilityLabel("Continue with Apple")
+                if let e = authError {
+                    Text(e).font(.caption).foregroundStyle(Theme.amber).multilineTextAlignment(.center)
+                        .accessibilityAddTraits(.isStaticText)
+                }
+                Button { startSignIn() } label: {
                     Text("Sign in").font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.textSecondary)
-                }.buttonStyle(.plain).padding(.top, 2)
+                }.buttonStyle(.plain).padding(.top, 2).disabled(signingIn)
             }
             .padding(.horizontal, 24).padding(.bottom, 24)
         }
