@@ -1,0 +1,31 @@
+#!/bin/bash
+# Function Compute custom runtime entrypoint (custom.debian12 == Python 3.11).
+#
+# FC's contract, which this file exists to satisfy exactly:
+#   * the file MUST be named `bootstrap` and MUST be executable (see build-package.sh — python's
+#     zipfile does not preserve the exec bit, so the package is built with the `zip` CLI);
+#   * it MUST start an HTTP server listening on $FC_SERVER_PORT (default 9000);
+#   * it MUST bind 0.0.0.0, never 127.0.0.1 — FC reaches the server from outside the process
+#     namespace, and a loopback bind produces a function that "starts" and then times out;
+#   * the server MUST be accepting connections within 15 seconds or FC kills the instance.
+#
+# The code package is extracted to /code. Dependencies are vendored under /code/python (see
+# build-package.sh) rather than installed at runtime — FC has no network during bootstrap and no
+# pip step, so anything not in the zip does not exist.
+#
+# This runs the SAME FastAPI app as local and as the container image (bruce_engine.api:app).
+# Nothing about auth, RLS, idempotency or the provider path changes for the deployment.
+
+set -euo pipefail
+
+export PYTHONPATH="/code:/code/python:${PYTHONPATH:-}"
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+
+# Single worker: FC scales by spawning instances, not by in-process workers. A second worker would
+# just double memory and contend for the same DB pool.
+exec python3 -m uvicorn bruce_engine.api:app \
+  --host 0.0.0.0 \
+  --port "${FC_SERVER_PORT:-9000}" \
+  --workers 1 \
+  --no-access-log

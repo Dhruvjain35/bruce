@@ -22,7 +22,12 @@ Last verified: **2026-07-16** · branch `hackathon/qwen-cloud`
 | **One real Qwen Cloud inference call** | **NO — ZERO successful calls** | 144/144 models return 403 |
 | Google Calendar live execution | **NO** | no `GOOGLE_*` credentials issued |
 | RAM AccessKey valid | **VERIFIED** | `sts:GetCallerIdentity` 200 — RAM user `bruce-hackathon-deploy` |
-| Function Compute reachable | **NO — but NOT risk-blocked** | `fc:ListFunctions` → `ImplicitDeny` (no policy attached), no `RISK_CONTROL` in any FC response |
+| RAM policies attached | **VERIFIED** | `fc:ListFunctions` → `{"functions": []}` (was `ImplicitDeny`) |
+| Function Compute **activated** | **NO** | `CreateFunction` → `AccessDenied: FC service is not enabled for current user` |
+| FC blocked by risk control? | **NO** | no FC response has ever returned `RISK_CONTROL` or `Unpurchased` |
+| FC code package builds | **VERIFIED** | 44MB zip / 60.7MB base64 / 138MB unpacked; `bootstrap` mode `0o755`; no `.env` |
+| Package serves under FC's runtime contract | **VERIFIED (emulated)** | Debian 12 / py3.11 / amd64, `/health` 200, `/v1/*` 401 |
+| Cold start within FC's 15s limit | **UNVERIFIED — known risk** | 26s emulated, but QEMU is ~12× (native import 2.0s) |
 
 **Hackathon eligibility is NOT met.** It requires genuine Qwen Cloud usage and an Alibaba-deployed
 backend. Neither has happened. Do not claim otherwise anywhere in the submission.
@@ -120,7 +125,87 @@ Attach to RAM user `bruce-hackathon-deploy` — least privilege, **not** `Admini
 Then re-run the probes above. If they return 200, deployment proceeds. If they return
 `RISK.RISK_CONTROL_REJECTION`, the hold covers FC too and that must be recorded here.
 
-## Blocker 3 — no Google Calendar credentials
+## Blocker 3 — Function Compute is not activated
+
+RAM policies were attached on 2026-07-17 and **the permissions blocker is resolved**:
+
+```
+$ aliyun fc GET /2023-03-30/functions --region ap-southeast-1
+{"functions": []}                                   <-- was ImplicitDeny; permissions now OK
+
+$ aliyun fc POST /2023-03-30/functions --region ap-southeast-1 ...
+ErrorCode: AccessDenied
+Message:   FC service is not enabled for current user.     <-- the remaining blocker
+```
+
+This is the standard "activate the service" step, **not** risk control: no Function Compute response
+has ever contained `RISK_CONTROL` or `Unpurchased`. Activate FC in the Singapore console
+(https://fcnext.console.aliyun.com/). Whether the account-level risk hold also blocks *activation*
+is still **unknown** — activation is an "order", which is what the hold suspends. That is the next
+thing we learn.
+
+### Target changed: Custom Container -> Web Function (code package)
+
+ACR **Personal Edition is not offered** in this account's Singapore console, and FC pulls
+custom-container images only from ACR in the same region+account. Buying ACR Enterprise is not
+justified for a hackathon. The container target (`deploy/s.yaml`, Dockerfile) is **retained for
+later production use, not deleted** — it is verified working locally and is blocked solely on ACR.
+
+The hackathon slice now ships as a **code package on `custom.debian12` (Python 3.11)** —
+`deploy/s-webfunction.yaml`. This needs no ACR at all.
+
+### Package sizing — measured, fits, no cuts needed
+
+Built in a real `linux/amd64` `python:3.11-slim` container (macOS/arm64 wheels would not load on
+FC: `asyncpg`, `cryptography`, `pydantic-core`, `pillow` are compiled extensions).
+
+| | Unpacked | Zip | Base64 (API body) |
+|---|---|---|---|
+| **Full set (shipped)** | 138 MB | **44 MB** | **60.7 MB** |
+| Without `pdfplumber` + plain `uvicorn` | 83 MB | 22.2 MB | 29.5 MB |
+
+Limits: **500 MB** code package (Singapore; 100 MB in other regions), and **100 MB** for the
+create/update *request body* including the base64 code — the latter is the binding constraint.
+**60.7 MB fits with ~40% headroom, so no dependency reduction is required.**
+
+`pdfplumber` (~40MB: pillow + pdfminer + pypdfium2) is deliberately **kept**: it fits, and
+`extraction._pdf_to_text` swallows exceptions and returns `""`, so removing it would turn a PDF
+into a successful-looking EMPTY intake — a false completion. If cold starts ever force the cut, fix
+that swallow first.
+
+### Verified locally against FC's actual runtime contract
+
+`python:3.11-slim` **is** Debian 12 (bookworm) — the same base as `custom.debian12`. Package mounted
+at `/code`, started via `./bootstrap` with `FC_SERVER_PORT=9000`:
+
+```
+/health            -> 200 {"status":"ok","service":"bruce-engine","commit":"28d142c","region":"ap-southeast-1"}
+POST /v1/intake    -> 401      POST /v1/missions -> 401      GET /v1/diagnostics -> 401
+bootstrap mode     -> 0o755 (executable — FC will not run it otherwise)
+.env in package    -> no
+```
+
+### KNOWN RISK — cold start vs FC's 15-second limit
+
+FC kills an instance whose HTTP server is not listening within **15s**. The emulated run took
+**26s**, which would fail. Measured breakdown:
+
+| | Time |
+|---|---|
+| `import bruce_engine.api`, QEMU-emulated amd64 | 24.8s |
+| `import bruce_engine.api`, native | 2.0s |
+| **QEMU penalty** | **~12×** |
+
+So the 26s is overwhelmingly emulation, and real FC (native amd64) should import in ~2–4s. **This
+is an inference, not a measurement** — it cannot be confirmed until a real deployment, and FC cold
+start also includes fetching/extracting the 44MB package on hardware slower than a dev laptop.
+
+If the deployed function times out on cold start, in order: (1) drop `pdfplumber` +
+`uvicorn[standard]` → 83MB/22MB (fix the `_pdf_to_text` swallow first); (2) lazy-import
+`pydantic_ai`/`openai` (5.7s emulated, the single heaviest import) off the startup path;
+(3) enable FC provisioned instances to remove cold start entirely.
+
+## Blocker 4 — no Google Calendar credentials
 
 `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REFRESH_TOKEN` are unset, so calendar
 execution and read-back verification have never run against Google. The adapter and its 15 tests

@@ -1,0 +1,96 @@
+# Bruce engine -> Alibaba Cloud Function Compute 3.0 WEB FUNCTION (code package)
+# Region: Singapore (ap-southeast-1).   Deploy:  s deploy -t deploy/s-webfunction.yaml
+#
+# WHY THIS EXISTS ALONGSIDE s.yaml:
+# The container target (deploy/s.yaml) is RETAINED for later production use — it is not dead, and
+# it is not deleted. It is unusable *today* only because FC pulls custom-container images solely
+# from Alibaba Container Registry in the same region+account, and ACR Personal Edition is not
+# offered in this account's Singapore console. Buying ACR Enterprise for a hackathon is not
+# justified. So the hackathon slice ships as a code package on a custom runtime instead.
+#
+# RUNTIME CHOICE — custom.debian12 is Python 3.11 (verified against Alibaba's runtime docs):
+#   custom.debian12 -> Python 3.11   <-- this one
+#   custom.debian11 -> Python 3.12
+#   custom.debian10 -> Python 3.10
+# Bruce's source was verified to compile under 3.11 (`compileall` in a real amd64 3.11 container),
+# and dependencies are built as linux/amd64 wheels (see build-package.sh) because asyncpg,
+# cryptography, pydantic-core and pillow are compiled extensions.
+#
+# SIZING (measured, not estimated): 138 MB unpacked / 45.1 MB zip / 60.1 MB base64.
+# Singapore allows a 500 MB code package; the binding limit is the 100 MB create/update request
+# body, which the base64 payload fits with ~40% headroom. No dependency cuts were needed.
+#
+# STATUS: NOT YET DEPLOYED. Function Compute reported "FC service is not enabled for current user"
+# on 2026-07-16 and must be activated in the console first. See docs/deployment-verification.md —
+# that document, not this file, is the source of truth for what is actually running.
+
+edition: 3.0.0
+name: bruce-engine-web
+access: bruce
+
+vars:
+  region: ap-southeast-1
+
+resources:
+  bruce-api:
+    component: fc3
+    props:
+      region: ${vars.region}
+      functionName: bruce-engine
+      description: Bruce — student-life action engine (hackathon vertical slice)
+
+      # Web function on a custom runtime: FC forwards raw HTTP to the server that `bootstrap`
+      # starts. No handler/event shim — the SAME FastAPI app runs here as locally.
+      runtime: custom.debian12
+      handler: index.handler   # ignored for a web function; FC requires the field to be present
+      code: ./../build/fc      # `s` zips this dir; build it first with deploy/build-package.sh
+
+      customRuntimeConfig:
+        command:
+          - ./bootstrap
+        # Must match what bootstrap binds. FC injects FC_SERVER_PORT; bootstrap defaults to 9000.
+        port: 9000
+
+      cpu: 1
+      memorySize: 2048
+      diskSize: 512
+      # Generous on purpose: one intake does image transcription + extraction + DB writes inside a
+      # single transaction. This is latency-bound, not CPU-bound.
+      timeout: 120
+      # Required — the function must reach Qwen Cloud, Google Calendar and ApsaraDB.
+      internetAccess: true
+
+      environmentVariables:
+        BRUCE_REGION: ${vars.region}
+        BRUCE_COMMIT: ${env(BRUCE_COMMIT)}
+        # --- auth: JWT verification stays ON. The HTTP trigger is anonymous at the gateway, so
+        #     this is the ONLY thing between the public internet and student data. ---
+        BRUCE_JWT_SECRET: ${env(BRUCE_JWT_SECRET)}
+        BRUCE_JWT_AUDIENCE: ${env(BRUCE_JWT_AUDIENCE)}
+        # --- Postgres stays EXTERNAL (ApsaraDB). The app connects as the restricted bruce_app
+        #     role, so RLS/FORCE RLS is enforced by the database exactly as it is locally. There is
+        #     deliberately NO in-memory fallback — that would discard the persistence architecture
+        #     and quietly turn the demo into a toy. ---
+        BRUCE_DATABASE_URL: ${env(BRUCE_DATABASE_URL)}
+        BRUCE_APP_DATABASE_URL: ${env(BRUCE_APP_DATABASE_URL)}
+        # --- Qwen Cloud: configured, and NOT failed over. While inference is account-blocked the
+        #     intake path returns 503 provider_unavailable naming the real cause. ---
+        BRUCE_INTAKE_PROVIDER: qwen
+        DASHSCOPE_API_KEY: ${env(DASHSCOPE_API_KEY)}
+        QWEN_BASE_URL: ${env(QWEN_BASE_URL)}
+        QWEN_INTAKE_MODEL: ${env(QWEN_INTAKE_MODEL)}
+        # --- Google Calendar: execute-once + read-back verification ---
+        GOOGLE_CLIENT_ID: ${env(GOOGLE_CLIENT_ID)}
+        GOOGLE_CLIENT_SECRET: ${env(GOOGLE_CLIENT_SECRET)}
+        GOOGLE_REFRESH_TOKEN: ${env(GOOGLE_REFRESH_TOKEN)}
+        GOOGLE_CALENDAR_ID: ${env(GOOGLE_CALENDAR_ID)}
+
+      triggers:
+        - triggerName: httpTrigger
+          triggerType: http
+          triggerConfig:
+            # anonymous == FC does not add ITS OWN signature auth, which would break normal bearer
+            # -token clients. Authorization is Bruce's JWT check on every /v1/* route; /health is
+            # the only genuinely public endpoint.
+            authType: anonymous
+            methods: [GET, POST, DELETE]

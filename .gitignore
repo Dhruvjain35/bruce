@@ -35,3 +35,6 @@ ios/Bruce.xcodeproj/
 ios/*.png
 ios/shots/
 ios/**/xcuserdata/
+
+# FC build artifacts (deps + zip; rebuilt by deploy/build-package.sh)
+build/
