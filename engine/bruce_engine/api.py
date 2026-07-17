@@ -17,9 +17,9 @@ import asyncio
 import os
 from datetime import date
 from enum import Enum
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from sqlalchemy import text as sa_text
@@ -33,7 +33,7 @@ from . import provider_status
 from . import tasks as tasks_mod
 from .auth import AuthenticatedUser, current_user
 from .briefing import compose_brief
-from .extraction import extract_from_text
+from .extraction import ExtractionError, extract_from_text
 from .models import (
     CalendarEvent,
     DailyBrief,
@@ -153,6 +153,55 @@ async def health() -> dict[str, str]:
         "commit": os.environ.get("BRUCE_COMMIT", "unknown"),
         "region": os.environ.get("BRUCE_REGION", "unknown"),
     }
+
+
+class Readiness(BaseModel):
+    ready: bool
+    checks: dict[str, str]
+
+
+@app.get("/ready")
+async def ready(response: Response) -> Readiness:
+    """PUBLIC readiness probe — are Bruce's MANDATORY runtime dependencies usable?
+
+    Distinct from /health on purpose:
+      /health = this process is up and serving (never touches the DB or a provider, so a dependency
+                outage can't make the platform think the process is dead and recycle it).
+      /ready  = the things Bruce cannot function without are actually usable.
+
+    Mandatory here means: the database (every guarantee Bruce makes — RLS, isolation, idempotency,
+    evidence lineage — is enforced BY Postgres, so without it Bruce is not Bruce) and JWT
+    configuration (without it, either nothing authenticates or, worse, something doesn't).
+
+    Qwen is deliberately NOT a readiness condition. Qwen being blocked means intake returns a
+    truthful 503 provider_unavailable; it does not mean the service should be pulled out of the
+    load balancer, and missions/decisions/receipts keep working. Provider state is reported
+    separately by /v1/diagnostics (authenticated). Returns 503 when not ready so a platform health
+    check can act on it; the body names which check failed, with no secrets.
+    """
+    checks: dict[str, str] = {}
+
+    try:
+        async with user_session(uuid5(NAMESPACE_URL, "bruce.readiness.probe")) as s:
+            await s.execute(sa_text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as exc:
+        checks["database"] = f"unavailable ({type(exc).__name__})"
+
+    secret, jwks = os.environ.get("BRUCE_JWT_SECRET"), os.environ.get("BRUCE_JWKS_URL")
+    if secret and len(secret) >= 32:
+        checks["auth_config"] = "ok"
+    elif jwks:
+        checks["auth_config"] = "ok"
+    elif secret:
+        checks["auth_config"] = "weak (BRUCE_JWT_SECRET under 32 bytes)"
+    else:
+        checks["auth_config"] = "missing (no BRUCE_JWT_SECRET or BRUCE_JWKS_URL)"
+
+    ok = all(v == "ok" for v in checks.values())
+    if not ok:
+        response.status_code = 503
+    return Readiness(ready=ok, checks=checks)
 
 
 class ProviderReport(BaseModel):
@@ -285,6 +334,10 @@ async def intake(req: IntakeRequest, user: AuthenticatedUser = Depends(current_u
             extract=extract_from_text,  # resolved here (not at import) so tests can patch it
             idempotency_key=req.idempotency_key,
         )
+    except ExtractionError as exc:
+        # We could not READ the input. 415 (wrong type) / 422 (unreadable instance) — never a 200
+        # with zero findings, which would claim Bruce read it and found nothing.
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail())
     except Exception as exc:
         # A provider outage is reported as exactly that — 503 provider_unavailable, naming the
         # provider and the real cause. It is NOT retried against a different provider: silently

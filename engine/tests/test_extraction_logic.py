@@ -1,6 +1,8 @@
 """Offline tests for extraction grounding (no network)."""
 
-from bruce_engine.extraction import _norm, _pdf_to_text, _verify_deadlines
+import pytest
+
+from bruce_engine.extraction import UnsupportedSourceType, _norm, _pdf_to_text, _verify_deadlines
 from bruce_engine.models import ExtractedDeadline
 
 
@@ -36,4 +38,13 @@ def test_norm_collapses_whitespace_and_case():
 
 
 def test_pdf_to_text_rejects_non_pdf():
-    assert _pdf_to_text(b"not a pdf") == ""
+    """CONTRACT CHANGE (2026-07-17): non-PDF bytes now RAISE instead of returning "".
+
+    The old assertion (`== ""`) encoded the false-completion bug: "" flowed into
+    extract_from_text, which returns an empty ExtractedIntake for empty input, so a wrong-type
+    upload produced a 200 with zero deadlines — indistinguishable from "Bruce read your file and
+    it contained nothing". A failure to READ must never render as "read it, found nothing".
+    See tests/test_no_false_completion.py for the full invariant.
+    """
+    with pytest.raises(UnsupportedSourceType):
+        _pdf_to_text(b"not a pdf")
