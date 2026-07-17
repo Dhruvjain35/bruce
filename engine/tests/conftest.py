@@ -28,7 +28,8 @@ load_dotenv(ENGINE / ".env")
 TEST_DB = "bruce_test"
 _USER_TABLES = (
     "users sources source_spans opportunities tasks calendar_proposals briefs missions "
-    "mission_phase_events approvals receipts audit_events model_costs"
+    "mission_phase_events approvals receipts audit_events model_costs "
+    "integrations oauth_states"  # added 0004 — must be truncated too, or OAuth state leaks between tests
 ).split()
 
 

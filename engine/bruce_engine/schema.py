@@ -231,6 +231,60 @@ class AuditEvent(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class Integration(Base, TSV):
+    """A connected external account (Google Calendar today). Holds the ENCRYPTED refresh token.
+
+    Security shape, deliberate:
+      * ``refresh_token_encrypted`` is Fernet ciphertext (see bruce_engine.crypto) — never plaintext,
+        never logged, never returned by any endpoint, never put in a model prompt. The DB is
+        encrypted at rest by the provider, but a refresh token is a bearer credential for a
+        student's real calendar; a dump or a stray log line must not hand it over.
+      * There is deliberately NO access_token column. Access tokens are short-lived and are fetched
+        on demand from the refresh token — persisting them widens the blast radius for no gain.
+      * RLS scopes rows to the owning user like every other table; account deletion cascades.
+    """
+
+    __tablename__ = "integrations"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)  # "google_calendar"
+    # Who the provider says this is (e.g. the Google account email). Shown in Settings so a student
+    # can see WHICH account Bruce is writing to — a real safety property, not decoration.
+    provider_account_id: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    scopes: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    refresh_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    selected_calendar_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="connected")
+    revoked_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_integration_user_provider"),)
+
+
+class OAuthState(Base):
+    """One-time CSRF state for an OAuth authorization-code flow.
+
+    This table IS the security boundary of the connect flow. The callback arrives from the user's
+    browser and its query parameters are attacker-controllable, so identity is NEVER read from them
+    — it is read from the row this state points at. Each row is:
+      * bound to the authenticated user who started the flow,
+      * short-lived (``expires_at``),
+      * single-use (``consumed_at`` — a replayed state must fail, not re-authorize),
+      * carrier of the PKCE ``code_verifier``, which never leaves the server.
+    """
+
+    __tablename__ = "oauth_states"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The opaque value handed to Google. Unique so a replay cannot create a second row.
+    state: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
+    code_verifier: Mapped[str] = mapped_column(String(128), nullable=False)  # PKCE; server-only
+    redirect_uri: Mapped[str] = mapped_column(String(500), nullable=False)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ModelCost(Base):
     __tablename__ = "model_costs"
     id = _pk()
