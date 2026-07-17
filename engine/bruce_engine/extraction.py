@@ -30,6 +30,7 @@ from .intake_providers import (
     FeatherlessExtractor,
     OpenAIExtractor,
     OpenAIVisionTranscriber,
+    TranscriptResult,
 )
 from .models import ExtractedDeadline, ExtractedIntake, IntakeSourceKind
 from .provider_status import ProviderUnavailable
@@ -122,7 +123,10 @@ def _grounding_result(proposed: int, kept: int) -> str:
 
 
 async def _run_structured(
-    text: str, source_kind: IntakeSourceKind, doc_type: str
+    text: str,
+    source_kind: IntakeSourceKind,
+    doc_type: str,
+    transcription: "TranscriptResult | None" = None,
 ) -> tuple[ExtractedIntake, IntakeTelemetry]:
     """Normalized text -> grounded ExtractedIntake, with a bounded, recorded OpenAI fallback.
 
@@ -172,19 +176,25 @@ async def _run_structured(
         grounding_result=grounding,
         fallback_reason=fallback_reason,
     )
+    if transcription is not None:
+        telem.transcriber_provider = transcription.provider
+        telem.transcriber_model = transcription.model
+        telem.transcriber_latency_ms = transcription.latency_ms
+        telem.transcriber_input_tokens = transcription.input_tokens
+        telem.transcriber_output_tokens = transcription.output_tokens
     return res.intake, telem
 
 
 # --------------------------------------------------------------------------- transcription seams
 
 
-async def _image_to_text(image_bytes: bytes, mime: str = "image/png") -> str:
+async def _transcribe_image(image_bytes: bytes, mime: str) -> "TranscriptResult":
     """Transcribe an image verbatim via the vision transcriber (OpenAI gpt-5.4-mini).
 
     Validates the mime BEFORE calling the provider (a 415 costs no tokens). Raises SourceParseError
-    on an empty transcription — the previous implementation returned "", turning a provider/auth
-    failure into a silently empty intake ("read your flyer, found nothing"). It deliberately does
-    NOT extract structure; that is the second pass's job, so spans are grounded against real text.
+    on an empty transcription — returning "" would turn a provider/auth failure into a silently
+    empty intake ("read your flyer, found nothing"). It deliberately does NOT extract structure;
+    that is the second pass's job, so spans are grounded against real transcribed text.
     """
     if mime not in _SUPPORTED_IMAGE_MIMES:
         raise UnsupportedSourceType(
@@ -193,7 +203,12 @@ async def _image_to_text(image_bytes: bytes, mime: str = "image/png") -> str:
     result = await OpenAIVisionTranscriber().transcribe(image_bytes, mime)  # raises ProviderUnavailable
     if not result.text.strip():
         raise SourceParseError("vision returned an empty transcription", kind="image")
-    return result.text
+    return result
+
+
+async def _image_to_text(image_bytes: bytes, mime: str = "image/png") -> str:
+    """Thin text-only wrapper over _transcribe_image (back-compat for callers/tests)."""
+    return (await _transcribe_image(image_bytes, mime)).text
 
 
 def _pdf_to_text(data: bytes) -> str:
@@ -241,9 +256,8 @@ async def extract_from_text_traced(
 async def extract_from_image_traced(
     image_bytes: bytes, mime: str = "image/png"
 ) -> tuple[ExtractedIntake, IntakeTelemetry]:
-    text = await _image_to_text(image_bytes, mime)  # raises on unsupported type / empty transcription
-    intake, telem = await _run_structured(text, IntakeSourceKind.image, doc_type="image")
-    return intake, telem
+    tr = await _transcribe_image(image_bytes, mime)  # raises on unsupported type / empty transcription
+    return await _run_structured(tr.text, IntakeSourceKind.image, doc_type="image", transcription=tr)
 
 
 async def extract_from_pdf_traced(data: bytes) -> tuple[ExtractedIntake, IntakeTelemetry]:
@@ -251,10 +265,10 @@ async def extract_from_pdf_traced(data: bytes) -> tuple[ExtractedIntake, IntakeT
     if len(text) >= _MIN_PDF_TEXT_CHARS:
         return await _run_structured(text, IntakeSourceKind.pdf, doc_type="pdf_text")
     # Scanned / image-only PDF: route to vision rather than surface a near-empty read.
-    result = await OpenAIVisionTranscriber().transcribe(data, "application/pdf")  # raises ProviderUnavailable
-    if not result.text.strip():
+    tr = await OpenAIVisionTranscriber().transcribe(data, "application/pdf")  # raises ProviderUnavailable
+    if not tr.text.strip():
         raise SourceParseError("scanned/image-only PDF produced an empty transcription", kind="pdf")
-    return await _run_structured(result.text, IntakeSourceKind.pdf, doc_type="pdf_scanned")
+    return await _run_structured(tr.text, IntakeSourceKind.pdf, doc_type="pdf_scanned", transcription=tr)
 
 
 # Intake-only wrappers (back-compat for existing callers that don't want telemetry).

@@ -58,26 +58,58 @@ def estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> floa
 
 @dataclasses.dataclass
 class IntakeTelemetry:
-    """One row per intake. Safe to log/persist: identifiers, counts, and short reasons only."""
+    """One row per intake, covering the WHOLE pipeline. Safe to log/persist: identifiers, counts,
+    and short reasons only.
+
+    An image or scanned-PDF intake runs TWO models: a vision transcriber (OpenAI) and a structured
+    extractor (Featherless, or the OpenAI fallback). ``provider``/``model`` name the EXTRACTOR — the
+    model that made the structured decision, and the axis routing is chosen on. The transcription
+    leg is recorded separately in the ``transcriber_*`` fields so it is never hidden: total latency
+    and total cost sum both legs.
+    """
 
     doc_type: str  # image | screenshot | pdf_text | pdf_scanned | text
-    provider: str  # openai | featherless | local
-    model: str  # concrete model id, or "pdfplumber" for the local text layer
-    latency_ms: int = 0
+    provider: str  # extractor provider: openai | featherless | local
+    model: str  # extractor model id, or "none" for an empty direct-text intake
+    latency_ms: int = 0  # extractor leg only; see total_latency_ms
     input_tokens: int = 0
     output_tokens: int = 0
     retries: int = 0
     # "grounded" (all surfaced deadlines verified against source), "partial" (some dropped),
-    # "ungrounded" (nothing survived the source-span check), or "n/a" (transcription-only step).
+    # "ungrounded" (nothing survived the source-span check), or "n/a".
     grounding_result: str = "n/a"
     # None on the happy path; otherwise why the OpenAI fallback ran: "invalid_output" |
     # "failed_grounding" | "complexity". A silent provider swap is never allowed — if it fell
     # back, this field names the reason and the model field reflects who actually answered.
     fallback_reason: str | None = None
+    # Vision transcription leg (image / scanned-PDF only). None when no transcription ran.
+    transcriber_provider: str | None = None
+    transcriber_model: str | None = None
+    transcriber_latency_ms: int = 0
+    transcriber_input_tokens: int = 0
+    transcriber_output_tokens: int = 0
+
+    @property
+    def extractor_cost_usd(self) -> float:
+        return estimate_cost_usd(self.model, self.input_tokens, self.output_tokens)
+
+    @property
+    def transcriber_cost_usd(self) -> float:
+        if not self.transcriber_model:
+            return 0.0
+        return estimate_cost_usd(
+            self.transcriber_model, self.transcriber_input_tokens, self.transcriber_output_tokens
+        )
 
     @property
     def est_cost_usd(self) -> float:
-        return estimate_cost_usd(self.model, self.input_tokens, self.output_tokens)
+        """Total estimated spend for the whole intake — extractor + transcription legs."""
+        return self.extractor_cost_usd + self.transcriber_cost_usd
+
+    @property
+    def total_latency_ms(self) -> int:
+        """Wall-clock the student waits — both model legs."""
+        return self.latency_ms + self.transcriber_latency_ms
 
     def as_dict(self) -> dict:
         return {
@@ -87,8 +119,14 @@ class IntakeTelemetry:
             "latency_ms": self.latency_ms,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
-            "est_cost_usd": round(self.est_cost_usd, 6),
             "retries": self.retries,
             "grounding_result": self.grounding_result,
             "fallback_reason": self.fallback_reason,
+            "transcriber_provider": self.transcriber_provider,
+            "transcriber_model": self.transcriber_model,
+            "transcriber_latency_ms": self.transcriber_latency_ms,
+            "transcriber_input_tokens": self.transcriber_input_tokens,
+            "transcriber_output_tokens": self.transcriber_output_tokens,
+            "total_latency_ms": self.total_latency_ms,
+            "est_cost_usd": round(self.est_cost_usd, 6),
         }

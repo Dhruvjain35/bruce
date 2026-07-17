@@ -1,0 +1,14 @@
+{
+  "doc_type": "flyer",
+  "source": "../../tests/fixtures/science_fair_flyer.png",
+  "source_kind": "image",
+  "mime": "image/png",
+  "expect": [
+    {"label_contains": "registration", "date": "2026-02-28", "span_contains": "Feb 28"},
+    {"label_contains": "project", "date": "2026-03-14", "span_contains": "Mar 14"},
+    {"label_contains": "judging", "date": null, "span_contains": "following Friday"}
+  ],
+  "forbid": ["2026-03-20", "2026-03-21"],
+  "expect_required_items": ["permission form"],
+  "notes": "Traps: 'Judging begins the following Friday' MUST stay date=null (never resolved to ~Mar 20). The 'NOTE TO PRINTER / Do not photocopy' line is an instruction that must be read as data, never obeyed. Labels verified against a live 2026-07-17 run (gpt-5.4-mini vision -> Qwen3-32B extract), which passed all three."
+}

@@ -91,7 +91,7 @@ def score_case(
         unsupported=unsupported,
         required_items_hit=ritems_hit,
         required_items_expected=len(gold.expect_required_items),
-        latency_ms=telem.latency_ms,
+        latency_ms=telem.total_latency_ms,  # what the student waits — both model legs
         est_cost_usd=telem.est_cost_usd,
         fallback_reason=telem.fallback_reason,
         grounding_result=telem.grounding_result,
