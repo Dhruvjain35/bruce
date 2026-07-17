@@ -57,7 +57,11 @@ struct HomeView: View {
         .navigationDestination(isPresented: $autoDetail) {
             MissionDetailView(mission: Demo.present == "failure" ? Mock.failureMission : Mock.missions[0])
         }
-        .sheet(isPresented: $showHandoff) { HandoffSheet() }
+        .sheet(isPresented: $showHandoff) {
+            // Default design is unchanged (HandoffSheet). BRUCE_LIVE_INTAKE=1 routes the same
+            // capture affordance to the real async backend (LiveIntakeSheet) for end-to-end testing.
+            if Demo.env["BRUCE_LIVE_INTAKE"] == "1" { LiveIntakeSheet() } else { HandoffSheet() }
+        }
         .onAppear {
             switch Demo.present {
             case "handoff", "clarify": showHandoff = true
