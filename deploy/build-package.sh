@@ -20,11 +20,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="$ROOT/build/fc"
 ZIP="$ROOT/build/bruce-fc.zip"
+LOCK="$ROOT/build/.build.lock"
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 
 command -v docker >/dev/null || { echo "docker required (amd64 wheels cannot be built on the host)"; exit 1; }
 
-rm -rf "$BUILD" "$ZIP"
+# SINGLE-WRITER LOCK. Two concurrent builds share $BUILD, so one creates files while the other is
+# deleting them — `rm -rf` then fails with "Directory not empty" and the package is left corrupt.
+# Observed for real during development. Fail fast and loudly rather than emit a half-built zip that
+# only shows up as a broken deployment.
+mkdir -p "$ROOT/build"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "ERROR: another build is already running (lock: $LOCK)."
+  echo "       Wait for it, or remove the lock directory if that build is dead."
+  exit 1
+fi
+cleanup_lock() { rmdir "$LOCK" 2>/dev/null || true; }
+trap cleanup_lock EXIT
+
+# Retry once: on a virtiofs mount a just-released file can briefly linger and defeat the first rm.
+rm -rf "$BUILD" "$ZIP" 2>/dev/null || { sleep 1; rm -rf "$BUILD" "$ZIP"; }
 mkdir -p "$BUILD/python"
 
 echo "==> installing dependencies for linux/amd64 + python3.11"
