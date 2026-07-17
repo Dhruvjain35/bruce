@@ -21,6 +21,8 @@ Last verified: **2026-07-16** · branch `hackathon/qwen-cloud`
 | **Live service URL** | **NONE** | — |
 | **One real Qwen Cloud inference call** | **NO — ZERO successful calls** | 144/144 models return 403 |
 | Google Calendar live execution | **NO** | no `GOOGLE_*` credentials issued |
+| RAM AccessKey valid | **VERIFIED** | `sts:GetCallerIdentity` 200 — RAM user `bruce-hackathon-deploy` |
+| Function Compute reachable | **NO — but NOT risk-blocked** | `fc:ListFunctions` → `ImplicitDeny` (no policy attached), no `RISK_CONTROL` in any FC response |
 
 **Hackathon eligibility is NOT met.** It requires genuine Qwen Cloud usage and an Alibaba-deployed
 backend. Neither has happened. Do not claim otherwise anywhere in the submission.
@@ -71,17 +73,52 @@ The non-Qwen row is the proof. If this were a free-quota, entitlement, or model-
 `text-embedding-v3` and `qwen-turbo` would work. Nothing does. Creating a new API key and a new
 workspace changed nothing, because the hold sits above both.
 
-## Blocker 2 — no RAM AccessKey
+## Blocker 2 — the RAM user has no permissions (NOT risk control)
 
-Deploying to Function Compute needs an Alibaba Cloud **RAM AccessKey** (`AccessKeyId` /
-`AccessKeySecret`). That is a **different credential** from the DashScope/Model Studio API key we
-hold. Without it the FC and ACR APIs cannot be called at all, so we cannot even reach — and
-therefore cannot report — the FC activation error. Function Compute activation status is
-**unverified**, not "blocked": we have not been able to ask.
+A RAM AccessKey was issued on 2026-07-16 and **it works**. This blocker is now precisely
+characterised, and it is *not* the same wall as Model Studio.
 
-Given that risk control blocks inference account-wide, the working assumption is that it also blocks
-FC/ACR provisioning, but that is an **assumption and is labelled as one** until an AccessKey exists
-to test it.
+```
+$ aliyun sts GetCallerIdentity
+{"AccountId":"5550384261126497",
+ "Arn":"acs:ram::5550384261126497:user/bruce-hackathon-deploy",
+ "IdentityType":"RAMUser"}                                    <-- key is VALID
+
+$ aliyun fc GET /2023-03-30/functions --region ap-southeast-1
+ErrorCode: AccessDenied
+Message:   the caller is not authorized to perform 'fc:ListFunctions' on resource
+           'acs:fc:ap-southeast-1:5550384261126497:functions/*'
+AccessDeniedDetail: NoPermissionType:ImplicitDeny
+                    PolicyType:AccountLevelIdentityBasedPolicy   <-- NO POLICY ATTACHED
+
+$ aliyun ram ListPoliciesForUser --UserName bruce-hackathon-deploy
+ErrorCode: NoPermission  (ImplicitDeny)                        <-- cannot introspect itself
+```
+
+**`ImplicitDeny` means no policy grants the action** — the RAM user was created bare. Critically,
+**no Function Compute response mentions `RISK_CONTROL` or `Unpurchased`**; the only codes returned
+are `AccessDenied` / `ImplicitDeny`. That is a different failure from the Model Studio hold.
+
+### What this does and does not tell us
+
+- **Does:** the FC blocker so far is a fixable RAM permissions gap, self-serve, no CS ticket.
+- **Does NOT:** prove FC is usable. Function Compute activation remains **unverified** — we still
+  cannot ask, because the call is denied before activation is ever evaluated. Risk control is
+  account-level and killed 144/144 model calls, so it *may* also block FC/ACR provisioning once
+  permissions exist. **This is explicitly an open question, not a prediction.**
+
+### Fix (root account)
+
+Attach to RAM user `bruce-hackathon-deploy` — least privilege, **not** `AdministratorAccess`:
+
+| Policy | Why |
+|---|---|
+| `AliyunFCFullAccess` | deploy/manage the function |
+| `AliyunContainerRegistryFullAccess` | FC pulls images only from ACR, same region + account |
+| `AliyunRDSFullAccess` | provision ApsaraDB PostgreSQL 16 |
+
+Then re-run the probes above. If they return 200, deployment proceeds. If they return
+`RISK.RISK_CONTROL_REJECTION`, the hold covers FC too and that must be recorded here.
 
 ## Blocker 3 — no Google Calendar credentials
 
