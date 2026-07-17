@@ -5,7 +5,7 @@ read-back that matches. A calendar adapter that reports success on a 2xx write w
 test suite and lie to the student — so most of what follows is negative cases.
 
 The Google wire format is asserted through an httpx MockTransport against the real client stack
-(same approach as the Qwen provider tests), so CI covers the integration without OAuth. The live
+(same approach as the vision-transcriber tests), so CI covers the integration without OAuth. The live
 test needs real Google credentials and skips with a precise reason when they are absent.
 """
 

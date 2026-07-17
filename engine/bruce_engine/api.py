@@ -14,19 +14,23 @@ their auth-gating as persistence. Run: PYTHONPATH=. python scripts/run_api.py
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import date
 from enum import Enum
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
+from sqlalchemy import text as sa_text
 
 from . import calendar_build
 from . import intake_store
 from . import tasks as tasks_mod
 from .auth import AuthenticatedUser, current_user
 from .briefing import compose_brief
-from .extraction import extract_from_text
+from .db import user_session
+from .extraction import ExtractionError, extract_from_text
+from .provider_status import ProviderUnavailable
 from .models import (
     CalendarEvent,
     DailyBrief,
@@ -134,6 +138,55 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+class Readiness(BaseModel):
+    ready: bool
+    checks: dict[str, str]
+
+
+@app.get("/ready")
+async def ready(response: Response) -> Readiness:
+    """PUBLIC readiness probe — are Bruce's MANDATORY runtime dependencies usable?
+
+    Distinct from /health on purpose:
+      /health = this process is up and serving (never touches the DB or a provider, so a dependency
+                outage can't make the platform think the process is dead and recycle it).
+      /ready  = the things Bruce cannot function without are actually usable.
+
+    Mandatory here means: the database (every guarantee Bruce makes — RLS, isolation, idempotency,
+    evidence lineage — is enforced BY Postgres) and JWT configuration (without it, either nothing
+    authenticates or, worse, something doesn't).
+
+    A model provider is deliberately NOT a readiness condition. If a provider is blocked, intake
+    returns a truthful 503 provider_unavailable while missions/decisions/receipts keep working; the
+    service should not be pulled from the load balancer. Provider state is reported separately by
+    /v1/diagnostics (authenticated). Returns 503 when not ready; the body names which check failed,
+    with no secrets.
+    """
+    checks: dict[str, str] = {}
+
+    try:
+        async with user_session(uuid5(NAMESPACE_URL, "bruce.readiness.probe")) as s:
+            await s.execute(sa_text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as exc:
+        checks["database"] = f"unavailable ({type(exc).__name__})"
+
+    secret, jwks = os.environ.get("BRUCE_JWT_SECRET"), os.environ.get("BRUCE_JWKS_URL")
+    if secret and len(secret) >= 32:
+        checks["auth_config"] = "ok"
+    elif jwks:
+        checks["auth_config"] = "ok"
+    elif secret:
+        checks["auth_config"] = "weak (BRUCE_JWT_SECRET under 32 bytes)"
+    else:
+        checks["auth_config"] = "missing (no BRUCE_JWT_SECRET or BRUCE_JWKS_URL)"
+
+    ok = all(v == "ok" for v in checks.values())
+    if not ok:
+        response.status_code = 503
+    return Readiness(ready=ok, checks=checks)
+
+
 @app.post("/v1/missions", response_model=MissionCreated)
 async def create_mission(req: MissionRequest, user: AuthenticatedUser = Depends(current_user)) -> MissionCreated:
     await _user_repo.ensure(user.user_id, auth_provider=user.auth_provider)
@@ -206,6 +259,15 @@ async def intake(req: IntakeRequest, user: AuthenticatedUser = Depends(current_u
             extract=extract_from_text,  # resolved here (not at import) so tests can patch it
             idempotency_key=req.idempotency_key,
         )
+    except ExtractionError as exc:
+        # We could not READ the input. 415 (wrong type) / 422 (unreadable instance) — never a 200
+        # with zero findings, which would claim Bruce read it and found nothing. Detail carries no
+        # student content (type + short cause only).
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+    except ProviderUnavailable as exc:
+        # A model provider outage is reported as exactly that — 503 provider_unavailable, naming the
+        # provider and the real cause. It is NOT retried against a different provider here.
+        raise HTTPException(status_code=503, detail=exc.as_detail())
     except Exception as exc:
         # Type only — never the message: it can quote the student's raw content.
         raise HTTPException(status_code=502, detail=f"extraction failed: {type(exc).__name__}")

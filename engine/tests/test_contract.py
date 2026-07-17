@@ -129,7 +129,7 @@ def test_mismatch_is_not_success_shaped():
 def test_blocking_reason_is_carried_for_blocked_missions():
     c = build_contract(
         state=MachineState.blocked, updated_at="t", refs=REFS,
-        blocking_reason="Qwen Cloud is not available for this account",
+        blocking_reason="the model provider is not available for this account",
     )
     assert c.blocking_reason and c.state == MachineState.blocked
 
