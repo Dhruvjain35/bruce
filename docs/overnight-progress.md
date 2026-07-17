@@ -87,7 +87,7 @@ Each commit is one concern. Tests were run before each; the full offline suite b
 | 4 | `2d66804` | **P3** calendar provider + verified undo | 30 tests; normalization keeps Google types out of the domain | live execution needs `GOOGLE_*` |
 | 5 | `6432387` | **P4** server-authorized contract + **P9** smoke script | 16 tests | — |
 | 6 | `1e58837` | **P7** messaging boundary | 16 tests via FakeChannel | **no provider connected**; iMessage NOT functional |
-| 7 | `d9c3f7a` | **P8** README, readiness table, demo script, screenshots checklist, LICENSE | docs cross-checked against measured status | — |
+| 7 | `cf6eb15` | **P8** README, readiness table, demo script, screenshots checklist, LICENSE | docs cross-checked against measured status | — |
 
 **Suite: 244 → 342 passed, 12 skipped.** Every skip names its blocker.
 
