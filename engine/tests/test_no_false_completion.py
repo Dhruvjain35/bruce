@@ -177,7 +177,7 @@ def test_intake_maps_extraction_errors_to_precise_status_codes(monkeypatch, exc,
         raise exc
 
     monkeypatch.setattr(api, "_persist_intake", boom)
-    r = client.post("/v1/intake", json={"text": "x"}, headers=_auth(uuid4()))
+    r = client.post("/v1/intake/sync", json={"text": "x"}, headers=_auth(uuid4()))
     assert r.status_code == expected
     assert r.json()["detail"]["error"] in ("unsupported_source_type", "source_parse_failed")
 
@@ -189,7 +189,7 @@ def test_intake_maps_provider_outage_to_503_provider_unavailable(monkeypatch):
         raise ProviderUnavailable(provider="featherless", model="Qwen/Qwen3-32B", reason="rate limit", status_code=429)
 
     monkeypatch.setattr(api, "_persist_intake", boom)
-    r = client.post("/v1/intake", json={"text": "x"}, headers=_auth(uuid4()))
+    r = client.post("/v1/intake/sync", json={"text": "x"}, headers=_auth(uuid4()))
     assert r.status_code == 503
     assert r.json()["detail"]["error"] == "provider_unavailable"
 
@@ -207,7 +207,7 @@ def test_extraction_failure_never_returns_a_successful_empty_intake(monkeypatch)
             return boom
 
         monkeypatch.setattr(api, "_persist_intake", make(exc))
-        r = client.post("/v1/intake", json={"text": "x"}, headers=_auth(uuid4()))
+        r = client.post("/v1/intake/sync", json={"text": "x"}, headers=_auth(uuid4()))
         assert r.status_code != 200
         assert "source_id" not in r.text and "task_ids" not in r.text
 
@@ -219,7 +219,7 @@ def test_extraction_error_detail_leaks_no_student_content(monkeypatch):
         raise SourceParseError("could not parse the PDF (ValueError)", kind="pdf")
 
     monkeypatch.setattr(api, "_persist_intake", boom)
-    r = client.post("/v1/intake", json={"text": secret}, headers=_auth(uuid4()))
+    r = client.post("/v1/intake/sync", json={"text": secret}, headers=_auth(uuid4()))
     assert secret not in r.text and "555-0100" not in r.text
 
 

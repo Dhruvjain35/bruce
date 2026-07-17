@@ -110,12 +110,12 @@ def test_intake_endpoint(monkeypatch):
 
     monkeypatch.setattr(api, "extract_from_text", fake_extract)
     monkeypatch.setattr(api, "_persist_intake", fake_persist)
-    r = client.post("/v1/intake", json={"text": "Registration closes Feb 28, 2026."}, headers=_auth(uuid4()))
+    r = client.post("/v1/intake/sync", json={"text": "Registration closes Feb 28, 2026."}, headers=_auth(uuid4()))
     assert r.status_code == 200 and r.json()["title"] == "Science Fair"
     # additive contract: the extraction still sits at its original paths, ids are new
     assert r.json()["deadlines"][0]["label"] == "Registration"
     assert r.json()["source_id"] and len(r.json()["task_ids"]) == 1
-    assert client.post("/v1/intake", json={"text": "x"}).status_code == 401  # auth required
+    assert client.post("/v1/intake/sync", json={"text": "x"}).status_code == 401  # auth required
 
 
 def test_intake_failure_leaks_no_content(monkeypatch):
@@ -126,7 +126,7 @@ def test_intake_failure_leaks_no_content(monkeypatch):
         raise ValueError(secret)
 
     monkeypatch.setattr(api, "_persist_intake", boom)
-    r = client.post("/v1/intake", json={"text": secret}, headers=_auth(uuid4()))
+    r = client.post("/v1/intake/sync", json={"text": secret}, headers=_auth(uuid4()))
     assert r.status_code == 502
     assert secret not in r.text and "555-0100" not in r.text
     assert r.json()["detail"] == "extraction failed: ValueError"

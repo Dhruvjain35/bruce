@@ -20,7 +20,9 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -298,6 +300,48 @@ class ModelCost(Base):
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     cost_usd: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IntakeJob(Base, TSV):
+    """A durable unit of intake work: transcribe + extract, done OUTSIDE the request lifecycle.
+
+    The request commits this row (status='pending') plus its source + mission, then returns 202. A
+    worker later claims it with a lease, runs the model work, and persists results — so a process
+    restart never loses accepted work (the row survives; the lease expires and any worker reclaims
+    it). The raw input bytes/text live HERE (transient, cleared when the job finishes) so no new blob
+    table is needed; the durable content lands in sources/spans/tasks under the owner's RLS context.
+
+    RLS is custom (see migration 0005): the owner sees their own jobs (API status reads), and a
+    worker session (app.worker='on', set only by server worker code, never from a request) may claim
+    across users. Content writes still happen under user_session(user_id), fully tenant-scoped.
+    """
+
+    __tablename__ = "intake_jobs"
+    id = _pk()
+    user_id = _owner()
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    mission_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("missions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # pending -> processing -> completed | retryable_failed (-> reclaimed) | terminal_failed
+    status: Mapped[str] = mapped_column(String(24), nullable=False, server_default="pending", index=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)  # IntakeSourceKind
+    mime: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_text: Mapped[str | None] = mapped_column(Text, nullable=True)  # text sources; cleared on finish
+    input_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)  # image/pdf; cleared on finish
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)  # TYPE/reason only, no content
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_intake_job_idem"),
+        # The claim query filters on status + lease_expires_at; index it for the worker hot path.
+        Index("ix_intake_jobs_claimable", "status", "lease_expires_at"),
+    )
 
 
 # user-owned tables that get row-level security (users handled separately: a user sees only self)
