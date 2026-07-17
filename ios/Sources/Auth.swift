@@ -3,7 +3,6 @@ import Observation
 import AuthenticationServices
 import CryptoKit
 import Security
-import UIKit
 
 // MARK: - Config
 
@@ -56,15 +55,48 @@ enum Keychain {
 // MARK: - Session
 
 enum AuthError: LocalizedError, Equatable {
-    case cancelled, noIdentityToken, exchangeFailed(Int), network, notConfigured
+    case cancelled, noIdentityToken, exchangeFailed(Int), network, notConfigured, notSignedIn
     var errorDescription: String? {
         switch self {
         case .cancelled: return "Sign-in was cancelled."
         case .noIdentityToken: return "Apple didn't return an identity token. Try again."
-        case .exchangeFailed(let c): return c == 401 ? "Apple sign-in couldn't be verified." : "Couldn't sign you in (\(c))."
-        case .network: return "Couldn't reach Bruce. Check your connection."
+        case .exchangeFailed(let c): return c == 401 ? "Your session expired. Sign in again." : "Something went wrong (\(c))."
+        case .network: return "Couldn't reach Bruce. Check your connection and try again."
         case .notConfigured: return "Sign in with Apple isn't configured for this build."
+        case .notSignedIn: return "You're not signed in."
         }
+    }
+}
+
+/// Network operations for auth/account — injectable so AppSession is unit-testable without a server.
+protocol AuthTransport {
+    func appleExchange(idToken: String, rawNonce: String) async throws -> (token: String, userID: UUID)
+    func deleteAccount(bearer: String) async throws
+}
+
+struct URLSessionAuthTransport: AuthTransport {
+    func appleExchange(idToken: String, rawNonce: String) async throws -> (token: String, userID: UUID) {
+        var req = URLRequest(url: AppConfig.baseURL.appending(path: "/v1/auth/apple"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["identity_token": idToken, "raw_nonce": rawNonce])
+        let (data, resp): (Data, URLResponse)
+        do { (data, resp) = try await URLSession.shared.data(for: req) } catch { throw AuthError.network }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        guard code == 200 else { throw AuthError.exchangeFailed(code) }
+        struct SessionToken: Codable { let token: String; let user_id: UUID; let expires_in: Int }
+        let s = try JSONDecoder().decode(SessionToken.self, from: data)
+        return (s.token, s.user_id)
+    }
+
+    func deleteAccount(bearer: String) async throws {
+        var req = URLRequest(url: AppConfig.baseURL.appending(path: "/v1/account"))
+        req.httpMethod = "DELETE"
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+        let resp: URLResponse
+        do { (_, resp) = try await URLSession.shared.data(for: req) } catch { throw AuthError.network }
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        guard (200..<300).contains(code) else { throw AuthError.exchangeFailed(code) }
     }
 }
 
@@ -76,52 +108,84 @@ enum AuthError: LocalizedError, Equatable {
     private(set) var token: String?
     private(set) var userID: UUID?
     var lastError: AuthError? = nil
+    private(set) var isDeleting = false
+
+    private let transport: AuthTransport
+    private var rawNonce = ""
 
     /// The bearer the API layer sends. Real token first; the dev token only if DEBUG+flag allow it.
     var bearer: String? { token ?? AppConfig.devToken }
     var isSignedIn: Bool { token != nil }
 
-    private let coordinator = AppleSignInCoordinator()
+    init(transport: AuthTransport = URLSessionAuthTransport(), seedToken: String? = nil) {
+        self.transport = transport
+        token = seedToken ?? Keychain.read()   // seedToken is a test seam; prod reads Keychain
+    }
 
-    private init() { token = Keychain.read() }
+    // MARK: Sign in with Apple (driven by the official SignInWithAppleButton)
 
-    @MainActor func signInWithApple() async -> Bool {
+    /// Configure the button's request: a FRESH random nonce each attempt (its sha256 is bound into
+    /// the token and checked server-side against replay).
+    func prepare(_ request: ASAuthorizationAppleIDRequest) {
+        rawNonce = AppleNonce.make()
+        request.requestedScopes = [.fullName, .email]
+        request.nonce = AppleNonce.sha256(rawNonce)
+    }
+
+    /// Handle the button's completion. Returns true on a verified sign-in.
+    @MainActor func complete(_ result: Result<ASAuthorization, Error>) async -> Bool {
         lastError = nil
-        do {
-            let (idToken, rawNonce) = try await coordinator.run()
-            try await exchange(idToken: idToken, rawNonce: rawNonce)
-            return true
-        } catch let e as AuthError {
-            if e != .cancelled { lastError = e }   // cancellation is not an error to surface
-            return false
-        } catch {
+        switch result {
+        case .failure(let error):
+            if let e = error as? ASAuthorizationError, e.code == .canceled { return false }  // silent
             lastError = .network
             return false
+        case .success(let auth):
+            guard let cred = auth.credential as? ASAuthorizationAppleIDCredential,
+                  let data = cred.identityToken, let idToken = String(data: data, encoding: .utf8) else {
+                lastError = .noIdentityToken; return false
+            }
+            do {
+                let (tok, uid) = try await transport.appleExchange(idToken: idToken, rawNonce: rawNonce)
+                Keychain.save(tok); token = tok; userID = uid
+                return true
+            } catch let e as AuthError { lastError = e; return false }
+            catch { lastError = .network; return false }
         }
     }
 
-    func signOut() {
-        Keychain.clear(); token = nil; userID = nil
+    func signOut() { clearLocal(); token = nil; userID = nil }
+
+    // MARK: Account deletion
+
+    /// Delete the account server-side, then locally. Returns true ONLY after the server confirms —
+    /// never claims success early. Guarded against repeated taps.
+    @MainActor func deleteAccount() async -> Bool {
+        guard !isDeleting else { return false }
+        guard let bearer = token else { lastError = .notSignedIn; return false }  // expired/no auth
+        isDeleting = true
+        defer { isDeleting = false }
+        do {
+            try await transport.deleteAccount(bearer: bearer)   // throws on non-2xx / network
+        } catch let e as AuthError { lastError = e; return false }
+        catch { lastError = .network; return false }
+        // Server confirmed. Now clear everything local and drop to signed-out.
+        clearLocal(); token = nil; userID = nil
+        return true
     }
 
-    private func exchange(idToken: String, rawNonce: String) async throws {
-        var req = URLRequest(url: AppConfig.baseURL.appending(path: "/v1/auth/apple"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["identity_token": idToken, "raw_nonce": rawNonce])
-        let (data, resp): (Data, URLResponse)
-        do { (data, resp) = try await URLSession.shared.data(for: req) }
-        catch { throw AuthError.network }
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-        guard code == 200 else { throw AuthError.exchangeFailed(code) }
-        struct SessionToken: Codable { let token: String; let user_id: UUID; let expires_in: Int }
-        let s = try JSONDecoder().decode(SessionToken.self, from: data)
-        await MainActor.run {
-            Keychain.save(s.token)
-            self.token = s.token
-            self.userID = s.user_id
-        }
+    /// Clear all local user-specific state: Keychain JWT, restore pointer, caches, Live Activities.
+    private func clearLocal() {
+        Keychain.clear()
+        IntakeRestore.pending = nil
+        LiveActivities.endAll()
     }
+}
+
+/// Live Activities teardown. No ActivityKit surface exists yet, so this is a safe no-op that becomes
+/// the single place to end activities the moment one is added (e.g. an intake Dynamic Island).
+enum LiveActivities {
+    static func endAll() { /* no ActivityKit activities yet — hook for when one lands */ }
 }
 
 // MARK: - Apple flow (nonce + ASAuthorizationController)
@@ -135,48 +199,5 @@ enum AppleNonce {
     }
     static func sha256(_ input: String) -> String {
         SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-}
-
-/// Runs the native Sign in with Apple request and returns (identityToken, rawNonce). Uses a fresh
-/// random nonce each time (bound into the token, checked server-side against replay).
-final class AppleSignInCoordinator: NSObject, ASAuthorizationControllerDelegate, ASAuthorizationControllerPresentationContextProviding {
-    private var cont: CheckedContinuation<(String, String), Error>?
-    private var rawNonce = ""
-
-    @MainActor func run() async throws -> (String, String) {
-        rawNonce = AppleNonce.make()
-        let req = ASAuthorizationAppleIDProvider().createRequest()
-        req.requestedScopes = [.fullName, .email]
-        req.nonce = AppleNonce.sha256(rawNonce)   // Apple echoes this hash in the token's nonce claim
-        let controller = ASAuthorizationController(authorizationRequests: [req])
-        controller.delegate = self
-        controller.presentationContextProvider = self
-        return try await withCheckedThrowingContinuation { c in
-            self.cont = c
-            controller.performRequests()
-        }
-    }
-
-    func authorizationController(controller: ASAuthorizationController, didCompleteWithAuthorization authorization: ASAuthorization) {
-        guard let cred = authorization.credential as? ASAuthorizationAppleIDCredential,
-              let tokenData = cred.identityToken, let idToken = String(data: tokenData, encoding: .utf8) else {
-            cont?.resume(throwing: AuthError.noIdentityToken); cont = nil; return
-        }
-        cont?.resume(returning: (idToken, rawNonce)); cont = nil
-    }
-
-    func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
-        if let e = error as? ASAuthorizationError, e.code == .canceled {
-            cont?.resume(throwing: AuthError.cancelled)
-        } else {
-            cont?.resume(throwing: AuthError.network)
-        }
-        cont = nil
-    }
-
-    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first { $0.isKeyWindow } ?? ASPresentationAnchor()
     }
 }

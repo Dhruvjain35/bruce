@@ -1,17 +1,28 @@
 import SwiftUI
+import AuthenticationServices
 
 // MARK: - Root flow (onboarding gate)
 
 struct RootFlow: View {
     // A returning signed-in user (JWT in Keychain) skips onboarding. BRUCE_SKIP_ONBOARD=1 also jumps
     // straight to the app for dev. Otherwise onboarding runs and gates on Sign in with Apple.
+    @State private var session = AppSession.shared
     @State private var onboarded = Demo.env["BRUCE_SKIP_ONBOARD"] == "1" || AppSession.shared.isSignedIn
 
     var body: some View {
-        if onboarded {
-            RootView()
-        } else {
-            OnboardingView { withAnimation(.easeInOut) { onboarded = true } }
+        Group {
+            if onboarded {
+                RootView()
+            } else {
+                OnboardingView { withAnimation(.easeInOut) { onboarded = true } }
+            }
+        }
+        // Account deletion / sign-out clears the token -> return to the signed-out root. (Dev builds
+        // stay in the app via the dev token so local work isn't interrupted.)
+        .onChange(of: session.isSignedIn) { _, signedIn in
+            if !signedIn && Demo.env["BRUCE_SKIP_ONBOARD"] != "1" && AppConfig.devToken == nil {
+                withAnimation(.easeInOut) { onboarded = false }
+            }
         }
     }
 }
@@ -58,17 +69,13 @@ struct OnboardingView: View {
 
     private func advance() { withAnimation(.easeInOut(duration: 0.25)) { step += 1 } }
 
-    /// Real Sign in with Apple. In a local dev build (DEBUG + BRUCE_DEV_AUTH=1) the dev token is in
-    /// use, so we skip the Apple flow and proceed. Otherwise we run the real exchange; on success we
-    /// advance, on cancel we stay put, on error we show it. Guarded against double taps.
-    private func startSignIn() {
-        Haptics.tap()
+    /// Handle the official Sign in with Apple button's completion: exchange the identity token, then
+    /// advance on success, stay put on cancel, surface a real error otherwise.
+    private func completeSignIn(_ result: Result<ASAuthorization, Error>) {
         authError = nil
-        if AppConfig.devToken != nil { advance(); return }
-        guard !signingIn else { return }
         signingIn = true
         Task {
-            let ok = await AppSession.shared.signInWithApple()
+            let ok = await AppSession.shared.complete(result)
             signingIn = false
             if ok { advance() } else { authError = AppSession.shared.lastError?.errorDescription }
         }
@@ -110,25 +117,36 @@ struct OnboardingView: View {
             }
             Spacer(); Spacer()
             VStack(spacing: 12) {
-                Button { startSignIn() } label: {
-                    HStack(spacing: 8) {
-                        if signingIn { ProgressView().tint(.black) }
-                        else {
+                if AppConfig.devToken != nil {
+                    // Local dev only: the dev token is in use, so skip the real Apple flow.
+                    Button { Haptics.tap(); advance() } label: {
+                        HStack(spacing: 8) {
                             Image(systemName: "apple.logo").font(.system(size: 17, weight: .medium))
-                            Text("Continue with Apple").font(.system(size: 17, weight: .semibold))
+                            Text("Continue (dev)").font(.system(size: 17, weight: .semibold))
                         }
+                        .foregroundStyle(.black).frame(maxWidth: .infinity).padding(.vertical, 15)
+                        .background(.white, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }.buttonStyle(PressStyle())
+                } else {
+                    // The official Sign in with Apple button. Fresh nonce per attempt (onRequest),
+                    // real exchange (onCompletion); VoiceOver is provided by the control itself.
+                    ZStack {
+                        SignInWithAppleButton(.continue,
+                            onRequest: { req in AppSession.shared.prepare(req) },
+                            onCompletion: { result in completeSignIn(result) })
+                            .signInWithAppleButtonStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 52)
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .disabled(signingIn)
+                            .opacity(signingIn ? 0.5 : 1)
+                        if signingIn { ProgressView().tint(.black) }
                     }
-                    .foregroundStyle(.black).frame(maxWidth: .infinity).padding(.vertical, 15)
-                    .background(.white, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                }.buttonStyle(PressStyle()).disabled(signingIn)
-                    .accessibilityLabel("Continue with Apple")
+                }
                 if let e = authError {
                     Text(e).font(.caption).foregroundStyle(Theme.amber).multilineTextAlignment(.center)
                         .accessibilityAddTraits(.isStaticText)
                 }
-                Button { startSignIn() } label: {
-                    Text("Sign in").font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.textSecondary)
-                }.buttonStyle(.plain).padding(.top, 2).disabled(signingIn)
             }
             .padding(.horizontal, 24).padding(.bottom, 24)
         }
@@ -515,6 +533,8 @@ struct Toast: View {
 
 struct DeleteAccountSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @State private var deleting = false
+    @State private var error: String? = nil
     var body: some View {
         ZStack {
             Theme.Backdrop()
@@ -538,13 +558,22 @@ struct DeleteAccountSheet: View {
                 .background(Theme.cardFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Theme.stroke))
 
+                if let e = error {
+                    Text(e).font(.caption).foregroundStyle(Color(hex: 0xFF6B6B)).multilineTextAlignment(.center)
+                        .accessibilityAddTraits(.isStaticText)
+                }
                 Spacer()
-                Button { } label: {
-                    Text("Delete my account").font(.system(size: 16, weight: .bold)).foregroundStyle(.white)
-                        .frame(maxWidth: .infinity).padding(.vertical, 15)
-                        .background(Color(hex: 0xFF6B6B), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                }.buttonStyle(.plain)
-                GhostButton(title: "Keep my account") { dismiss() }
+                Button { confirmDelete() } label: {
+                    Group {
+                        if deleting { ProgressView().tint(.white) }
+                        else { Text("Delete my account").font(.system(size: 16, weight: .bold)) }
+                    }
+                    .foregroundStyle(.white).frame(maxWidth: .infinity).padding(.vertical, 15)
+                    .background(Color(hex: 0xFF6B6B), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }.buttonStyle(.plain).disabled(deleting)
+                    .accessibilityLabel("Delete my account")
+                    .accessibilityHint("Permanently deletes your account after the server confirms.")
+                GhostButton(title: "Keep my account") { dismiss() }.disabled(deleting)
             }
             .padding(.horizontal, 22).padding(.bottom, 16)
         }
@@ -552,6 +581,19 @@ struct DeleteAccountSheet: View {
         .presentationBackground(Theme.bg)
         .preferredColorScheme(.dark)
     }
+    /// Deletes server-side FIRST; only a confirmed server response clears local state + returns to
+    /// signed-out. Guarded against repeated taps; a failure is recoverable (stays on the sheet).
+    private func confirmDelete() {
+        guard !deleting else { return }
+        Haptics.tap(); error = nil; deleting = true
+        Task {
+            let ok = await AppSession.shared.deleteAccount()
+            deleting = false
+            if ok { dismiss() }   // token cleared -> RootFlow returns to the signed-out root
+            else { error = AppSession.shared.lastError?.errorDescription ?? "Couldn't delete your account. Try again." }
+        }
+    }
+
     private func bullet(_ t: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "xmark").font(.caption2.weight(.bold)).foregroundStyle(Color(hex: 0xFF6B6B)).padding(.top, 2)
