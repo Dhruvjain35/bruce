@@ -269,6 +269,70 @@ the account is unblocked.
 
 ---
 
+## THE MORNING COMMAND
+
+After activating Function Compute (Singapore, needs SMS), this is the whole deployment:
+
+```bash
+make deploy-fc            # or: ./deploy/deploy_fc.sh
+```
+
+It runs, in order, and stops at the first failure with a named cause:
+
+1. tool check (docker, s, aliyun, python3, zip, git)
+2. env check — required vars present; **refuses** a `BRUCE_JWT_SECRET` that is <32 bytes or looks
+   like a test value (that secret is the only thing protecting student data on a public URL)
+3. bounded preflight — auth + provider-status + api tests (31); refuses to deploy if they fail
+4. build the linux/amd64 code package
+5. validate: bootstrap executable, no `.env`, `api.py` present, base64 < 100MB; print sha256
+6. `s deploy`
+7. discover the HTTP trigger URL
+8. **live verify** — `/health` 200, commit matches, region matches, and `/v1/*` return 401
+   unauthenticated (asserted against the LIVE URL, because the FC trigger is anonymous at the
+   gateway and Bruce's JWT check is the only thing in front of student data)
+9. write `docs/deployment-proof.json` (non-secret by construction)
+
+Dry run — every local check, never contacts Alibaba:
+
+```bash
+make deploy-fc-dry
+```
+
+**Locally verified 2026-07-17:** the dry run passes end to end (tools ✓, env ✓, 31 preflight tests ✓,
+package 45.5MB zip / 60.7MB base64 ✓, sha256 computed ✓). `s` 3.1.10 is installed and the `bruce`
+access profile is configured against RAM user `bruce-hackathon-deploy`. Credentials live in `~/.s`
+and `engine/.env`, both outside version control.
+
+If it fails, `deploy/diagnose.sh` names which of these you hit — and it is unit-tested against the
+real strings this account has produced (12 tests):
+
+| Cause | Exit | Fix |
+|---|---|---|
+| `fc_not_activated` | 20 | activate FC in the Singapore console (SMS) |
+| `ram_permission_missing` | 21 | attach `AliyunFCFullAccess` |
+| `risk_control_rejection` | 22 | the account hold reached FC — record it and stop |
+| `wrong_architecture` | 14 | rebuild via `deploy/build-package.sh` (amd64 container) |
+| `bootstrap_failed` | 33 | exec bit lost — must be `0o755` |
+| `invalid_package` | 14 | rebuild; check base64 < 100MB |
+
+### Fields to capture after deployment
+
+`deploy_fc.sh` writes most of these to `docs/deployment-proof.json` automatically. Paste into the
+**Deployment record** table above:
+
+- service URL, region, function name, commit SHA, package sha256, deployed-at timestamp
+- the `/health` JSON exactly as returned
+- output of `BRUCE_DEPLOY_URL=<url> make smoke`
+
+### Devpost proof instructions
+
+1. Screenshot the FC console showing `bruce-engine` in **Singapore** with its trigger URL.
+2. Screenshot `curl <url>/health` returning the commit SHA, next to `git log -1` showing the same
+   SHA — this is what ties the running service to the public repo.
+3. Screenshot a `401` from `curl -X POST <url>/v1/intake` — proves auth is enforced in production.
+4. Link `docs/deployment-proof.json` in the Devpost description.
+5. Do **not** screenshot `.env`, the RAM AccessKey, or `~/.s`.
+
 ## What would flip each row to green
 
 1. Alibaba CS lifts `RISK.RISK_CONTROL_REJECTION`, **or** the hackathon organizers issue a sponsored
