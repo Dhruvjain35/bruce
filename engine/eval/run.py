@@ -96,9 +96,12 @@ async def main(cases_dir: Path, json_out: Path | None) -> int:
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    cases_dir = Path(args[0]) if args else _ENGINE_ROOT / "eval" / "cases"
+    argv = sys.argv[1:]
     out = None
-    if "--json" in sys.argv:
-        out = Path(sys.argv[sys.argv.index("--json") + 1])
+    if "--json" in argv:
+        i = argv.index("--json")
+        out = Path(argv[i + 1])
+        del argv[i : i + 2]  # drop the flag AND its value before reading positionals
+    positionals = [a for a in argv if not a.startswith("--")]
+    cases_dir = Path(positionals[0]) if positionals else _ENGINE_ROOT / "eval" / "cases"
     raise SystemExit(asyncio.run(main(cases_dir, out)))
