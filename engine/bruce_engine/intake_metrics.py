@@ -71,6 +71,9 @@ class IntakeTelemetry:
     doc_type: str  # image | screenshot | pdf_text | pdf_scanned | text
     provider: str  # extractor provider: openai | featherless | local
     model: str  # extractor model id, or "none" for an empty direct-text intake
+    # "production" (a synchronous student-facing request — must be OpenAI) or "evaluation" (offline
+    # eval/batch, where Featherless is allowed). Lets dashboards separate the two cleanly.
+    traffic: str = "production"
     latency_ms: int = 0  # extractor leg only; see total_latency_ms
     input_tokens: int = 0
     output_tokens: int = 0
@@ -114,6 +117,7 @@ class IntakeTelemetry:
     def as_dict(self) -> dict:
         return {
             "doc_type": self.doc_type,
+            "traffic": self.traffic,
             "provider": self.provider,
             "model": self.model,
             "latency_ms": self.latency_ms,

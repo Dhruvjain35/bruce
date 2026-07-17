@@ -3,10 +3,13 @@
 Three roles, three interfaces (the user's requirement: keep providers behind neutral interfaces so
 the domain layer is not coupled to any vendor's types):
 
-  * VisionTranscriber   pixels -> verbatim text. OpenAI gpt-5.4-mini today.
-  * StructuredExtractor normalized text -> ExtractedIntake. Featherless Qwen3-32B today, with a
-                        bounded OpenAI fallback the orchestrator invokes explicitly.
-  * DraftGenerator      grounded drafting/summary. Featherless Qwen3-32B today.
+  * VisionTranscriber   pixels -> verbatim text. OpenAI gpt-5.4-mini.
+  * StructuredExtractor normalized text -> ExtractedIntake. PRODUCTION = OpenAI gpt-5.4-mini
+                        (`production_extractor()`). Featherless is offline-only and flag-gated.
+  * DraftGenerator      grounded drafting/summary. PRODUCTION = OpenAI (`production_drafter()`).
+
+Production never touches Featherless. The Featherless* classes exist for offline eval/batch
+comparison and raise unless BRUCE_ENABLE_FEATHERLESS is set.
 
 Every method RAISES on provider failure. None of them ever returns an empty-but-successful result:
 a failure to read is a different fact from "read it, found nothing", and only one of those is honest
@@ -72,10 +75,17 @@ syllabus, form, announcement, screenshot text) and return it as JSON. Rules:
 
 
 def _pa_tokens(result) -> tuple[int, int]:
-    """Pull (input, output) token counts out of a pydantic-ai result across version spellings."""
+    """Pull (input, output) token counts out of a pydantic-ai result across version spellings.
+
+    `usage` is a PROPERTY in current pydantic-ai (was a method in older versions), so handle both:
+    read the attribute, and only call it if it turns out to be callable."""
     try:
-        u = result.usage()
+        u = getattr(result, "usage", None)
+        if callable(u):
+            u = u()
     except Exception:
+        return (0, 0)
+    if u is None:
         return (0, 0)
     for a, b in (("input_tokens", "output_tokens"), ("request_tokens", "response_tokens")):
         i, o = getattr(u, a, None), getattr(u, b, None)
@@ -176,26 +186,31 @@ class _PydanticAIExtractor:
         )
 
 
-class FeatherlessExtractor(_PydanticAIExtractor):
-    """Primary structured extractor — Featherless Qwen3-32B (flat-rate, high-volume)."""
+class OpenAIExtractor(_PydanticAIExtractor):
+    """PRODUCTION structured extractor — OpenAI gpt-5.4-mini. Bounded, low-tail latency."""
 
-    provider = "featherless"
+    provider = "openai"
     model = llm.MODEL_EXTRACTION
 
     def _model(self):
         return llm.extraction_model()
 
 
-class OpenAIExtractor(_PydanticAIExtractor):
-    """Bounded fallback extractor — OpenAI. Invoked ONLY by the orchestrator, only after the
-    primary produced invalid output or failed grounding. Its use is recorded as a fallback_reason;
-    it is never a silent per-request provider swap."""
+class FeatherlessExtractor(_PydanticAIExtractor):
+    """OFFLINE-ONLY structured extractor — Featherless Qwen3-32B. Flat-rate but high-tail latency,
+    so it is disabled by default and never on a production path. `_model()` raises unless
+    BRUCE_ENABLE_FEATHERLESS is set — used for eval/batch model comparison only."""
 
-    provider = "openai"
-    model = llm.MODEL_FALLBACK
+    provider = "featherless"
+    model = llm.MODEL_FEATHERLESS_EXTRACTION
 
     def _model(self):
-        return llm.fallback_model()
+        return llm.featherless_extraction_model()  # raises if the flag is off
+
+
+def production_extractor() -> OpenAIExtractor:
+    """The one extractor a synchronous request may use. Always OpenAI, never Featherless."""
+    return OpenAIExtractor()
 
 
 # ---- DraftGenerator ---------------------------------------------------------------------------
@@ -203,15 +218,31 @@ class OpenAIExtractor(_PydanticAIExtractor):
 
 class DraftGenerator(Protocol):
     provider: str
-    model: str
+    model: str  # the model id string
 
-    def model(self):  # returns a pydantic-ai model for the caller's Agent
+    def pa_model(self):  # returns a pydantic-ai model for the caller's Agent
         ...
 
 
-class FeatherlessDrafter:
-    provider = "featherless"
+class OpenAIDrafter:
+    """PRODUCTION drafter — OpenAI gpt-5.4-mini."""
+
+    provider = "openai"
     model = llm.MODEL_DRAFTING
 
-    def model(self):
+    def pa_model(self):
         return llm.drafting_model()
+
+
+class FeatherlessDrafter:
+    """OFFLINE-ONLY drafter — Featherless Qwen3-32B. Raises unless the flag is set."""
+
+    provider = "featherless"
+    model = llm.MODEL_FEATHERLESS_DRAFTING
+
+    def pa_model(self):
+        return llm.featherless_drafting_model()  # raises if the flag is off
+
+
+def production_drafter() -> OpenAIDrafter:
+    return OpenAIDrafter()

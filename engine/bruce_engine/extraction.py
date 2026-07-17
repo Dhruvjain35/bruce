@@ -6,15 +6,17 @@ source span it came from, and after the model extracts we deterministically DROP
 whose source span isn't actually present in the source text (anti-hallucination). Ambiguous or
 relative dates ("Friday", "next week") are left unresolved and flagged, never guessed.
 
-Routing (providers live behind neutral seams in intake_providers; the domain names no vendor):
+Routing (providers live behind neutral seams in intake_providers; the domain names no vendor).
+PRODUCTION is OpenAI end-to-end — a latency decision (Featherless's serverless tail is multi-minute):
 
-    image / screenshot         -> OpenAI vision transcribe -> Featherless Qwen3-32B extract
-    selectable-text PDF        -> local pdfplumber          -> Featherless Qwen3-32B extract
-    scanned / image-only PDF   -> OpenAI vision transcribe -> Featherless Qwen3-32B extract
-    pasted text / email        ->                              Featherless Qwen3-32B extract
+    image / screenshot         -> OpenAI vision transcribe -> OpenAI gpt-5.4-mini extract
+    selectable-text PDF        -> local pdfplumber          -> OpenAI gpt-5.4-mini extract
+    scanned / image-only PDF   -> OpenAI vision transcribe -> OpenAI gpt-5.4-mini extract
+    pasted text / email        ->                              OpenAI gpt-5.4-mini extract
 
-    fallback (recorded, bounded): OpenAI structured extract, ONLY after the Featherless primary
-    produces invalid output or fails grounding. Never a silent per-request swap.
+    retry (recorded, bounded): ONE more call to the SAME model on invalid output or all-ungrounded
+    deadlines — never a cross-provider swap. Featherless is offline-only (eval/batch), flag-gated,
+    and may be injected as `extractor=` for comparison; it never serves a production request.
 
 The load-bearing invariant: a failure to READ is never reported as "read it, found nothing". Every
 read failure is a typed, loud ExtractionError (415/422) or ProviderUnavailable (503) — never an
@@ -23,14 +25,15 @@ empty-but-successful 200. See tests/test_no_false_completion.py.
 
 from __future__ import annotations
 
+import asyncio
 import io
 
 from .intake_metrics import IntakeTelemetry
 from .intake_providers import (
-    FeatherlessExtractor,
-    OpenAIExtractor,
     OpenAIVisionTranscriber,
+    StructuredExtractor,
     TranscriptResult,
+    production_extractor,
 )
 from .models import ExtractedDeadline, ExtractedIntake, IntakeSourceKind
 from .provider_status import ProviderUnavailable
@@ -41,6 +44,16 @@ _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/webp", 
 # Below this many characters of extracted PDF text, we treat the PDF as scanned/image-only and route
 # it to vision rather than surface a near-empty read.
 _MIN_PDF_TEXT_CHARS = 24
+
+# --- Latency budget (student-facing intake). Tail latency is the enemy; a bounded, recoverable
+# failure beats an unbounded wait. See llm.py for why production is OpenAI-only.
+#   mission acknowledgement   : < 1s   (handled by the mission flow: create + return immediately)
+#   visible processing state  : immediate (phase persisted before any model call)
+#   typical extraction result : target < 10s
+#   hard timeout (recoverable): 20s -> raises ProviderUnavailable, client retries
+INTAKE_HARD_TIMEOUT_S = 20
+INTAKE_TARGET_MS = 10_000
+MISSION_ACK_BUDGET_MS = 1_000
 
 
 # --------------------------------------------------------------------------- typed read failures
@@ -127,36 +140,44 @@ async def _run_structured(
     source_kind: IntakeSourceKind,
     doc_type: str,
     transcription: "TranscriptResult | None" = None,
+    extractor: "StructuredExtractor | None" = None,
+    traffic: str = "production",
 ) -> tuple[ExtractedIntake, IntakeTelemetry]:
-    """Normalized text -> grounded ExtractedIntake, with a bounded, recorded OpenAI fallback.
+    """Normalized text -> grounded ExtractedIntake.
 
-    Featherless Qwen3-32B is the primary. OpenAI is used ONLY when the primary produces invalid
-    output (any non-provider error) or when it proposed deadlines that all failed grounding. The
-    fallback is never silent: telemetry carries fallback_reason and the model that actually answered.
+    Production uses the OpenAI extractor (``production_extractor()``); no Featherless, ever, on a
+    synchronous path. ``extractor`` may be injected for OFFLINE eval/batch comparison only.
+
+    The only retry is a bounded SECOND CALL TO THE SAME MODEL, on invalid output or all-ungrounded
+    deadlines — never a cross-provider swap (that was the Featherless-fallback pattern we removed).
+    A provider outage propagates as ProviderUnavailable; ambiguous/unverifiable fields are dropped
+    and left for student review rather than papered over by a different model.
     """
+    ext = extractor or production_extractor()
     fallback_reason: str | None = None
     retries = 0
 
     try:
-        res = await FeatherlessExtractor().extract(text, source_kind)
+        res = await ext.extract(text, source_kind)
     except ProviderUnavailable:
-        raise  # honest outage — never mask it with a different provider
+        raise  # honest outage — never mask it
     except Exception:
-        # Primary produced unusable output -> one bounded OpenAI fallback (may itself 503).
-        res = await OpenAIExtractor().extract(text, source_kind)
+        # Unusable output (bad JSON / schema) -> one bounded retry on the SAME model.
+        res = await ext.extract(text, source_kind)
         fallback_reason, retries = "invalid_output", 1
 
     proposed = len(res.intake.deadlines)
     kept = _verify_deadlines(res.intake.deadlines, text)
     grounding = _grounding_result(proposed, len(kept))
 
-    # Bounded grounding fallback: the primary saw deadlines but none grounded -> one OpenAI look.
+    # Bounded grounding retry: model proposed deadlines but none grounded -> one more same-model
+    # sample (temperature variance can ground it). Still recorded; still no provider swap.
     if fallback_reason is None and grounding == "ungrounded" and proposed > 0:
         try:
-            fb = await OpenAIExtractor().extract(text, source_kind)
+            fb = await ext.extract(text, source_kind)
             fb_kept = _verify_deadlines(fb.intake.deadlines, text)
             fallback_reason, retries = "failed_grounding", 1
-            if fb_kept:  # only adopt the fallback if it actually grounded something
+            if fb_kept:
                 res, kept = fb, fb_kept
                 grounding = _grounding_result(len(fb.intake.deadlines), len(fb_kept))
         except ProviderUnavailable:
@@ -175,6 +196,7 @@ async def _run_structured(
         retries=retries,
         grounding_result=grounding,
         fallback_reason=fallback_reason,
+        traffic=traffic,
     )
     if transcription is not None:
         telem.transcriber_provider = transcription.provider
@@ -235,12 +257,32 @@ def _pdf_to_text(data: bytes) -> str:
 
 
 # --------------------------------------------------------------------------- public entry points
-# Each returns (ExtractedIntake, IntakeTelemetry). Thin non-traced wrappers below preserve the
-# older intake-only signatures for existing callers.
+# Each returns (ExtractedIntake, IntakeTelemetry) and enforces the intake latency budget: the whole
+# intake (transcription + extraction + any bounded retry) is capped at INTAKE_HARD_TIMEOUT_S. On
+# timeout it raises a RECOVERABLE ProviderUnavailable (the client retries) rather than hang the UI.
+# Thin intake-only wrappers below preserve the older signatures for existing callers.
+
+
+async def _budgeted(coro):
+    """Run an intake coroutine under the hard latency budget. A timeout is a bounded, recoverable
+    failure — never an unbounded wait."""
+    try:
+        return await asyncio.wait_for(coro, INTAKE_HARD_TIMEOUT_S)
+    except asyncio.TimeoutError as exc:
+        raise ProviderUnavailable(
+            provider="openai",
+            model=production_extractor().model,
+            reason=f"intake exceeded the {INTAKE_HARD_TIMEOUT_S}s latency budget — retry",
+            status_code=504,
+        ) from exc
 
 
 async def extract_from_text_traced(
-    text: str, source_kind: IntakeSourceKind = IntakeSourceKind.text
+    text: str,
+    source_kind: IntakeSourceKind = IntakeSourceKind.text,
+    *,
+    extractor: "StructuredExtractor | None" = None,
+    traffic: str = "production",
 ) -> tuple[ExtractedIntake, IntakeTelemetry]:
     text = (text or "").strip()
     if not text:
@@ -248,27 +290,52 @@ async def extract_from_text_traced(
         # failure — return an honest empty intake with zero-cost telemetry.
         return (
             ExtractedIntake(source_kind=source_kind),
-            IntakeTelemetry(doc_type="text", provider="local", model="none"),
+            IntakeTelemetry(doc_type="text", provider="local", model="none", traffic=traffic),
         )
-    return await _run_structured(text, source_kind, doc_type="text")
+    return await _budgeted(
+        _run_structured(text, source_kind, doc_type="text", extractor=extractor, traffic=traffic)
+    )
 
 
 async def extract_from_image_traced(
-    image_bytes: bytes, mime: str = "image/png"
+    image_bytes: bytes,
+    mime: str = "image/png",
+    *,
+    extractor: "StructuredExtractor | None" = None,
+    traffic: str = "production",
 ) -> tuple[ExtractedIntake, IntakeTelemetry]:
-    tr = await _transcribe_image(image_bytes, mime)  # raises on unsupported type / empty transcription
-    return await _run_structured(tr.text, IntakeSourceKind.image, doc_type="image", transcription=tr)
+    async def _work():
+        tr = await _transcribe_image(image_bytes, mime)  # raises on unsupported type / empty transcription
+        return await _run_structured(
+            tr.text, IntakeSourceKind.image, doc_type="image", transcription=tr,
+            extractor=extractor, traffic=traffic,
+        )
+
+    return await _budgeted(_work())
 
 
-async def extract_from_pdf_traced(data: bytes) -> tuple[ExtractedIntake, IntakeTelemetry]:
-    text = _pdf_to_text(data)  # raises on non-PDF / corrupt / missing dep; "" only if no text layer
-    if len(text) >= _MIN_PDF_TEXT_CHARS:
-        return await _run_structured(text, IntakeSourceKind.pdf, doc_type="pdf_text")
-    # Scanned / image-only PDF: route to vision rather than surface a near-empty read.
-    tr = await OpenAIVisionTranscriber().transcribe(data, "application/pdf")  # raises ProviderUnavailable
-    if not tr.text.strip():
-        raise SourceParseError("scanned/image-only PDF produced an empty transcription", kind="pdf")
-    return await _run_structured(tr.text, IntakeSourceKind.pdf, doc_type="pdf_scanned", transcription=tr)
+async def extract_from_pdf_traced(
+    data: bytes,
+    *,
+    extractor: "StructuredExtractor | None" = None,
+    traffic: str = "production",
+) -> tuple[ExtractedIntake, IntakeTelemetry]:
+    async def _work():
+        text = _pdf_to_text(data)  # raises on non-PDF / corrupt / missing dep; "" only if no text layer
+        if len(text) >= _MIN_PDF_TEXT_CHARS:
+            return await _run_structured(
+                text, IntakeSourceKind.pdf, doc_type="pdf_text", extractor=extractor, traffic=traffic
+            )
+        # Scanned / image-only PDF: route to vision rather than surface a near-empty read.
+        tr = await OpenAIVisionTranscriber().transcribe(data, "application/pdf")  # raises ProviderUnavailable
+        if not tr.text.strip():
+            raise SourceParseError("scanned/image-only PDF produced an empty transcription", kind="pdf")
+        return await _run_structured(
+            tr.text, IntakeSourceKind.pdf, doc_type="pdf_scanned", transcription=tr,
+            extractor=extractor, traffic=traffic,
+        )
+
+    return await _budgeted(_work())
 
 
 # Intake-only wrappers (back-compat for existing callers that don't want telemetry).

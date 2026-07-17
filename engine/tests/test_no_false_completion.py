@@ -105,7 +105,7 @@ def test_scanned_pdf_routes_to_vision_never_a_silent_empty_read(monkeypatch):
     monkeypatch.setattr(extraction, "OpenAIVisionTranscriber", _fake_transcriber("SCIENCE FAIR — forms due May 3"))
     seen = {}
 
-    async def _stub_structured(text, source_kind, doc_type, transcription=None):
+    async def _stub_structured(text, source_kind, doc_type, transcription=None, extractor=None, traffic="production"):
         seen["text"], seen["doc_type"] = text, doc_type
         return ExtractedIntake(source_kind=source_kind), object()
 

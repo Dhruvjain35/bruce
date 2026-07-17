@@ -1,19 +1,21 @@
 """LLM provider layer.
 
 Provider-neutral by design: all model access goes through here, so swapping providers or
-models is a config change, not an architecture change. Two providers, by role:
+models is a config change, not an architecture change.
 
-  * Featherless (open models, flat-rate) — cheap/high-volume TEXT steps (routing, structured
-    extraction, drafting). Confirmed working via pydantic-ai OpenAIChatModel + PromptedOutput
-    mode (default tool-calling 500s on some Featherless open models; PromptedOutput is robust).
-  * OpenAI (frontier, metered) — three roles: (1) vision transcription (pixels -> verbatim text,
-    the multimodal intake brain), (2) the safety-critical verification/entailment gate, and
-    (3) a bounded structured-extraction fallback the intake orchestrator invokes ONLY after the
-    Featherless primary produces invalid output or fails grounding. Never a silent per-request
-    swap — a fallback is always recorded with its reason.
+PRODUCTION runs entirely on OpenAI. Every synchronous, student-facing step — vision
+transcription, structured extraction, drafting, verification — uses gpt-5.4-mini. This is a
+deliberate LATENCY decision, not a cost one: live measurement showed the Featherless serverless
+path at ~34s steady-state with a 252s cold-start tail, and one random four-minute wait destroys
+the "hand it to Bruce and it starts working" promise. Tail latency, not average, is the enemy.
 
-Alibaba Qwen Cloud is intentionally NOT a provider here. The open-weight Qwen models above run on
-Featherless (flat-rate); the vendor "Qwen Cloud (DashScope)" is not used.
+Featherless (open-weight Qwen on a flat-rate plan) is kept ONLY for offline work — batch
+evaluations, overnight processing, model comparisons, non-urgent backfills — and is DISABLED by
+default. It is never on a synchronous production request path and is never a silent fallback.
+Reaching it requires BRUCE_ENABLE_FEATHERLESS to be set AND an explicit accessor; otherwise it
+raises. Bruce runs without a Featherless key.
+
+Alibaba Qwen Cloud is not a provider here at all.
 
 Model ids are verified against each provider's live /v1/models list — never hard-trust a
 memorized id.
@@ -28,15 +30,30 @@ from pydantic_ai.providers.openai import OpenAIProvider
 
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 
-# Featherless (open) — checked against /v1/models 2026-07-13.
-MODEL_ROUTING = "Qwen/Qwen3-30B-A3B-Instruct-2507"  # fast MoE for cheap classify/parse
-MODEL_EXTRACTION = "Qwen/Qwen3-32B"                 # dense, reliable structured extraction
-MODEL_DRAFTING = "Qwen/Qwen3-32B"                   # grounded drafting
-
-# OpenAI (frontier) — verified available 2026-07-13.
-MODEL_VERIFICATION = "gpt-5.4-mini"  # safety-critical entailment gate
+# --- PRODUCTION (OpenAI, every synchronous student-facing step) — verified available 2026-07-13.
 MODEL_VISION = "gpt-5.4-mini"        # vision transcription (image/scanned-PDF -> verbatim text)
-MODEL_FALLBACK = "gpt-5.4-mini"      # bounded structured-extraction fallback (recorded, not silent)
+MODEL_EXTRACTION = "gpt-5.4-mini"    # structured task/date extraction
+MODEL_DRAFTING = "gpt-5.4-mini"      # grounded drafting
+MODEL_VERIFICATION = "gpt-5.4-mini"  # safety-critical entailment gate
+
+# --- OFFLINE ONLY (Featherless open-weight Qwen) — flag-gated, never on a production path.
+MODEL_FEATHERLESS_EXTRACTION = "Qwen/Qwen3-32B"
+MODEL_FEATHERLESS_DRAFTING = "Qwen/Qwen3-32B"
+MODEL_FEATHERLESS_ROUTING = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+
+def featherless_enabled() -> bool:
+    """True only when BRUCE_ENABLE_FEATHERLESS is explicitly set. Default OFF — production never
+    touches Featherless, so its absence (or a missing key) must not degrade the product."""
+    return os.environ.get("BRUCE_ENABLE_FEATHERLESS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_featherless() -> None:
+    if not featherless_enabled():
+        raise RuntimeError(
+            "Featherless is disabled. It is an offline-only provider (eval/batch/backfill); set "
+            "BRUCE_ENABLE_FEATHERLESS=1 to use it there. It must never serve a production request."
+        )
 
 
 def featherless(model_id: str) -> OpenAIChatModel:
@@ -71,19 +88,26 @@ def vision_client():
     return AsyncOpenAI(api_key=api_key)
 
 
-# Role-based accessors so callers don't hard-code provider/model choices.
-def drafting_model() -> OpenAIChatModel:
-    return featherless(MODEL_DRAFTING)
-
-
+# Role-based accessors — PRODUCTION (all OpenAI). Callers never hard-code provider/model choices.
 def extraction_model() -> OpenAIChatModel:
-    return featherless(MODEL_EXTRACTION)
+    return openai_model(MODEL_EXTRACTION)
 
 
-def fallback_model() -> OpenAIChatModel:
-    """OpenAI structured-extraction fallback. Invoked only after the primary fails; recorded."""
-    return openai_model(MODEL_FALLBACK)
+def drafting_model() -> OpenAIChatModel:
+    return openai_model(MODEL_DRAFTING)
 
 
 def verification_model() -> OpenAIChatModel:
     return openai_model(MODEL_VERIFICATION)
+
+
+# Role-based accessors — OFFLINE ONLY (Featherless). Each raises unless the flag is set, so a
+# stray production caller fails loudly instead of silently taking the slow serverless path.
+def featherless_extraction_model() -> OpenAIChatModel:
+    _require_featherless()
+    return featherless(MODEL_FEATHERLESS_EXTRACTION)
+
+
+def featherless_drafting_model() -> OpenAIChatModel:
+    _require_featherless()
+    return featherless(MODEL_FEATHERLESS_DRAFTING)

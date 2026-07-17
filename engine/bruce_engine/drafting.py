@@ -1,4 +1,4 @@
-"""Grounded outreach drafting (Featherless / open model).
+"""Grounded outreach drafting (production: OpenAI gpt-5.4-mini via llm.drafting_model()).
 
 The drafter sees ONLY the candidate's real papers + the student profile. It anchors a
 personalized hook on ONE real paper and engages a specific finding from its abstract. The

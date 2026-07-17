@@ -22,6 +22,7 @@ from bruce_engine.extraction import (
     extract_from_pdf_traced,
     extract_from_text_traced,
 )
+from bruce_engine.intake_providers import FeatherlessExtractor
 from bruce_engine.provider_status import ProviderUnavailable
 
 from .schema import GoldCase, load_cases
@@ -44,21 +45,27 @@ def _load_dotenv() -> None:
         os.environ.setdefault(k.strip(), v.strip())
 
 
-async def _run_one(case_path: Path, gold: GoldCase):
+async def _run_one(case_path: Path, gold: GoldCase, extractor):
+    # Eval is always OFFLINE traffic; an injected extractor (e.g. Featherless) is used for model
+    # comparison only. Production requests never take this path.
+    kw = {"extractor": extractor, "traffic": "evaluation"}
     if gold.inline_text is not None:
-        return await extract_from_text_traced(gold.inline_text)
+        return await extract_from_text_traced(gold.inline_text, **kw)
     data = (case_path.parent / gold.source)
     if gold.source_kind == "text":
-        return await extract_from_text_traced(data.read_text())
+        return await extract_from_text_traced(data.read_text(), **kw)
     if gold.source_kind == "image":
-        return await extract_from_image_traced(data.read_bytes(), mime=gold.mime)
+        return await extract_from_image_traced(data.read_bytes(), mime=gold.mime, **kw)
     if gold.source_kind == "pdf":
-        return await extract_from_pdf_traced(data.read_bytes())
+        return await extract_from_pdf_traced(data.read_bytes(), **kw)
     raise ValueError(f"unknown source_kind {gold.source_kind!r}")
 
 
-async def main(cases_dir: Path, json_out: Path | None) -> int:
+async def main(cases_dir: Path, json_out: Path | None, use_featherless: bool) -> int:
     _load_dotenv()
+    # Default extractor is None -> the production OpenAI extractor. --featherless compares the
+    # offline Featherless extractor (needs BRUCE_ENABLE_FEATHERLESS=1).
+    extractor = FeatherlessExtractor() if use_featherless else None
     cases = load_cases(cases_dir)
     if not cases:
         print(f"no cases in {cases_dir} — see eval/README.md for the corpus spec (40 real documents).")
@@ -69,7 +76,7 @@ async def main(cases_dir: Path, json_out: Path | None) -> int:
     for path, gold in cases:
         name = path.stem
         try:
-            intake, telem = await _run_one(path, gold)
+            intake, telem = await _run_one(path, gold, extractor)
         except (ExtractionError, ProviderUnavailable) as exc:
             failures.append((name, f"{type(exc).__name__}: {exc}"))
             continue
@@ -102,6 +109,7 @@ if __name__ == "__main__":
         i = argv.index("--json")
         out = Path(argv[i + 1])
         del argv[i : i + 2]  # drop the flag AND its value before reading positionals
+    use_featherless = "--featherless" in argv
     positionals = [a for a in argv if not a.startswith("--")]
     cases_dir = Path(positionals[0]) if positionals else _ENGINE_ROOT / "eval" / "cases"
-    raise SystemExit(asyncio.run(main(cases_dir, out)))
+    raise SystemExit(asyncio.run(main(cases_dir, out, use_featherless)))
