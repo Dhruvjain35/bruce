@@ -75,3 +75,58 @@ The handoff is accurate. Two clarifications:
 - The handoff says ~244 passing; exact count is **244 passed / 11 skipped**. Confirmed.
 
 ---
+## Increments
+
+Each commit is one concern. Tests were run before each; the full offline suite before each push.
+
+| # | Commit | Goal | Verified | Blocked / limits |
+|---|---|---|---|---|
+| 1 | `3e7e6c8` | **P1** one-command deploy | dry-run passes end-to-end (tools, env, 31 preflight tests, 45.5MB package, sha256); 12 tests on failure diagnosis vs REAL Alibaba error strings; `s` 3.1.10 installed + `bruce` profile configured | live deploy blocked: FC not activated |
+| 2 | `09cb490` | **P2** no false completion + `/ready` | 15 tests; native import profiled at **1.17s** (vs FC's 15s limit) so no risky trimming/lazy-imports were done | cold start on real FC still **inferred**, not measured |
+| 3 | `8fdd5bb` | **P3** Google OAuth (PKCE, one-time state, encrypted tokens) | 24 tests vs **real Postgres** + mocked Google; migration 0004 verified on BOTH fresh and pre-existing DBs (rls=true force=true policy present) | nothing has touched Google |
+| 4 | `2d66804` | **P3** calendar provider + verified undo | 30 tests; normalization keeps Google types out of the domain | live execution needs `GOOGLE_*` |
+| 5 | `6432387` | **P4** server-authorized contract + **P9** smoke script | 16 tests | — |
+| 6 | `1e58837` | **P7** messaging boundary | 16 tests via FakeChannel | **no provider connected**; iMessage NOT functional |
+| 7 | `d9c3f7a` | **P8** README, readiness table, demo script, screenshots checklist, LICENSE | docs cross-checked against measured status | — |
+
+**Suite: 244 → 342 passed, 12 skipped.** Every skip names its blocker.
+
+### Contradictions found and fixed (by my own tests)
+
+1. **`failed` was both terminal and retryable** (`contract.py`). Both cannot be true. Fixed in the
+   model, not the test: `TERMINAL = {succeeded, cancelled}`; `failed`/`blocked` are RECOVERABLE.
+   Treating them as terminal offers no way out of a transiently-failed mission.
+2. **`test_pdf_to_text_rejects_non_pdf` asserted `== ""`** — the false-completion bug encoded as a
+   test. Updated to assert the raise. This strengthens the test; it does not weaken it.
+
+### P9 — Qwen smoke, run once at the end (as instructed)
+
+```
+2026-07-17T06:43:54Z  ws-5xgdxnbet67n8x8e.ap-southeast-1.maas.aliyuncs.com
+  qwen3.7-plus  403 AccessDenied.Unpurchased  req b78e28ef-e7d5-9a64-96a1-51b0f619e4e8  1161ms
+  qwen-turbo    403 AccessDenied.Unpurchased  req 6d8832b3-b5d1-937f-9d91-03896feca547   693ms
+```
+
+Two calls, no enumeration. A basic text model is refused too → **account-level hold**, not
+entitlement. **Zero successful Qwen calls. Blocker stands.** Stopped testing, as instructed.
+
+### Not done this session — stated plainly
+
+| Priority | Status | Why |
+|---|---|---|
+| **P5** iOS ↔ live API | **NOT DONE** | The app still renders mock data. Wiring it without a live URL or live Qwen would produce a client I could compile but not exercise against anything real. |
+| **P6** Live Activity / Dynamic Island | **NOT DONE** | Needs a new app-extension target in `project.yml`. Nothing exists today. |
+| P4 endpoints | **PARTIAL** | `contract.py` (states/actions/refs) is done and tested; the remaining journey endpoints are not yet wired to it. |
+
+These are the honest gaps. The iOS app **builds** (Xcode 26.4, `BUILD SUCCEEDED`) but is not
+connected.
+
+### Security notes from this session
+
+- Both the RAM AccessKey and the DashScope key are in the chat transcript. **Rotate both** after the
+  hackathon; the RAM key can provision and bill infrastructure.
+- `deploy_fc.sh` refuses to deploy a `BRUCE_JWT_SECRET` under 32 bytes or containing "test" — on a
+  public FC URL with an anonymous gateway trigger, that secret is the only thing in front of student
+  data.
+- `BRUCE_ENCRYPTION_KEY` is new and **required** before any Google refresh token can be stored. There
+  is no plaintext fallback; connect will refuse without it.
