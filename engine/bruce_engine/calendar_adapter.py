@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from typing import Protocol
@@ -55,6 +56,22 @@ class CalendarError(Exception):
 
 class AlreadyExists(CalendarError):
     """The event id is already present (Google 409). Expected on retry; means execute-once held."""
+
+
+class CalendarAuthError(CalendarError):
+    """Not connected / revoked / unauthorized. The student must reconnect — retrying won't help."""
+
+
+class InsufficientScope(CalendarError):
+    """Connected, but without calendar.events. Retrying is pointless; re-consent is required."""
+
+
+class CalendarNotFound(CalendarError):
+    """The calendar or event does not exist (e.g. the student deleted the calendar)."""
+
+
+class RateLimited(CalendarError):
+    """Google 429. Transient — a retry may succeed."""
 
 
 @dataclass(frozen=True)
@@ -105,8 +122,50 @@ def deterministic_event_id(user_id: UUID, mission_id: UUID, event: CalendarEvent
 
 
 class CalendarAdapter(Protocol):
+    """The canonical calendar interface. NO provider-specific types cross this boundary.
+
+    `get` returns a normalized dict (see _normalize), never a raw Google resource — the domain must
+    not learn Google's field names, or swapping to CalDAV/Apple later means touching the verifier.
+    """
+
     async def insert(self, event: CalendarEvent, event_id: str) -> CalendarEventRef: ...
     async def get(self, event_id: str) -> dict | None: ...
+    async def update(self, event: CalendarEvent, event_id: str) -> CalendarEventRef: ...
+    async def delete(self, event_id: str) -> bool: ...
+
+
+# The marker Bruce writes into every event it creates. Unobtrusive and non-secret: it links the
+# event back to a mission for undo/audit without exposing anything about the student.
+BRUCE_MARKER = "bruce:mission:"
+
+
+def mission_marker(mission_id: UUID) -> str:
+    return f"{BRUCE_MARKER}{mission_id}"
+
+
+def _normalize(raw: dict) -> dict:
+    """Google event resource -> Bruce's normalized shape. The ONLY place Google field names live.
+
+    Date-only and timed events are both flattened to a single `start`/`end` string so the verifier
+    compares like with like — Google returns `date` for all-day and `dateTime` for timed, and a
+    comparison that forgot that would silently pass on a mismatch.
+    """
+    def when(side: dict | None) -> str | None:
+        side = side or {}
+        return side.get("dateTime") or side.get("date")
+
+    return {
+        "id": raw.get("id"),
+        "title": raw.get("summary"),
+        "start": when(raw.get("start")),
+        "end": when(raw.get("end")),
+        "timezone": (raw.get("start") or {}).get("timeZone"),
+        "location": raw.get("location"),
+        "description": raw.get("description"),
+        "calendar_id": raw.get("organizer", {}).get("email") or raw.get("_calendar_id"),
+        "status": raw.get("status"),
+        "html_link": raw.get("htmlLink"),
+    }
 
 
 # --------------------------------------------------------------------------- Google
@@ -128,7 +187,7 @@ def _google_env() -> dict[str, str]:
     }
 
 
-def _to_google_body(event: CalendarEvent, event_id: str) -> dict:
+def _to_google_body(event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None) -> dict:
     """Map a Bruce CalendarEvent onto Google's event resource.
 
     Date-only values must use `date`, timed values `dateTime` — Google 400s if they are mixed up.
@@ -144,24 +203,70 @@ def _to_google_body(event: CalendarEvent, event_id: str) -> dict:
     }
     if event.location:
         body["location"] = event.location
+    desc = []
     if event.source:
-        body["description"] = f"Added by Bruce from: {event.source}"
+        desc.append(f"Added by Bruce from: {event.source}")
+    if mission_id is not None:
+        # Unobtrusive, non-secret. Lets undo/audit find the exact event Bruce created without
+        # exposing anything about the student.
+        desc.append(mission_marker(mission_id))
+    if desc:
+        body["description"] = "\n".join(desc)
     return body
 
 
 class GoogleCalendarAdapter:
-    """Real Google Calendar v3. Reads OAuth config from the environment; never logs tokens."""
+    """Real Google Calendar v3.
+
+    Credentials come from the OAuth integration for a specific user (bruce_engine.oauth_google) —
+    NOT from a process-wide env var, which could only ever serve one account. A short-lived access
+    token is fetched per operation from the encrypted refresh token; nothing here logs a token.
+
+    `user_id=None` falls back to GOOGLE_REFRESH_TOKEN from the environment. That path exists ONLY
+    for single-account smoke tests before the OAuth flow is connected; it is never used for a real
+    student, because it cannot distinguish accounts.
+    """
 
     provider = "google"
 
-    def __init__(self, http_client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient | None = None,
+        *,
+        user_id: UUID | None = None,
+        calendar_id: str | None = None,
+    ) -> None:
         self._client = http_client
+        self._user_id = user_id
+        self._calendar_id = calendar_id
 
     async def _http(self) -> httpx.AsyncClient:
         return self._client or httpx.AsyncClient(timeout=30)
 
+    async def _calendar(self) -> str:
+        if self._calendar_id:
+            return self._calendar_id
+        if self._user_id is not None:
+            from . import oauth_google
+
+            row = await oauth_google.get_integration(self._user_id)
+            if row is not None and row.selected_calendar_id:
+                return row.selected_calendar_id
+        return os.environ.get("GOOGLE_CALENDAR_ID", "primary")
+
     async def _access_token(self) -> str:
-        """Exchange the long-lived refresh token for a short-lived access token."""
+        """Short-lived access token for THIS user's connected account."""
+        if self._user_id is not None:
+            from . import oauth_google
+
+            try:
+                return await oauth_google.access_token_for(
+                    self._user_id, http_client=self._client
+                )
+            except oauth_google.OAuthError as exc:
+                # Surface the real cause (not connected / revoked) rather than a generic failure —
+                # the UI needs to tell the student to reconnect, not "try again".
+                raise CalendarError(str(exc)) from exc
         cfg = _google_env()
         client = await self._http()
         r = await client.post(
@@ -178,41 +283,96 @@ class GoogleCalendarAdapter:
             raise CalendarError(f"Google token refresh failed: HTTP {r.status_code}")
         return r.json()["access_token"]
 
-    async def insert(self, event: CalendarEvent, event_id: str) -> CalendarEventRef:
-        cfg = _google_env()
+    def _classify(self, r: httpx.Response, op: str) -> None:
+        """Map Google's failures to causes the product can act on. Status only, never the body."""
+        if r.status_code in (401, 403):
+            body = ""
+            try:
+                body = json.dumps(r.json())
+            except Exception:
+                body = ""
+            if "insufficientPermissions" in body or "insufficient" in body.lower():
+                raise InsufficientScope(f"Google {op}: the connection lacks calendar.events scope")
+            raise CalendarAuthError(f"Google {op}: not authorized (HTTP {r.status_code}) — reconnect")
+        if r.status_code == 404:
+            raise CalendarNotFound(f"Google {op}: calendar or event not found (HTTP 404)")
+        if r.status_code == 429:
+            raise RateLimited(f"Google {op}: rate limited (HTTP 429)")
+        raise CalendarError(f"Google {op} failed: HTTP {r.status_code}")
+
+    async def insert(
+        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None
+    ) -> CalendarEventRef:
+        cal = await self._calendar()
         token = await self._access_token()
         client = await self._http()
         r = await client.post(
-            f"{GOOGLE_CALENDAR_API}/calendars/{cfg['calendar_id']}/events",
+            f"{GOOGLE_CALENDAR_API}/calendars/{cal}/events",
             headers={"Authorization": f"Bearer {token}"},
-            json=_to_google_body(event, event_id),
+            json=_to_google_body(event, event_id, mission_id=mission_id),
         )
         if r.status_code == 409:
             raise AlreadyExists(event_id)  # retry of an already-executed insert; not an error
         if r.status_code not in (200, 201):
-            raise CalendarError(f"Google events.insert failed: HTTP {r.status_code}")
+            self._classify(r, "events.insert")
         body = r.json()
         return CalendarEventRef(
             event_id=body.get("id", event_id), provider=self.provider, html_link=body.get("htmlLink")
         )
 
     async def get(self, event_id: str) -> dict | None:
-        """Independent read-back. Returns None if absent; a cancelled event counts as absent."""
-        cfg = _google_env()
+        """Independent read-back, NORMALIZED. None if absent; a cancelled event counts as absent."""
+        cal = await self._calendar()
         token = await self._access_token()
         client = await self._http()
         r = await client.get(
-            f"{GOOGLE_CALENDAR_API}/calendars/{cfg['calendar_id']}/events/{event_id}",
+            f"{GOOGLE_CALENDAR_API}/calendars/{cal}/events/{event_id}",
             headers={"Authorization": f"Bearer {token}"},
         )
         if r.status_code == 404:
             return None
         if r.status_code != 200:
-            raise CalendarError(f"Google events.get failed: HTTP {r.status_code}")
+            self._classify(r, "events.get")
         body = r.json()
         if body.get("status") == "cancelled":
             return None  # present in the API but deleted — must never verify
-        return body
+        body["_calendar_id"] = cal
+        return _normalize(body)
+
+    async def update(
+        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None
+    ) -> CalendarEventRef:
+        cal = await self._calendar()
+        token = await self._access_token()
+        client = await self._http()
+        r = await client.put(
+            f"{GOOGLE_CALENDAR_API}/calendars/{cal}/events/{event_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json=_to_google_body(event, event_id, mission_id=mission_id),
+        )
+        if r.status_code not in (200, 201):
+            self._classify(r, "events.update")
+        body = r.json()
+        return CalendarEventRef(
+            event_id=body.get("id", event_id), provider=self.provider, html_link=body.get("htmlLink")
+        )
+
+    async def delete(self, event_id: str) -> bool:
+        """Delete. True if deleted, False if it was already gone (410/404) — both are 'absent',
+        so undo is naturally idempotent."""
+        cal = await self._calendar()
+        token = await self._access_token()
+        client = await self._http()
+        r = await client.delete(
+            f"{GOOGLE_CALENDAR_API}/calendars/{cal}/events/{event_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if r.status_code in (200, 204):
+            return True
+        if r.status_code in (404, 410):
+            return False  # already absent — repeated undo must not error
+        self._classify(r, "events.delete")
+        return False
 
 
 # --------------------------------------------------------------------------- fake (tests/demo)
@@ -230,32 +390,85 @@ class FakeCalendarAdapter:
     def __init__(self) -> None:
         self.events: dict[str, dict] = {}
         self.insert_calls = 0
+        self.delete_calls = 0
 
-    async def insert(self, event: CalendarEvent, event_id: str) -> CalendarEventRef:
+    async def insert(
+        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None
+    ) -> CalendarEventRef:
         self.insert_calls += 1
         if event_id in self.events:
             raise AlreadyExists(event_id)
-        self.events[event_id] = _to_google_body(event, event_id)
+        self.events[event_id] = _to_google_body(event, event_id, mission_id=mission_id)
         return CalendarEventRef(
             event_id=event_id, provider=self.provider, html_link=f"https://example.test/{event_id}"
         )
 
     async def get(self, event_id: str) -> dict | None:
-        return self.events.get(event_id)
+        raw = self.events.get(event_id)
+        return _normalize(raw) if raw is not None else None
+
+    async def update(
+        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None
+    ) -> CalendarEventRef:
+        if event_id not in self.events:
+            raise CalendarNotFound(event_id)
+        self.events[event_id] = _to_google_body(event, event_id, mission_id=mission_id)
+        return CalendarEventRef(event_id=event_id, provider=self.provider)
+
+    async def delete(self, event_id: str) -> bool:
+        self.delete_calls += 1
+        return self.events.pop(event_id, None) is not None
 
 
 # --------------------------------------------------------------------------- execute + verify
 
 
 def _matches(event: CalendarEvent, read_back: dict) -> tuple[bool, str]:
-    """Does what the provider now holds actually match what the student approved?"""
-    if (read_back.get("summary") or "") != event.title:
+    """Does what the provider now holds actually match what the student APPROVED?
+
+    Compares the fields a student would be harmed by getting wrong. `location` is compared only
+    when it was part of the approval — Google returns None for a field we never sent, and treating
+    that as a mismatch would fail every event that simply has no location.
+    """
+    if (read_back.get("title") or "") != event.title:
         return False, "read-back title does not match the approved proposal"
-    start = read_back.get("start") or {}
-    got = start.get("dateTime") or start.get("date")
-    if got != event.start:
-        return False, f"read-back start {got!r} does not match the approved {event.start!r}"
+    if read_back.get("start") != event.start:
+        return False, f"read-back start {read_back.get('start')!r} does not match the approved {event.start!r}"
+    expected_end = event.end or event.start
+    if read_back.get("end") != expected_end:
+        return False, f"read-back end {read_back.get('end')!r} does not match the approved {expected_end!r}"
+    if event.location and (read_back.get("location") or "") != event.location:
+        return False, "read-back location does not match the approved proposal"
     return True, "read-back matched the approved proposal"
+
+
+async def undo(
+    adapter: CalendarAdapter, *, event_id: str
+) -> VerificationResult:
+    """Reverse an executed calendar action, and PROVE it is gone by reading back.
+
+    Symmetric with execute_and_verify: a delete that returns 204 is a claim; a subsequent read that
+    finds nothing is evidence. `reversed=True` is only ever set by that read.
+
+    Idempotent: deleting an already-absent event is success, not an error — a student tapping Undo
+    twice must not see a failure for work that is genuinely done.
+    """
+    await adapter.delete(event_id)
+    still_there = await adapter.get(event_id)
+    if still_there is not None:
+        return VerificationResult(
+            verified=False,
+            event_id=event_id,
+            provider=getattr(adapter, "provider", "unknown"),
+            reason="event still present after delete — the undo is NOT confirmed",
+            read_back=still_there,
+        )
+    return VerificationResult(
+        verified=True,
+        event_id=event_id,
+        provider=getattr(adapter, "provider", "unknown"),
+        reason="read-back confirmed the event is gone",
+    )
 
 
 async def execute_and_verify(
@@ -275,7 +488,7 @@ async def execute_and_verify(
     html_link: str | None = None
 
     try:
-        ref = await adapter.insert(event, event_id)
+        ref = await adapter.insert(event, event_id, mission_id=mission_id)
         html_link = ref.html_link
     except AlreadyExists:
         # A retry. Execution already happened; fall through and verify the existing event rather
@@ -298,6 +511,11 @@ async def execute_and_verify(
         event_id=event_id,
         provider=getattr(adapter, "provider", "unknown"),
         reason=reason,
-        read_back={"summary": read_back.get("summary"), "start": read_back.get("start")},
-        html_link=html_link or read_back.get("htmlLink"),
+        # The receipt carries exactly the fields that were COMPARED — so a human reading it can
+        # check the verification themselves rather than taking `verified: true` on trust.
+        read_back={
+            k: read_back.get(k)
+            for k in ("title", "start", "end", "timezone", "location", "calendar_id", "html_link")
+        },
+        html_link=html_link or read_back.get("html_link"),
     )

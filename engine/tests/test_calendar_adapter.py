@@ -70,7 +70,7 @@ def test_happy_path_executes_and_verifies_via_read_back():
         cal = FakeCalendarAdapter()
         r = await execute_and_verify(cal, _event(), user_id=UID, mission_id=MID)
         assert r.verified is True
-        assert r.read_back is not None and r.read_back["summary"] == "Science Fair registration closes"
+        assert r.read_back is not None and r.read_back["title"] == "Science Fair registration closes"
         assert cal.insert_calls == 1
         # the receipt carries the proof, not just a claim
         ev = r.as_evidence()
@@ -132,8 +132,8 @@ def test_read_back_with_wrong_time_is_not_verified():
     """Provider stored a different start than the student approved -> NOT verified."""
     class Drifting(FakeCalendarAdapter):
         async def get(self, event_id):
-            ev = dict(self.events[event_id])
-            ev["start"] = {"date": "2026-12-25"}  # not what was approved
+            ev = dict(await super().get(event_id))
+            ev["start"] = "2026-12-25"  # not what was approved
             return ev
 
     async def run():
@@ -146,8 +146,8 @@ def test_read_back_with_wrong_time_is_not_verified():
 def test_read_back_with_wrong_title_is_not_verified():
     class Renamed(FakeCalendarAdapter):
         async def get(self, event_id):
-            ev = dict(self.events[event_id])
-            ev["summary"] = "Something else entirely"
+            ev = dict(await super().get(event_id))
+            ev["title"] = "Something else entirely"
             return ev
 
     async def run():
@@ -160,12 +160,199 @@ def test_read_back_with_wrong_title_is_not_verified():
 def test_provider_failure_propagates_rather_than_reporting_success():
     """A broken calendar must surface as an error, never as a quiet unverified 'done'."""
     class Broken(FakeCalendarAdapter):
-        async def insert(self, event, event_id):
+        async def insert(self, event, event_id, *, mission_id=None):
             raise CalendarError("Google events.insert failed: HTTP 503")
 
     async def run():
         with pytest.raises(CalendarError):
             await execute_and_verify(Broken(), _event(), user_id=UID, mission_id=MID)
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- normalization / marker
+
+
+def test_read_back_carries_no_google_specific_field_names():
+    """The domain must never learn Google's vocabulary, or swapping to CalDAV means rewriting the
+    verifier. The receipt should show the fields that were COMPARED, in Bruce's terms."""
+    async def run():
+        r = await execute_and_verify(FakeCalendarAdapter(), _event(), user_id=UID, mission_id=MID)
+        assert set(r.read_back) >= {"title", "start", "end"}
+        for google_only in ("summary", "dateTime", "htmlLink", "organizer"):
+            assert google_only not in r.read_back
+
+    asyncio.run(run())
+
+
+def test_receipt_shows_the_fields_that_were_compared():
+    """A human must be able to check the verification themselves rather than trust `verified:true`."""
+    async def run():
+        r = await execute_and_verify(FakeCalendarAdapter(), _event(), user_id=UID, mission_id=MID)
+        ev = r.as_evidence()
+        assert ev["read_back"]["title"] == "Science Fair registration closes"
+        assert ev["read_back"]["start"] == "2026-02-28"
+
+    asyncio.run(run())
+
+
+def test_created_event_carries_an_unobtrusive_mission_marker():
+    """Links the event back to its mission for undo/audit — and must expose nothing about the student."""
+    async def run():
+        cal = FakeCalendarAdapter()
+        await execute_and_verify(cal, _event(), user_id=UID, mission_id=MID)
+        raw = next(iter(cal.events.values()))
+        assert ca.mission_marker(MID) in raw["description"]
+        assert str(UID) not in raw["description"], "the marker must not leak the student's id"
+
+    asyncio.run(run())
+
+
+def test_end_mismatch_is_not_verified():
+    """end is part of what the student approved — a drifting end time must fail verification."""
+    class BadEnd(FakeCalendarAdapter):
+        async def get(self, event_id):
+            ev = dict(await super().get(event_id))
+            ev["end"] = "2099-01-01"
+            return ev
+
+    async def run():
+        r = await execute_and_verify(BadEnd(), _event(), user_id=UID, mission_id=MID)
+        assert r.verified is False and "end" in r.reason
+
+    asyncio.run(run())
+
+
+def test_absent_location_does_not_cause_a_false_mismatch():
+    """Google returns nothing for a field we never sent. Treating that as a mismatch would fail
+    every event without a location — a verifier that cries wolf gets ignored."""
+    async def run():
+        r = await execute_and_verify(FakeCalendarAdapter(), _event(), user_id=UID, mission_id=MID)
+        assert r.verified is True
+
+    asyncio.run(run())
+
+
+def test_location_mismatch_is_caught_when_it_was_approved():
+    class MovedRoom(FakeCalendarAdapter):
+        async def get(self, event_id):
+            ev = dict(await super().get(event_id))
+            ev["location"] = "Somewhere else"
+            return ev
+
+    async def run():
+        r = await execute_and_verify(MovedRoom(), _event(location="Gym"), user_id=UID, mission_id=MID)
+        assert r.verified is False and "location" in r.reason
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- undo
+
+
+def test_undo_deletes_and_proves_absence_by_read_back():
+    """Symmetric with execute: a 204 is a claim, an absent read-back is evidence."""
+    async def run():
+        cal = FakeCalendarAdapter()
+        ev = _event()
+        r = await execute_and_verify(cal, ev, user_id=UID, mission_id=MID)
+        u = await ca.undo(cal, event_id=r.event_id)
+        assert u.verified is True and "gone" in u.reason
+        assert cal.events == {}
+
+    asyncio.run(run())
+
+
+def test_undo_is_idempotent():
+    """A student tapping Undo twice must not see a failure for work that is genuinely done."""
+    async def run():
+        cal = FakeCalendarAdapter()
+        r = await execute_and_verify(cal, _event(), user_id=UID, mission_id=MID)
+        first = await ca.undo(cal, event_id=r.event_id)
+        second = await ca.undo(cal, event_id=r.event_id)
+        assert first.verified is True and second.verified is True
+
+    asyncio.run(run())
+
+
+def test_undo_that_did_not_actually_delete_is_not_confirmed():
+    """The delete 'succeeded' but the event is still there -> NOT reversed. No fake undo receipt."""
+    class Stubborn(FakeCalendarAdapter):
+        async def delete(self, event_id):
+            return True  # claims success, changes nothing
+
+    async def run():
+        cal = Stubborn()
+        r = await execute_and_verify(cal, _event(), user_id=UID, mission_id=MID)
+        u = await ca.undo(cal, event_id=r.event_id)
+        assert u.verified is False and "still present" in u.reason
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- typed Google failures
+
+
+@pytest.mark.parametrize(
+    "status,body,exc",
+    [
+        (403, {"error": {"errors": [{"reason": "insufficientPermissions"}]}}, ca.InsufficientScope),
+        (401, {"error": "unauthorized"}, ca.CalendarAuthError),
+        (404, {"error": "not found"}, ca.CalendarNotFound),
+        (429, {"error": "rate limit"}, ca.RateLimited),
+    ],
+)
+def test_google_failures_are_typed_so_the_product_can_react(monkeypatch, status, body, exc):
+    """'Reconnect', 'grant permission' and 'retry later' are different instructions to a student.
+    A single generic CalendarError would make all three read as 'something broke'."""
+    _with_google_env(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "oauth2" in str(request.url):
+            return httpx.Response(200, json={"access_token": "at", "expires_in": 3599})
+        return httpx.Response(status, json=body)
+
+    async def run():
+        cal = GoogleCalendarAdapter(http_client=_google_client(handler))
+        with pytest.raises(exc):
+            await cal.insert(_event(), deterministic_event_id(UID, MID, _event()))
+
+    asyncio.run(run())
+
+
+def test_google_delete_treats_already_gone_as_absent(monkeypatch):
+    """410/404 on delete means the goal state is reached — undo must be idempotent."""
+    _with_google_env(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "oauth2" in str(request.url):
+            return httpx.Response(200, json={"access_token": "at", "expires_in": 3599})
+        return httpx.Response(410, json={})
+
+    async def run():
+        cal = GoogleCalendarAdapter(http_client=_google_client(handler))
+        assert await cal.delete("someid") is False
+
+    asyncio.run(run())
+
+
+def test_google_get_returns_normalized_not_raw(monkeypatch):
+    _with_google_env(monkeypatch)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "oauth2" in str(request.url):
+            return httpx.Response(200, json={"access_token": "at", "expires_in": 3599})
+        return httpx.Response(200, json={
+            "id": "e1", "summary": "Registration closes", "status": "confirmed",
+            "start": {"date": "2026-02-28"}, "end": {"date": "2026-02-28"},
+            "htmlLink": "https://cal/e1",
+        })
+
+    async def run():
+        cal = GoogleCalendarAdapter(http_client=_google_client(handler))
+        got = await cal.get("e1")
+        assert got["title"] == "Registration closes" and got["start"] == "2026-02-28"
+        assert "summary" not in got, "raw Google fields must not cross the adapter boundary"
 
     asyncio.run(run())
 
