@@ -1,47 +1,68 @@
 import SwiftUI
 import Observation
 
-/// Bridges the capture UI to the async intake backend: submit -> durable mission -> poll canonical
-/// state. The student sees "Understanding your flyer…" within a moment (the 202 comes back in ~50ms)
-/// and the screen reconciles to real extracted objects when the worker finishes — never blocking.
-///
-/// Durability & safety are the backend's; this session just reflects it:
-///  * one idempotency key per capture, reused on retry -> a resubmit never spawns a second mission.
-///  * missionID is exposed so the app can persist it and re-poll after an app restart.
-///  * a blocked mission offers retry; a failed one says so honestly (no fake completion).
+/// Persists the one in-flight intake mission so a killed app can restore it on relaunch. Stored id
+/// only — never any document content.
+enum IntakeRestore {
+    private static let key = "bruce.activeIntakeMission"
+    static var pending: UUID? {
+        get { UserDefaults.standard.string(forKey: key).flatMap(UUID.init) }
+        set {
+            if let v = newValue { UserDefaults.standard.set(v.uuidString, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+    }
+}
+
+/// Drives the capture → durable-mission → poll journey behind the designed HandoffSheet. Reflects the
+/// real backend; owns no mock success. The 202 comes back in ~50ms, so "Understanding…" is honest and
+/// immediate; the screen reconciles to grounded results (or a real failure) when the worker finishes.
 @Observable final class LiveIntakeSession {
-    enum Stage: Equatable { case idle, submitting, working, ready, blocked, failed }
+    enum Stage: Equatable { case idle, submitting, working, ready, blocked, failed, sessionExpired }
 
     var stage: Stage = .idle
-    var displayStatus: String = ""
+    var displayStatus = ""
     var missionID: UUID? = nil
+    var sourceID: UUID? = nil
     var extracted: ExtractedIntake? = nil
     var blockingReason: String? = nil
+    var uploading = false                 // indeterminate upload feedback (photo/PDF submit)
+    private(set) var sourceType: IntakeEvent.SourceType = .text
 
-    private let api = BruceAPI()
-    private var idempotencyKey = UUID().uuidString
+    private let api: IntakeAPI
+    private let pollInterval: TimeInterval
+    private var idempotencyKey = UUID().uuidString   // one per capture; reused on retry -> no dup mission
     private var pollTask: Task<Void, Never>? = nil
+    private var lastSubmit: (() async throws -> IntakeAccepted)? = nil
 
-    var isSubmitting: Bool { stage == .submitting }
-    var canRetry: Bool { stage == .blocked || stage == .failed }
-
-    /// Submit pasted/typed text. Guarded so a double-tap can't fire two submits.
-    func submit(text: String) {
-        guard stage == .idle || canRetry else { return }
-        stage = .submitting
-        displayStatus = "Sending…"
-        Task { await self._submit { try await self.api.submitIntakeText(text, idempotencyKey: self.idempotencyKey) } }
+    init(api: IntakeAPI = BruceAPI(), pollInterval: TimeInterval = 1.0) {
+        self.api = api
+        self.pollInterval = pollInterval
     }
 
-    /// Submit a captured flyer/screenshot (image) or PDF.
-    func submit(bytes: Data, mime: String, sourceKind: String) {
-        guard stage == .idle || canRetry else { return }
-        stage = .submitting
-        displayStatus = "Sending…"
-        Task { await self._submit { try await self.api.submitIntakeBytes(bytes, mime: mime, sourceKind: sourceKind, idempotencyKey: self.idempotencyKey) } }
+    var isBusy: Bool { stage == .submitting || stage == .working }
+    var canRetry: Bool { stage == .blocked || stage == .failed || stage == .sessionExpired }
+
+    /// The ambiguous deadlines the server refused to guess a date for — surfaced as real Decisions.
+    var ambiguities: [ExtractedDeadline] { (extracted?.deadlines ?? []).filter { $0.isAmbiguous } }
+    var groundedDeadlines: [ExtractedDeadline] { (extracted?.deadlines ?? []).filter { !$0.isAmbiguous } }
+
+    func submit(text: String, type: IntakeEvent.SourceType) {
+        guard stage == .idle || canRetry else { return }   // dup-tap / double-submit guard
+        sourceType = type
+        Analytics.track(.submissionStarted(type))
+        run { try await self.api.submitIntakeText(text, idempotencyKey: self.idempotencyKey) }
     }
 
-    /// Re-poll an existing mission (e.g. after an app relaunch) without resubmitting.
+    func submit(bytes: Data, mime: String, sourceKind: String, type: IntakeEvent.SourceType) {
+        guard stage == .idle || canRetry else { return }
+        sourceType = type
+        uploading = true
+        Analytics.track(.submissionStarted(type))
+        run { try await self.api.submitIntakeBytes(bytes, mime: mime, sourceKind: sourceKind, idempotencyKey: self.idempotencyKey) }
+    }
+
+    /// Re-poll an existing mission (return visit or app relaunch) without resubmitting.
     func resume(missionID id: UUID) {
         missionID = id
         stage = .working
@@ -50,31 +71,53 @@ import Observation
     }
 
     func retry() {
-        guard canRetry else { return }
-        // Same idempotency key: if the mission already exists the backend returns it, so retry is
-        // safe and idempotent — it never duplicates a source, task, or mission.
-        if let id = missionID { stage = .working; startPolling(id) }
+        guard canRetry, let call = lastSubmit else { return }
+        Analytics.track(.retryUsed)
+        run(call)   // same idempotency key -> backend returns the existing mission; never duplicates
     }
 
+    /// Cancel BEFORE submission (or stop polling). Safe at any time.
     func cancel() {
-        pollTask?.cancel()
-        pollTask = nil
+        pollTask?.cancel(); pollTask = nil
+        uploading = false
+        if stage == .idle || stage == .submitting { stage = .idle }
+    }
+
+    private func run(_ call: @escaping () async throws -> IntakeAccepted) {
+        lastSubmit = call
+        stage = .submitting
+        displayStatus = "Sending…"
+        Task { await self._submit(call) }
     }
 
     private func _submit(_ call: @escaping () async throws -> IntakeAccepted) async {
         do {
             let accepted = try await call()
+            Analytics.track(.missionAcknowledged)
             await MainActor.run {
+                self.uploading = false
                 self.missionID = accepted.mission_id
+                self.sourceID = accepted.source_id
                 self.displayStatus = accepted.display_status
                 self.stage = .working
+                IntakeRestore.pending = accepted.mission_id   // survive an app kill
             }
             startPolling(accepted.mission_id)
         } catch {
-            await MainActor.run {
-                self.stage = .failed
-                self.blockingReason = "Couldn't reach Bruce. Check your connection and try again."
-            }
+            await MainActor.run { self.fail(from: error) }
+        }
+    }
+
+    @MainActor private func fail(from error: Error) {
+        uploading = false
+        if case BruceAPIError.badStatus(401) = error {
+            stage = .sessionExpired
+            blockingReason = "Your session expired. Sign in again to keep going."
+            Analytics.track(.extractionFailed(.sessionExpired))
+        } else {
+            stage = .failed
+            blockingReason = "Couldn't reach Bruce. Check your connection and try again."
+            Analytics.track(.extractionFailed(.network))
         }
     }
 
@@ -82,15 +125,13 @@ import Observation
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             guard let self else { return }
-            // Poll ~1s until the mission leaves a working phase. Bounded so a stuck mission can't
-            // spin forever; the backend's 20s budget means it resolves well within this.
-            for _ in 0..<40 {
+            for _ in 0..<40 {   // ~40s ceiling; backend's 20s budget resolves well inside this
                 if Task.isCancelled { return }
                 if let m = try? await self.api.mission(id) {
                     await MainActor.run { self.apply(m) }
                     if !m.isWorking { return }
                 }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
             }
         }
     }
@@ -99,122 +140,29 @@ import Observation
         displayStatus = m.short_status
         extracted = m.extracted
         blockingReason = m.blocking_reason
-        if m.isReady { stage = .ready }
-        else if m.isBlocked { stage = .blocked }
-        else if m.isTerminalFailure { stage = .failed }
-        else { stage = .working }
-    }
-}
-
-// MARK: - Capture sheet (paste/type today; image/PDF pickers slot into the same session)
-
-struct LiveIntakeSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var session = LiveIntakeSession()
-    @State private var text = ""
-
-    var body: some View {
-        ZStack {
-            Theme.Backdrop()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    header
-                    switch session.stage {
-                    case .idle, .submitting: composer
-                    case .working:           workingCard
-                    case .ready:             resultCard
-                    case .blocked, .failed:  problemCard
-                    }
-                    Color.clear.frame(height: 40)
-                }
-                .padding(.horizontal, 20).padding(.top, 12)
-            }
+        if m.isReady {
+            stage = .ready; IntakeRestore.pending = nil
+            Analytics.track(.extractionCompleted)
+        } else if m.isBlocked {
+            stage = .blocked
+        } else if m.isTerminalFailure {
+            stage = .failed; IntakeRestore.pending = nil
+            let reason: IntakeEvent.Reason = (m.blocking_reason ?? "").lowercased().contains("provider") ? .providerUnavailable : .unreadable
+            Analytics.track(.extractionFailed(reason))
+        } else {
+            stage = .working
         }
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Add to Bruce").font(.system(size: 28, weight: .bold)).foregroundStyle(Theme.text)
-            Text("Paste an email, a deadline, or anything school-related. Bruce reads it and tracks it.")
-                .font(.subheadline).foregroundStyle(Theme.textSecondary)
+    /// Called when the sheet is dismissed before the mission was acknowledged/ready.
+    func trackAbandon() {
+        let s: IntakeEvent.Stage
+        switch stage {
+        case .idle: s = .picking
+        case .submitting: s = .submitting
+        case .working: s = .working
+        default: return   // ready/failed aren't abandonment
         }
-    }
-
-    private var composer: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            TextField("", text: $text, prompt: Text("Paste or type…").foregroundColor(Theme.textTertiary), axis: .vertical)
-                .font(.system(size: 16)).foregroundStyle(Theme.text).tint(Theme.silver)
-                .lineLimit(4...12).padding(14).glass(16)
-            Button {
-                Haptics.tap()
-                session.submit(text: text)
-            } label: {
-                HStack { Spacer(); Text(session.isSubmitting ? "Sending…" : "Give it to Bruce").font(.system(size: 16, weight: .semibold)); Spacer() }
-                    .foregroundStyle(Theme.text).padding(15).glass(16)
-            }
-            .buttonStyle(PressStyle())
-            .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || session.isSubmitting)
-            .opacity(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.5 : 1)
-        }
-    }
-
-    private var workingCard: some View {
-        HStack(spacing: 12) {
-            ProgressView().tint(Theme.silver)
-            Text(session.displayStatus.isEmpty ? "Understanding what you sent…" : session.displayStatus)
-                .font(.system(size: 16, weight: .medium)).foregroundStyle(Theme.text)
-            Spacer()
-        }
-        .padding(16).glass(16)
-    }
-
-    private var resultCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Here's what I found").font(.system(size: 18, weight: .semibold)).foregroundStyle(Theme.text)
-            if let ex = session.extracted {
-                if let title = ex.title, !title.isEmpty {
-                    Text(title).font(.system(size: 15, weight: .semibold)).foregroundStyle(Theme.text)
-                }
-                ForEach(ex.deadlines) { d in
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: d.isAmbiguous ? "questionmark.circle" : "calendar")
-                            .foregroundStyle(d.isAmbiguous ? AnyShapeStyle(Theme.textTertiary) : AnyShapeStyle(Theme.silver))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(d.label).font(.system(size: 15, weight: .medium)).foregroundStyle(Theme.text)
-                            Text(d.isAmbiguous ? "Date unclear — needs your eye" : (d.date ?? ""))
-                                .font(.system(size: 13)).foregroundStyle(Theme.textSecondary)
-                        }
-                        Spacer()
-                    }
-                    .padding(12).glass(14)
-                }
-                if !ex.required_items.isEmpty {
-                    Text("You'll also need: " + ex.required_items.map(\.name).joined(separator: ", "))
-                        .font(.system(size: 13)).foregroundStyle(Theme.textSecondary)
-                }
-            }
-            Button { Haptics.tap(); dismiss() } label: {
-                HStack { Spacer(); Text("Looks right").font(.system(size: 16, weight: .semibold)); Spacer() }
-                    .foregroundStyle(Theme.text).padding(15).glass(16)
-            }.buttonStyle(PressStyle())
-        }
-    }
-
-    private var problemCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 10) {
-                Image(systemName: session.stage == .blocked ? "clock.arrow.circlepath" : "exclamationmark.triangle")
-                    .foregroundStyle(Theme.textSecondary)
-                Text(session.stage == .blocked ? "Hit a snag — you can retry" : "Couldn't read that one")
-                    .font(.system(size: 16, weight: .semibold)).foregroundStyle(Theme.text)
-            }
-            if let reason = session.blockingReason {
-                Text(reason).font(.system(size: 13)).foregroundStyle(Theme.textSecondary)
-            }
-            Button { Haptics.tap(); session.retry() } label: {
-                HStack { Spacer(); Text("Try again").font(.system(size: 16, weight: .semibold)); Spacer() }
-                    .foregroundStyle(Theme.text).padding(15).glass(16)
-            }.buttonStyle(PressStyle())
-        }
+        Analytics.track(.userAbandoned(s))
     }
 }
