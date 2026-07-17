@@ -14,6 +14,7 @@ live Supabase project — wiring the real IdP is only setting these env vars.
 
 from __future__ import annotations
 
+import datetime
 import os
 from uuid import UUID
 
@@ -23,6 +24,33 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 _bearer = HTTPBearer(auto_error=False)
+
+DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 3600  # 7 days; mobile session, no refresh endpoint yet
+
+
+def mint_bruce_jwt(user_id: UUID, *, provider: str = "apple", ttl_seconds: int | None = None,
+                   now: datetime.datetime | None = None) -> str:
+    """Issue a Bruce session JWT for an already-verified identity.
+
+    Bruce is now the token ISSUER (HS256 over BRUCE_JWT_SECRET), so production must set that secret;
+    the JWKS path in _decode remains only for verifying a third-party IdP if one is ever configured.
+    The sub is the derived Bruce user_id — never anything the client supplied.
+    """
+    secret = os.environ.get("BRUCE_JWT_SECRET")
+    if not secret:
+        raise RuntimeError("BRUCE_JWT_SECRET not set — required to mint Bruce session tokens.")
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    ttl = ttl_seconds if ttl_seconds is not None else int(os.environ.get("BRUCE_SESSION_TTL_SECONDS", DEFAULT_SESSION_TTL_SECONDS))
+    payload = {
+        "sub": str(user_id),
+        "iss": provider,
+        "iat": int(now.timestamp()),
+        "exp": int((now + datetime.timedelta(seconds=ttl)).timestamp()),
+    }
+    audience = os.environ.get("BRUCE_JWT_AUDIENCE")
+    if audience:
+        payload["aud"] = audience
+    return jwt.encode(payload, secret, algorithm="HS256")
 
 
 class AuthenticatedUser(BaseModel):

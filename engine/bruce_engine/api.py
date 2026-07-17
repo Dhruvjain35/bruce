@@ -26,6 +26,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 from sqlalchemy import text as sa_text
 
+from . import apple_auth
+from . import auth
 from . import calendar_build
 from . import extraction
 from . import intake_store
@@ -165,6 +167,39 @@ async def _run_mission(mission_id: UUID, user_id: UUID, req: MissionRequest) -> 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+class AppleSignInRequest(BaseModel):
+    identity_token: str = Field(min_length=1)
+    raw_nonce: str = Field(min_length=1)  # the client's one-time random value (unhashed)
+    full_name: str | None = Field(default=None, max_length=200)  # first sign-in only; optional
+
+
+class SessionToken(BaseModel):
+    token: str
+    user_id: UUID
+    expires_in: int
+
+
+@app.post("/v1/auth/apple", response_model=SessionToken)
+async def sign_in_with_apple(req: AppleSignInRequest) -> SessionToken:
+    """Exchange a verified Sign in with Apple identity token for a Bruce session JWT.
+
+    PUBLIC (it mints auth). The Bruce user is derived from Apple's stable subject — the client never
+    supplies a user id. Idempotent: first and returning sign-ins both land the same user_id; a
+    duplicate/retried callback just re-issues a token. Email is stored only if Apple sends it (first
+    authorization); a returning sign-in without email never clears it.
+    """
+    try:
+        identity = apple_auth.verify_apple_token(req.identity_token, req.raw_nonce)
+    except apple_auth.AppleAuthError as exc:
+        # Type/short reason only — never the token or any student data.
+        raise HTTPException(status_code=401, detail={"error": "apple_auth_failed", "reason": str(exc)})
+
+    await _user_repo.ensure(identity.bruce_user_id, auth_provider="apple", email=identity.email)
+    ttl = int(os.environ.get("BRUCE_SESSION_TTL_SECONDS", auth.DEFAULT_SESSION_TTL_SECONDS))
+    token = auth.mint_bruce_jwt(identity.bruce_user_id, provider="apple", ttl_seconds=ttl)
+    return SessionToken(token=token, user_id=identity.bruce_user_id, expires_in=ttl)
 
 
 class Readiness(BaseModel):

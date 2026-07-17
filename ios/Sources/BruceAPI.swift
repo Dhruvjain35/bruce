@@ -89,13 +89,16 @@ protocol IntakeAPI {
 extension BruceAPI: IntakeAPI {}
 
 struct BruceAPI {
-    var base = DevAuth.baseURL
-    var token = DevAuth.token
+    var base = AppConfig.baseURL
+    /// Resolved per request from the signed-in session (real Bruce JWT; dev token only if allowed).
+    var bearer: () -> String? = { AppSession.shared.bearer }
 
     private func request(_ path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
         var req = URLRequest(url: base.appending(path: path))
         req.httpMethod = method
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let token = bearer() {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }  // no token -> request is unauthenticated -> server 401 -> surfaced as session-expired
         if let body {
             req.httpBody = body
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
