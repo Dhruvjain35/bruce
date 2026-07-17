@@ -27,3 +27,23 @@ targets:
         SWIFT_VERSION: "5.0"
         CODE_SIGNING_ALLOWED: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  BruceTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests]
+    dependencies:
+      - target: Bruce
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.brucedev.BruceTests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        CODE_SIGNING_ALLOWED: NO
+schemes:
+  Bruce:
+    build:
+      targets:
+        Bruce: all
+    test:
+      targets:
+        - BruceTests

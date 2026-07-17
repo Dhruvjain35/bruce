@@ -5,6 +5,10 @@ struct HomeView: View {
     @Environment(BruceStore.self) private var store
     @State private var showHandoff = false
     @State private var autoDetail = false
+    @State private var liveSession: LiveIntakeSession? = nil
+    @State private var goLive = false
+    @State private var restoreID: UUID? = nil
+    @State private var didCheckRestore = false
 
     var body: some View {
       NavigationStack {
@@ -58,9 +62,23 @@ struct HomeView: View {
             MissionDetailView(mission: Demo.present == "failure" ? Mock.failureMission : Mock.missions[0])
         }
         .sheet(isPresented: $showHandoff) {
-            // Default design is unchanged (HandoffSheet). BRUCE_LIVE_INTAKE=1 routes the same
-            // capture affordance to the real async backend (LiveIntakeSheet) for end-to-end testing.
-            if Demo.env["BRUCE_LIVE_INTAKE"] == "1" { LiveIntakeSheet() } else { HandoffSheet() }
+            HandoffSheet { session in
+                // Mission durably acknowledged — hand off to the canonical detail (it keeps polling).
+                liveSession = session
+                goLive = true
+            }
+        }
+        .navigationDestination(isPresented: $goLive) {
+            if let s = liveSession { LiveMissionDetailView(session: s) }
+        }
+        .navigationDestination(
+            isPresented: Binding(get: { restoreID != nil }, set: { if !$0 { restoreID = nil } })
+        ) {
+            if let id = restoreID { LiveMissionDetailView(restoring: id) }
+        }
+        .onAppear {
+            // Restore an in-flight intake mission after an app relaunch (id only was persisted).
+            if !didCheckRestore { didCheckRestore = true; restoreID = IntakeRestore.pending }
         }
         .onAppear {
             switch Demo.present {

@@ -80,6 +80,14 @@ struct PhaseEvent: Codable, Identifiable {
 
 enum BruceAPIError: Error { case badStatus(Int) }
 
+/// The slice of the API the intake session needs — injectable so its state machine is unit-testable.
+protocol IntakeAPI {
+    func submitIntakeText(_ text: String, idempotencyKey: String) async throws -> IntakeAccepted
+    func submitIntakeBytes(_ bytes: Data, mime: String, sourceKind: String, idempotencyKey: String) async throws -> IntakeAccepted
+    func mission(_ id: UUID) async throws -> MissionDetail
+}
+extension BruceAPI: IntakeAPI {}
+
 struct BruceAPI {
     var base = DevAuth.baseURL
     var token = DevAuth.token
