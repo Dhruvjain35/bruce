@@ -32,6 +32,7 @@ from . import calendar_build
 from . import extraction
 from . import intake_store
 from . import schema
+from . import task_dispatch
 from . import tasks as tasks_mod
 from .auth import AuthenticatedUser, current_user
 from .briefing import compose_brief
@@ -166,7 +167,13 @@ async def _run_mission(mission_id: UUID, user_id: UUID, req: MissionRequest) -> 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    # Includes the deployed commit + environment so a smoke test can prove WHICH build is live.
+    # Stays dependency-free (never touches the DB/providers) — see /ready for dependency checks.
+    return {
+        "status": "ok",
+        "commit": os.environ.get("BRUCE_COMMIT", "unknown"),
+        "env": os.environ.get("BRUCE_ENV", "local"),
+    }
 
 
 class AppleSignInRequest(BaseModel):
@@ -393,6 +400,9 @@ async def intake(req: IntakeRequest, user: AuthenticatedUser = Depends(current_u
         mime=req.mime,
         idempotency_key=req.idempotency_key,
     )
+    # Wake the private worker via Cloud Tasks (no-op + no error if dispatch isn't configured — the
+    # job is already durable, so the in-proc worker or a later drain still handles it).
+    await task_dispatch.enqueue_intake(pending.job_id, user.user_id)
     return IntakeAccepted(
         mission_id=pending.mission_id,
         source_id=pending.source_id,
