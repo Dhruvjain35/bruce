@@ -302,6 +302,139 @@ class ModelCost(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+def _owner_nullable() -> Mapped[uuid.UUID | None]:
+    """user_id FK that may be NULL — a channel identity / inbound message exists BEFORE it is linked
+    to a Bruce user. Only a worker/service session (or the owner once linked) can see such a row."""
+    return mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+
+
+# ================================================================================================
+# MESSAGING DOMAIN (provider-neutral). NO provider (Linq/Apple) object may enter these — the adapter
+# normalizes into these rows at the boundary. Processed server-side (webhook -> worker), so RLS is
+# worker-or-owner (see migration 0006): a service session may handle a pre-link/unlinked row; the app
+# reads only the user's own once linked.
+# ================================================================================================
+
+
+class MessagingIdentity(Base, TSV):
+    """A channel handle (e.g. a phone number). NOT an identity claim on its own — user_id is NULL
+    until an AccountLinkCode binds it. One handle per channel binds to at most one user."""
+
+    __tablename__ = "messaging_identities"
+    id = _pk()
+    user_id = _owner_nullable()
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)   # ChannelKind
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, server_default="linq")
+    channel_identity: Mapped[str] = mapped_column(String(255), nullable=False)  # phone/handle
+    blocked_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    disconnected_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("channel", "channel_identity", name="uq_msg_identity"),)
+
+
+class MessagingConversation(Base, TSV):
+    __tablename__ = "messaging_conversations"
+    id = _pk()
+    user_id = _owner_nullable()
+    identity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messaging_identities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_conversation_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    last_message_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class InboundMessageRow(Base, TSV):
+    """A received message, normalized. Idempotent on (channel, provider_message_id) — webhooks are
+    redelivered, and a redelivery must never create a second mission."""
+
+    __tablename__ = "inbound_messages"
+    id = _pk()
+    user_id = _owner_nullable()
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messaging_conversations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    channel_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)  # transient; not the durable copy
+    reply_to_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_timestamp: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Lineage into the SAME intake the app uses — not a second pipeline.
+    source_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sources.id", ondelete="SET NULL"), nullable=True)
+    mission_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("missions.id", ondelete="SET NULL"), nullable=True)
+    __table_args__ = (UniqueConstraint("channel", "provider_message_id", name="uq_inbound_provider_msg"),)
+
+
+class MessageAttachment(Base, TSV):
+    """An inbound attachment. Bytes are NOT stored here — image/pdf route into the intake source; a
+    link stores its url. source_id links to the intake source it produced."""
+
+    __tablename__ = "message_attachments"
+    id = _pk()
+    user_id = _owner_nullable()
+    inbound_message_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("inbound_messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # image | pdf | link
+    media_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sources.id", ondelete="SET NULL"), nullable=True)
+
+
+class OutboundMessageRow(Base, TSV):
+    """A reply Bruce sends (ack/needs_review/receipt/…). Idempotent on idempotency_key so a retry
+    never double-sends. provider_message_id is filled after the provider accepts the send."""
+
+    __tablename__ = "outbound_messages"
+    id = _pk()
+    user_id = _owner_nullable()
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messaging_conversations.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # acknowledged|needs_review|blocked|failed|succeeded|decision|receipt
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    deep_link: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    mission_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("missions.id", ondelete="SET NULL"), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, server_default="pending")  # pending|sent|delivered|read|failed
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_outbound_idem"),)
+
+
+class MessageDeliveryEvent(Base, TSV):
+    """A delivery/read/failure event from the provider. Idempotent on provider_event_id (dedup)."""
+
+    __tablename__ = "message_delivery_events"
+    id = _pk()
+    user_id = _owner_nullable()
+    outbound_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("outbound_messages.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(24), nullable=False)  # sent|delivered|read|failed
+    provider_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)  # TYPE/short cause only, no content
+    __table_args__ = (UniqueConstraint("provider_event_id", name="uq_delivery_event"),)
+
+
+class AccountLinkCode(Base, TSV):
+    """A one-time code an AUTHENTICATED app user generates and texts to Bruce to bind their channel
+    identity. Hashed at rest (never the plaintext), short-lived, single-use, rate-limited by attempts."""
+
+    __tablename__ = "account_link_codes"
+    id = _pk()
+    user_id = _owner()  # NOT nullable — an authenticated user creates it
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # sha256 hex
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    bound_identity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("messaging_identities.id", ondelete="SET NULL"), nullable=True
+    )
+
+
 class IntakeJob(Base, TSV):
     """A durable unit of intake work: transcribe + extract, done OUTSIDE the request lifecycle.
 
