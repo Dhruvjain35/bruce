@@ -33,7 +33,8 @@ _USER_TABLES = (
     "intake_jobs "  # added 0005 — async intake queue; truncate so jobs don't leak between tests
     "messaging_identities messaging_conversations inbound_messages message_attachments "  # added 0006
     "outbound_messages message_delivery_events account_link_codes "
-    "relay_devices delivery_attempts"  # added 0007 — self-hosted iMessage relay
+    "relay_devices delivery_attempts "  # added 0007 — self-hosted iMessage relay
+    "relay_uploads"  # added 0009 — staged attachment bytes
 ).split()
 
 

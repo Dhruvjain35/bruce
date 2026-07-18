@@ -35,6 +35,7 @@ from . import messaging_inbound
 from . import messaging_outbound
 from . import messaging_store
 from . import relay_auth
+from . import relay_uploads
 from . import schema
 from . import task_dispatch
 from .messaging import Attachment, AttachmentKind, ChannelKind, InboundMessage
@@ -444,12 +445,19 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
     intake). Ignores Bruce's own echoes; deduplicated by message GUID. Returns quickly."""
     if req.is_from_me:
         return {"status": "ignored_echo"}
-    atts = []
+    atts, refs = [], []
     for a in req.attachments:
         try:
             k = AttachmentKind(a.kind)
         except ValueError:
             continue  # unknown attachment kind → skip (never trust arbitrary types)
+        if a.upload_ref:  # image/pdf: pull the staged bytes into the canonical Attachment
+            fetched = await relay_uploads.fetch_bytes(UUID(a.upload_ref))
+            if fetched is not None:
+                data, media = fetched
+                refs.append(UUID(a.upload_ref))
+                atts.append(Attachment(kind=k, media_type=media, data=data, filename=a.filename))
+                continue
         atts.append(Attachment(kind=k, media_type=a.media_type, url=a.url, filename=a.filename))
     ts = datetime.fromisoformat(req.timestamp) if req.timestamp else datetime.now(timezone.utc)
     msg = InboundMessage(
@@ -457,6 +465,10 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
         channel_identity=req.channel_identity, text=req.text, attachments=atts, timestamp=ts,
         reply_to_message_id=req.reply_to_message_id, thread_id=req.chat_guid)
     outcome = await messaging_inbound.handle_inbound(messaging_outbound.QueueChannel(), msg)
+    # Once the durable source has the bytes (processed), clear the staged upload copies.
+    if outcome.status == "processed":
+        for ref in refs:
+            await relay_uploads.consume(ref)
     return {"status": outcome.status, "mission_id": str(outcome.mission_id) if outcome.mission_id else None}
 
 
@@ -494,6 +506,30 @@ async def relay_ack_outbound(outbound_id: UUID, req: RelayOutboundAck,
 async def relay_heartbeat(device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
     """Device health — authenticating already stamped last_seen_at. Reports whether it's still active."""
     return {"device_id": str(device.id), "active": device.revoked_at is None}
+
+
+class RelayUploadRequest(BaseModel):
+    content_base64: str = Field(min_length=1)
+    media_type: str = Field(min_length=1)
+    filename: str | None = None
+
+
+@app.post("/v1/relay/upload")
+async def relay_upload(req: RelayUploadRequest, device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
+    """Stage an inbound attachment's bytes (validated: MIME allowlist, size cap, executable reject).
+    The relay includes the returned upload_ref in the inbound event; the handler consumes it into the
+    durable intake source. Returns the content hash so the relay can skip re-uploading a duplicate."""
+    try:
+        data = base64.b64decode(req.content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=422, detail={"error": "invalid_base64"})
+    try:
+        ref, content_hash = await relay_uploads.store_upload(
+            relay_device_id=device.id, data=data, media_type=req.media_type, filename=req.filename)
+    except relay_uploads.UploadRejected as exc:
+        # 415 for a type/executable reject; the message names the reason, never content.
+        raise HTTPException(status_code=415, detail={"error": "upload_rejected", "reason": str(exc)})
+    return {"upload_ref": str(ref), "content_hash": content_hash}
 
 
 # ------------------------------------------------------- Phase 1 compute endpoints (auth-gated)
