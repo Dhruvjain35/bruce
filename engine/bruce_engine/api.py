@@ -31,8 +31,10 @@ from . import auth
 from . import calendar_build
 from . import extraction
 from . import intake_store
+from . import messaging_store
 from . import schema
 from . import task_dispatch
+from .messaging import ChannelKind
 from . import tasks as tasks_mod
 from .auth import AuthenticatedUser, current_user
 from .briefing import compose_brief
@@ -337,8 +339,59 @@ async def list_missions(user: AuthenticatedUser = Depends(current_user)) -> list
 
 @app.delete("/v1/account")
 async def delete_account(user: AuthenticatedUser = Depends(current_user)) -> dict[str, bool]:
-    await _user_repo.delete(user.user_id)  # cascade removes all rows the user owns
+    await _user_repo.delete(user.user_id)  # cascade removes all rows the user owns (incl. messaging)
     return {"deleted": True}
+
+
+# ------------------------------------------------------- Messaging: account linking (Phase 5)
+
+class LinkCodeResponse(BaseModel):
+    code: str            # shown once; the user texts this to the Bruce number
+    channel: str
+    expires_at: str
+
+
+class MessagingIdentityView(BaseModel):
+    id: UUID
+    channel: str
+    handle_hint: str     # masked — never the full phone/handle
+    linked: bool
+    disconnected: bool
+
+
+def _mask(handle: str) -> str:
+    return ("…" + handle[-4:]) if len(handle) >= 4 else "…"
+
+
+@app.post("/v1/messaging/link-code", response_model=LinkCodeResponse)
+async def create_messaging_link_code(user: AuthenticatedUser = Depends(current_user)) -> LinkCodeResponse:
+    """Generate a one-time code the authenticated user texts to Bruce to link their number. The code
+    is hashed at rest; this is the only time the plaintext is returned."""
+    await _user_repo.ensure(user.user_id, auth_provider=user.auth_provider)
+    code, expires_at = await messaging_store.create_link_code(user.user_id, channel=ChannelKind.linq)
+    return LinkCodeResponse(code=code, channel=ChannelKind.linq.value, expires_at=expires_at.isoformat())
+
+
+@app.get("/v1/messaging/identities", response_model=list[MessagingIdentityView])
+async def list_messaging_identities(user: AuthenticatedUser = Depends(current_user)) -> list[MessagingIdentityView]:
+    """The user's linked channels — handles are MASKED (no private account details exposed)."""
+    rows = await messaging_store.list_identities(user.user_id)
+    return [
+        MessagingIdentityView(
+            id=r.id, channel=r.channel, handle_hint=_mask(r.channel_identity),
+            linked=r.user_id is not None, disconnected=r.disconnected_at is not None,
+        )
+        for r in rows
+    ]
+
+
+@app.delete("/v1/messaging/identities/{identity_id}")
+async def disconnect_messaging_identity(identity_id: UUID, user: AuthenticatedUser = Depends(current_user)) -> dict[str, bool]:
+    """Disconnect messaging from the app. RLS ensures the caller can only disconnect their own."""
+    ok = await messaging_store.disconnect_identity(user.user_id, identity_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="identity not found")
+    return {"disconnected": True}
 
 
 # ------------------------------------------------------- Phase 1 compute endpoints (auth-gated)
