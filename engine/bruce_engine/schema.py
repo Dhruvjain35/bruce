@@ -464,6 +464,22 @@ class RelayDevice(Base, TSV):
     revoked_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class RelayUpload(Base, TSV):
+    """A file the relay uploaded from an inbound message, staged until the intake source is created.
+    Bytes live here transiently (cleared on consume); infra, so worker-only RLS. content_hash lets
+    the relay skip re-uploading a duplicate."""
+
+    __tablename__ = "relay_uploads"
+    id = _pk()
+    relay_device_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("relay_devices.id", ondelete="SET NULL"), nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    media_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)  # cleared on consume
+    consumed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class DeliveryAttempt(Base, TSV):
     """One relay attempt to deliver an outbound message. Records the provider result for audit; carries
     no message content."""
