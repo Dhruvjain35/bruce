@@ -398,9 +398,21 @@ class OutboundMessageRow(Base, TSV):
     deep_link: Mapped[str | None] = mapped_column(String(500), nullable=True)
     mission_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("missions.id", ondelete="SET NULL"), nullable=True)
     provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    status: Mapped[str] = mapped_column(String(24), nullable=False, server_default="pending")  # pending|sent|delivered|read|failed
+    # Queue state machine (Phase 8): pending|leased|sending|sent|retryable_failed|terminal_failed.
+    status: Mapped[str] = mapped_column(String(24), nullable=False, server_default="pending")
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_outbound_idem"),)
+    # Lease fields so the Mac relay claims one message at a time (crash-safe, like intake_jobs).
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # NOTE: this class has a `text` column, so the module-level `text()` is shadowed here — use a
+    # plain-string server_default for these integers.
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="5")
+    relay_device_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_outbound_idem"),
+        Index("ix_outbound_claimable", "status", "lease_expires_at"),
+    )
 
 
 class MessageDeliveryEvent(Base, TSV):
@@ -433,6 +445,39 @@ class AccountLinkCode(Base, TSV):
     bound_identity_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("messaging_identities.id", ondelete="SET NULL"), nullable=True
     )
+
+
+class RelayDevice(Base, TSV):
+    """A dedicated Mac relay's credential. INFRASTRUCTURE, not user-owned — the server stores only a
+    HASH of the device secret (the secret is shown once at registration, held in the Mac Keychain).
+    Remotely revocable (revoked_at). Accessed only in a worker/service session (see migration 0007)."""
+
+    __tablename__ = "relay_devices"
+    id = _pk()
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False, server_default="self_hosted_imessage")
+    credential_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # sha256 of the secret
+    bruce_handle: Mapped[str | None] = mapped_column(String(255), nullable=True)  # the Bruce iMessage identity
+    last_seen_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rotated_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DeliveryAttempt(Base, TSV):
+    """One relay attempt to deliver an outbound message. Records the provider result for audit; carries
+    no message content."""
+
+    __tablename__ = "delivery_attempts"
+    id = _pk()
+    user_id = _owner_nullable()
+    outbound_message_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("outbound_messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    relay_device_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("relay_devices.id", ondelete="SET NULL"), nullable=True)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    status: Mapped[str] = mapped_column(String(24), nullable=False)  # sent | failed
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(200), nullable=True)  # TYPE/short cause only, no content
 
 
 class IntakeJob(Base, TSV):
