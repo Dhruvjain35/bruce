@@ -20,7 +20,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from . import intake_store, messaging_store, schema, task_dispatch
+from . import intake_store, messaging_outbound, messaging_store, schema, task_dispatch
 from .db import user_session, worker_session
 from .messaging import Attachment, AttachmentKind, ChannelKind, InboundMessage, MessagingChannel, OutboundMessage
 from .models import IntakeSourceKind
@@ -54,18 +54,12 @@ def _content(msg: InboundMessage) -> tuple[IntakeSourceKind, str | None, bytes |
 
 async def _send(channel: MessagingChannel, *, to: str, user_id: UUID | None, kind: str, text: str,
                 mission_id: UUID | None = None, dedup_key: str) -> None:
-    """Send + durably record an outbound message. Idempotent on dedup_key so a redelivery/retry never
-    double-sends the same reply."""
-    if user_id is not None:
-        async with user_session(user_id) as s:
-            existing = (await s.execute(
-                select(schema.OutboundMessageRow).where(schema.OutboundMessageRow.idempotency_key == dedup_key)
-            )).scalar_one_or_none()
-            if existing is not None:
-                return
-            s.add(schema.OutboundMessageRow(
-                user_id=user_id, channel=ChannelKind.linq.value, kind=kind, text=text,
-                mission_id=mission_id, idempotency_key=dedup_key, status="pending"))
+    """Queue an outbound reply durably (the relay claims it) + notify the channel. Idempotent on
+    dedup_key so a redelivery/retry never double-sends. In production the channel is a QueueChannel
+    (send is a no-op — the durable row IS the queue); FakeChannel records for tests."""
+    await messaging_outbound.enqueue(
+        user_id=user_id, to_handle=to, channel=ChannelKind.self_hosted_imessage, kind=kind, text=text,
+        idempotency_key=dedup_key, mission_id=mission_id)
     await channel.send_message(to=to, message=OutboundMessage(text=text))
 
 
@@ -85,19 +79,23 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
     if blocked:
         return InboundOutcome(status="blocked")
 
+    # Replies go to the CONVERSATION (group chat_guid via thread_id, else the direct sender).
+    reply_target = msg.thread_id or msg.channel_identity
+
     # 2. Unlinked sender: redeem a texted code, or prompt to link. No intake for an unlinked sender.
     if user_id is None:
         text = (msg.text or "").strip()
         if _CODE_RE.match(text):
             r = await messaging_store.redeem_link_code(text, msg.channel, msg.channel_identity, now=now)
             if r.status == "linked":
-                await _send(channel, to=msg.channel_identity, user_id=r.user_id, kind="acknowledged",
+                await _send(channel, to=reply_target, user_id=r.user_id, kind="acknowledged",
                             text=LINKED_TEXT, dedup_key=f"linked:{msg.provider_message_id}")
                 return InboundOutcome(status="linked", user_id=r.user_id)
-            await _send(channel, to=msg.channel_identity, user_id=None, kind="acknowledged",
+            await _send(channel, to=reply_target, user_id=None, kind="acknowledged",
                         text=BAD_CODE_TEXT, dedup_key=f"badcode:{msg.provider_message_id}")
             return InboundOutcome(status="bad_code")
-        await channel.send_message(to=msg.channel_identity, message=OutboundMessage(text=LINK_PROMPT))
+        await _send(channel, to=reply_target, user_id=None, kind="prompt", text=LINK_PROMPT,
+                    dedup_key=f"prompt:{msg.provider_message_id}")
         return InboundOutcome(status="unlinked_prompt")
 
     # 3. Idempotency: has this exact provider message already been handled?
@@ -135,6 +133,6 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
 
     # 6. Wake the worker (same Cloud Tasks path) + acknowledge immediately (no promise of success).
     await task_dispatch.enqueue_intake(pending.job_id, user_id)
-    await _send(channel, to=msg.channel_identity, user_id=user_id, kind="acknowledged", text=ACK_TEXT,
+    await _send(channel, to=reply_target, user_id=user_id, kind="acknowledged", text=ACK_TEXT,
                 mission_id=pending.mission_id, dedup_key=f"ack:{msg.provider_message_id}")
     return InboundOutcome(status="processed", user_id=user_id, mission_id=pending.mission_id)

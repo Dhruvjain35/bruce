@@ -47,6 +47,7 @@ class ChannelKind(str, Enum):
     in_app = "in_app"
     share_extension = "share_extension"
     linq = "linq"                    # planned — no adapter; no API contract in this repo
+    self_hosted_imessage = "self_hosted_imessage"  # dedicated-Mac imsg relay (alpha)
     apple_business = "apple_business"  # planned — requires Apple approval
     push_action = "push_action"
     fake = "fake"                    # tests only
