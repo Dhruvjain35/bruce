@@ -38,10 +38,14 @@ def _kind_for(mime: str) -> str | None:
 
 class Relay:
     def __init__(self, imsg: Imsg, backend: Backend, checkpoint: FileCheckpoint, *,
-                 spool_dir: str, poll_interval: float = 2.0, reconnect_delay: float = 3.0) -> None:
+                 spool_dir: str, poll_interval: float = 2.0, reconnect_delay: float = 3.0,
+                 sent_ledger: FileCheckpoint | None = None) -> None:
         self.imsg = imsg
         self.backend = backend
         self.checkpoint = checkpoint
+        # Durable at-most-once ledger of outbound ids we've already attempted to send. Guarantees a
+        # reclaimed row (ack lost, lease expired, relay crashed) is NEVER sent to a real person twice.
+        self.sent_ledger = sent_ledger
         self.spool_dir = spool_dir
         self.poll_interval = poll_interval
         self.reconnect_delay = reconnect_delay
@@ -141,9 +145,22 @@ class Relay:
             return False
         if job is None:
             return False
+        oid = str(job["id"])
+        # At-most-once: if we've already attempted this id, DO NOT send it again — just re-ack. This
+        # is what stops a reclaimed row (lost ack / expired lease / crash) from double-texting a human.
+        if self.sent_ledger is not None and self.sent_ledger.has(oid):
+            await self.backend.ack(job["id"], "sent", None, None)
+            log.info("outbound_skip_resend id=%s (already attempted)", job["id"])
+            return True
+        # Mark BEFORE sending: if anything after the send throws (ack, response read), the row is never
+        # resent. The trade-off is at-most-once (a genuinely failed first attempt isn't retried) — the
+        # correct bias for real messaging, where a duplicate text is worse than a missed reply.
+        if self.sent_ledger is not None:
+            self.sent_ledger.mark(oid)
         try:
             guid = await self.imsg.send_text(job["to"], job["text"])   # attachments in outbound: future
         except Exception as exc:
+            # Ledger already blocks a resend; report failure so the server can move it out of pending.
             await self.backend.ack(job["id"], "retryable_failed", None, f"{type(exc).__name__}")
             return True
         # Ack ONLY after the send command succeeded.

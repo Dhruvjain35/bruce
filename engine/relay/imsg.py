@@ -110,10 +110,41 @@ class SubprocessImsg:
             if ev is not None:
                 yield ev
 
+    async def _send(self, params: dict, *, timeout: float = 60.0) -> str | None:
+        """Send via a DEDICATED, short-lived `imsg rpc` process.
+
+        Outbound MUST NOT reuse the watch subprocess: watch() is continuously awaiting
+        ``stdout.readline()`` on that process, and a second concurrent readline on the same stream
+        raises ``RuntimeError`` in asyncio. Previously send shared it, so every send that overlapped
+        the watch loop raised AFTER the request had already reached imsg — the message was delivered
+        but recorded as failed, and the durable queue resent it every retry-backoff. A separate
+        process per send removes that shared reader entirely."""
+        proc = await asyncio.create_subprocess_exec(
+            self.binary, "rpc",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        try:
+            assert proc.stdin and proc.stdout
+            req = {"jsonrpc": "2.0", "id": 1, "method": "send", "params": params}
+            proc.stdin.write((json.dumps(req) + "\n").encode())
+            await proc.stdin.drain()
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()          # one-shot: terminate as soon as we have the response
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+        if not line:
+            return None
+        resp = json.loads(line.decode())
+        if "error" in resp:
+            raise RuntimeError(f"imsg send error: {resp['error']}")   # a real send failure -> retry
+        return (resp.get("result") or {}).get("guid")
+
     async def send_text(self, to: str, text: str) -> str | None:
-        r = await self._rpc("send", {"to": to, "text": text})
-        return (r.get("result") or {}).get("guid")
+        return await self._send({"to": to, "text": text})
 
     async def send_file(self, to: str, path: str) -> str | None:
-        r = await self._rpc("send", {"to": to, "file": path})
-        return (r.get("result") or {}).get("guid")
+        return await self._send({"to": to, "file": path})
