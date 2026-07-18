@@ -16,3 +16,4 @@ pyjwt[crypto]>=2.9     # verify IdP (Supabase/Apple) JWTs at the auth boundary
 # dev
 pytest>=8.0
 pytest-asyncio>=0.23
+google-cloud-tasks>=2.16   # Cloud Tasks dispatch (staging worker)

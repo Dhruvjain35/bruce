@@ -64,7 +64,9 @@ def _goal():
 
 
 def test_health_is_public():
-    assert client.get("/health").json() == {"status": "ok"}
+    body = client.get("/health").json()
+    assert body["status"] == "ok"
+    assert "commit" in body and "env" in body   # deployed build identity for smoke tests
 
 
 def test_mission_requires_auth():
