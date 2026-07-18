@@ -487,3 +487,23 @@ def test_watch_and_send_run_concurrently_without_collision(tmp_path):
 async def _collect(im, got):
     async for ev in im.watch():
         got.append(ev)
+
+
+# --- entrypoint wiring (regression: `python -m relay` crashed on an UnboundLocalError) ------------
+# main() was never covered, so a local `import os.path` that shadowed the module `os` shipped and
+# crashed the relay on startup. build_relay() runs the same os.makedirs/os.path lines, unit-testable.
+
+def test_build_relay_wires_config_without_crashing(tmp_path):
+    from relay.config import RelayConfig
+    from relay.__main__ import build_relay
+    cfg = RelayConfig(
+        base_url="https://example.test", secret="dummy-not-real",
+        spool_dir=str(tmp_path / "spool"),
+        checkpoint_path=str(tmp_path / "state" / "checkpoint.json"),
+        imsg_bin="imsg", poll_interval=0.01, reconnect_delay=0.01,
+    )
+    relay = build_relay(cfg)                              # would raise UnboundLocalError pre-fix
+    assert isinstance(relay, Relay)
+    assert relay.sent_ledger is not None                 # at-most-once ledger is wired
+    assert os.path.isdir(os.path.dirname(cfg.checkpoint_path))   # state dir created
+    assert relay.sent_ledger.path == str(tmp_path / "state" / "outbound_sent.json")

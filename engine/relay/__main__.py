@@ -1,7 +1,7 @@
 """Relay entrypoint — `python -m relay`. Wires the real imsg subprocess + HTTP backend and runs.
 
 Transport only. Content-free logging is configured here (message ids + statuses, never text/paths).
-Live behaviour is UNVERIFIED until the dedicated-Mac test passes.
+Live behaviour is UNVERIFIED until the dedicated-Mac dry-run passes.
 """
 
 from __future__ import annotations
@@ -17,17 +17,11 @@ from .imsg import SubprocessImsg
 from .relay import Relay
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",  # ids + statuses only
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log request URLs (keep logs focused)
-    cfg = RelayConfig.from_env()
+def build_relay(cfg: RelayConfig) -> Relay:
+    """Construct the Relay from config (separated from main() so the wiring is unit-testable)."""
     os.makedirs(os.path.dirname(cfg.checkpoint_path), exist_ok=True)
-    import os.path
     sent_ledger_path = os.path.join(os.path.dirname(cfg.checkpoint_path), "outbound_sent.json")
-    relay = Relay(
+    return Relay(
         imsg=SubprocessImsg(cfg.imsg_bin),
         backend=HttpBackend(cfg.base_url, cfg.secret),
         checkpoint=FileCheckpoint(cfg.checkpoint_path),
@@ -36,6 +30,16 @@ def main() -> None:
         reconnect_delay=cfg.reconnect_delay,
         sent_ledger=FileCheckpoint(sent_ledger_path),   # durable at-most-once outbound guard
     )
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",  # ids + statuses only
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log request URLs (keep logs focused)
+    cfg = RelayConfig.from_env()
+    relay = build_relay(cfg)
     logging.getLogger("bruce.relay").info("relay_start base=%s", cfg.base_url)
     try:
         asyncio.run(relay.run())
