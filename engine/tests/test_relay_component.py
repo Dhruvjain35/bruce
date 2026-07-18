@@ -20,6 +20,7 @@ import pytest
 from relay.backend import AuthError, BackendError
 from relay.checkpoint import FileCheckpoint
 from relay.fake_imsg import InProcessImsg
+from relay.imsg import stream_event
 from relay.relay import Relay
 
 # 1x1 PNG (valid magic, tiny) — stands in for a screenshot attachment.
@@ -340,3 +341,34 @@ def test_outbound_empty_claim_is_noop(tmp_path):
     r = _relay(tmp_path, InProcessImsg(), be)
     assert _run(r.process_one_outbound()) is False
     assert be.acks == []
+
+
+# --- imsg watch-stream framing (contract with the real `imsg rpc`) ---------------------------------
+# imsg 0.13.x frames rpc I/O as JSON-RPC 2.0, so watch pushes arrive as NOTIFICATIONS. stream_event
+# must accept that framing AND a bare object, while skipping our own request responses — otherwise a
+# live relay would silently yield no messages.
+
+def test_stream_event_jsonrpc_notification_params_is_message():
+    ev = stream_event({"jsonrpc": "2.0", "method": "watch.event",
+                       "params": {"guid": "g1", "sender": "+1555", "text": "hi", "is_from_me": False}})
+    assert ev is not None and ev.guid == "g1" and ev.sender == "+1555" and ev.text == "hi"
+
+
+def test_stream_event_jsonrpc_notification_params_wraps_message():
+    ev = stream_event({"jsonrpc": "2.0", "method": "watch.event",
+                       "params": {"subscription": 1, "message": {"guid": "g2", "text": "yo"}}})
+    assert ev is not None and ev.guid == "g2" and ev.text == "yo"
+
+
+def test_stream_event_bare_message_object():
+    ev = stream_event({"guid": "g3", "sender": "+1555", "is_group": True, "chat_guid": "c1"})
+    assert ev is not None and ev.guid == "g3" and ev.is_group is True and ev.chat_guid == "c1"
+
+
+def test_stream_event_skips_request_responses_and_noise():
+    assert stream_event({"jsonrpc": "2.0", "result": {"subscription": 1}, "id": 1}) is None  # subscribe ack
+    assert stream_event({"jsonrpc": "2.0", "result": {"guid": "out-1"}, "id": 2}) is None      # send response
+    assert stream_event({"jsonrpc": "2.0", "error": {"code": -32601}, "id": 3}) is None        # error
+    assert stream_event({"jsonrpc": "2.0", "method": "ping", "params": {}}) is None            # no guid
+    assert stream_event("not-a-dict") is None
+    assert stream_event({"hello": "world"}) is None

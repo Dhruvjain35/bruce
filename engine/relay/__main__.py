@@ -22,6 +22,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",  # ids + statuses only
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log request URLs (keep logs focused)
     cfg = RelayConfig.from_env()
     os.makedirs(os.path.dirname(cfg.checkpoint_path), exist_ok=True)
     relay = Relay(
