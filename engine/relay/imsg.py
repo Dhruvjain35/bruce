@@ -51,6 +51,31 @@ def parse_event(raw: dict) -> ImsgEvent:
     )
 
 
+def stream_event(obj: object) -> ImsgEvent | None:
+    """Turn ONE line of imsg's rpc watch stream into an ImsgEvent, or None if it isn't a message.
+
+    imsg (0.13.x) frames all rpc I/O as JSON-RPC 2.0, so watch pushes arrive as NOTIFICATIONS —
+    ``{"jsonrpc":"2.0","method":"...","params":{...message...}}`` (a notification has a ``method`` and
+    no ``id``). We accept that, and also a bare message object (some builds emit the message directly).
+    Request RESPONSES to our own calls (``watch.subscribe``/``send`` → ``{"result"|"error","id":...}``)
+    are NOT events and are skipped. Being tolerant of both shapes means the live watch can't silently
+    yield nothing if imsg wraps events in JSON-RPC framing."""
+    if not isinstance(obj, dict):
+        return None
+    if "method" in obj and "id" not in obj:            # JSON-RPC notification -> event in params
+        params = obj.get("params")
+        if isinstance(params, dict):
+            msg = params if params.get("guid") else params.get("message")
+            if isinstance(msg, dict) and msg.get("guid"):
+                return parse_event(msg)
+        return None
+    if "result" in obj or "error" in obj:              # a response/error to one of our requests
+        return None
+    if obj.get("guid"):                                # bare message object (no JSON-RPC framing)
+        return parse_event(obj)
+    return None
+
+
 class SubprocessImsg:
     """Real client: drives one `imsg rpc` subprocess. Reconnect is the caller's job (see Relay)."""
 
@@ -81,9 +106,9 @@ class SubprocessImsg:
                 obj = json.loads(line.decode())
             except json.JSONDecodeError:
                 continue
-            # Watch pushes message objects (not RPC responses) — those carry a guid.
-            if isinstance(obj, dict) and (obj.get("guid") or obj.get("id")) and "jsonrpc" not in obj:
-                yield parse_event(obj)
+            ev = stream_event(obj)   # tolerant of JSON-RPC-notification OR bare-object framing
+            if ev is not None:
+                yield ev
 
     async def send_text(self, to: str, text: str) -> str | None:
         r = await self._rpc("send", {"to": to, "text": text})
