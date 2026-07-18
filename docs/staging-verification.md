@@ -9,7 +9,7 @@ here (they live only in Secret Manager). Deployment + verification only — no p
 |---|---|
 | GCP project | `bruce-staging-2645` (isolated; labels `app=bruce, env=staging`) |
 | Region | `us-central1` (API, worker, Cloud SQL, Artifact Registry, Cloud Tasks all co-located) |
-| Deployed commit | `d080231` (`BRUCE_COMMIT`), `BRUCE_ENV=staging` |
+| Deployed commit | `0056988` (`BRUCE_COMMIT`), `BRUCE_ENV=staging` — adds the self-hosted iMessage relay + messaging endpoints (was `d080231`) |
 | **API URL** | **https://bruce-api-3iwweh3bqa-uc.a.run.app** (public; only auth + health routes are open) |
 | Worker URL | https://bruce-worker-3iwweh3bqa-uc.a.run.app (**private** — no unauthenticated access) |
 
@@ -22,9 +22,9 @@ iPhone app → Cloud Run bruce-api → Cloud Tasks (bruce-intake) → private Cl
                         (API never does model work inline)                   → persists to Cloud SQL
 ```
 
-- **Cloud Run `bruce-api`** — revision `bruce-api-00002-xgq`; min instances **0**, max **3**, startup
+- **Cloud Run `bruce-api`** — revision `bruce-api-00003-4xr`; min instances **0**, max **3**, startup
   CPU boost, startup+liveness probes on `/health`. SA `bruce-api-staging`.
-- **Cloud Run `bruce-worker`** — revision `bruce-worker-00001-sgl`; private (invoker: only
+- **Cloud Run `bruce-worker`** — revision `bruce-worker-00002-vk4`; private (invoker: only
   `bruce-tasks-invoker-staging` has `run.invoker`); min **0**, max **3**. Entrypoint
   `uvicorn bruce_engine.worker_api:app`. SA `bruce-worker-staging`.
 - **Cloud Tasks** queue `bruce-intake` (OIDC-authenticated dispatch to the private worker).
@@ -38,10 +38,12 @@ iPhone app → Cloud Run bruce-api → Cloud Tasks (bruce-intake) → private Cl
 
 ## Migration
 
-- Applied by Cloud Run job `bruce-migrate` (execution `bruce-migrate-cbjh5`, succeeded) running
+- Applied by Cloud Run job `bruce-migrate` (execution `bruce-migrate-nmqqt`, succeeded) running
   `alembic upgrade head` as the **owner** role over the connector.
-- Migration revision: head **`0005_intake_jobs`** (schema + FORCE-RLS policies + least-privilege
-  `bruce_app` grants).
+- Migration revision: head **`0009_relay_uploads`** (schema + FORCE-RLS policies + least-privilege
+  `bruce_app` grants). `0006`–`0009` add the messaging domain, relay devices (worker-only RLS),
+  outbound `to_handle`, and staged relay uploads. Confirmed live below by real table-backed queries.
+  (Earlier `0005_intake_jobs` deploy was execution `bruce-migrate-cbjh5`.)
 
 ## RLS / least privilege (verified)
 
@@ -78,6 +80,25 @@ Item **#10 (kill the worker mid-job → recovery)** is not run as an explicit st
 mechanism (lease expiry + Cloud Tasks at-least-once retry + idempotent phase-2 persist) is covered by
 the Postgres test suite (`test_async_intake_pg`: outage→blocked→reclaim, dup-worker→no duplicates).
 An explicit staging kill-test is a low-risk follow-up.
+
+## Self-hosted iMessage — server endpoints (2026-07-18, commit 0056988)
+
+The relay + messaging endpoints are now **live in staging**. This verifies the SERVER side only —
+see [`self-hosted-imessage-alpha.md`](self-hosted-imessage-alpha.md). **Live iMessage remains
+UNVERIFIED** until the dedicated-Mac dry-run passes; the dedicated Mac is not yet wired.
+
+| # | Check | Result |
+|---|---|---|
+| 1 | `/health` reports the new commit | ✅ `commit=0056988, env=staging` |
+| 2 | `/v1/relay/{inbound,outbound/claim,heartbeat,upload}` without a device credential → 401 | ✅ all 401 |
+| 3 | `/v1/relay/inbound` with a bad Bearer secret → 401 | ✅ (hash lookup + `compare_digest` reject) |
+| 4 | `GET /v1/messaging/identities` (valid session) → 200 | ✅ `[]` (queries `messaging_identities` under RLS — table live) |
+| 5 | `POST /v1/messaging/link-code` (valid session) → 200 | ✅ 6-char code + `expires_at` (writes `account_link_codes` — table live) |
+
+Checks 4–5 prove migrations `0006`–`0009` applied (the endpoints touch the messaging tables; a missing
+table would 500, not 200). No relay device is registered in staging yet — provisioning is an operator
+action (`scripts/register_relay_device.py`), deferred to the dedicated-Mac setup. The cloud exposes no
+route that dials the Mac; the relay is the only initiator.
 
 ## Cost
 
