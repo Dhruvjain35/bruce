@@ -395,6 +395,7 @@ class OutboundMessageRow(Base, TSV):
     channel: Mapped[str] = mapped_column(String(32), nullable=False)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)  # acknowledged|needs_review|blocked|failed|succeeded|decision|receipt
     text: Mapped[str] = mapped_column(Text, nullable=False)
+    to_handle: Mapped[str | None] = mapped_column(String(255), nullable=True)  # recipient handle/chat_guid for the relay
     deep_link: Mapped[str | None] = mapped_column(String(500), nullable=True)
     mission_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("missions.id", ondelete="SET NULL"), nullable=True)
     provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)

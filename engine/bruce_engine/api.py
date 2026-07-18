@@ -17,11 +17,11 @@ import asyncio
 import base64
 import contextlib
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 from enum import Enum
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 from sqlalchemy import text as sa_text
@@ -31,10 +31,13 @@ from . import auth
 from . import calendar_build
 from . import extraction
 from . import intake_store
+from . import messaging_inbound
+from . import messaging_outbound
 from . import messaging_store
+from . import relay_auth
 from . import schema
 from . import task_dispatch
-from .messaging import ChannelKind
+from .messaging import Attachment, AttachmentKind, ChannelKind, InboundMessage
 from . import tasks as tasks_mod
 from .auth import AuthenticatedUser, current_user
 from .briefing import compose_brief
@@ -392,6 +395,105 @@ async def disconnect_messaging_identity(identity_id: UUID, user: AuthenticatedUs
     if not ok:
         raise HTTPException(status_code=404, detail="identity not found")
     return {"disconnected": True}
+
+
+# ------------------------------------------------------- Relay boundary (self-hosted iMessage — Alpha)
+# The cloud NEVER initiates a connection to the Mac. The relay authenticates here, POSTs inbound
+# events, and PULLS outbound work. Live iMessage behaviour is UNVERIFIED until the dedicated-Mac test.
+
+async def current_relay_device(
+    authorization: str | None = Header(default=None),
+    x_bruce_timestamp: str | None = Header(default=None),
+    x_bruce_nonce: str | None = Header(default=None),
+    x_bruce_request_id: str | None = Header(default=None),
+) -> schema.RelayDevice:
+    """Authenticate a relay device: Bearer <device secret> over mandatory TLS + a timestamp replay
+    window. Nonce + request id are carried for tracing; inbound replay is additionally prevented by
+    message-GUID dedup downstream."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing relay credential")
+    try:
+        return await relay_auth.authenticate(authorization[7:], timestamp=x_bruce_timestamp)
+    except relay_auth.RelayAuthError as exc:
+        raise HTTPException(status_code=401, detail={"error": "relay_auth_failed", "reason": str(exc)})
+
+
+class RelayAttachment(BaseModel):
+    kind: str  # image | pdf | link
+    media_type: str | None = None
+    url: str | None = None          # links; image/pdf bytes arrive via the upload endpoint (Phase 7)
+    filename: str | None = None
+    upload_ref: str | None = None
+
+
+class RelayInboundRequest(BaseModel):
+    provider_message_id: str = Field(min_length=1)   # imsg message GUID
+    channel_identity: str = Field(min_length=1)      # sender handle
+    chat_guid: str | None = None                     # conversation (group reply target)
+    is_group: bool = False
+    is_from_me: bool = False                          # Bruce's own echo
+    text: str | None = None
+    attachments: list[RelayAttachment] = Field(default_factory=list)
+    reply_to_message_id: str | None = None
+    timestamp: str | None = None
+
+
+@app.post("/v1/relay/inbound")
+async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
+    """Ingest a normalized imsg event → the SAME handle_inbound flow (durable mission via the existing
+    intake). Ignores Bruce's own echoes; deduplicated by message GUID. Returns quickly."""
+    if req.is_from_me:
+        return {"status": "ignored_echo"}
+    atts = []
+    for a in req.attachments:
+        try:
+            k = AttachmentKind(a.kind)
+        except ValueError:
+            continue  # unknown attachment kind → skip (never trust arbitrary types)
+        atts.append(Attachment(kind=k, media_type=a.media_type, url=a.url, filename=a.filename))
+    ts = datetime.fromisoformat(req.timestamp) if req.timestamp else datetime.now(timezone.utc)
+    msg = InboundMessage(
+        provider_message_id=req.provider_message_id, channel=ChannelKind.self_hosted_imessage,
+        channel_identity=req.channel_identity, text=req.text, attachments=atts, timestamp=ts,
+        reply_to_message_id=req.reply_to_message_id, thread_id=req.chat_guid)
+    outcome = await messaging_inbound.handle_inbound(messaging_outbound.QueueChannel(), msg)
+    return {"status": outcome.status, "mission_id": str(outcome.mission_id) if outcome.mission_id else None}
+
+
+@app.post("/v1/relay/outbound/claim")
+async def relay_claim_outbound(device: schema.RelayDevice = Depends(current_relay_device)):
+    """Claim the next outbound message to send (204 when idle). The relay PULLS — the cloud never
+    calls the Mac. Idempotent + lease-guarded: two pollers never claim the same row."""
+    c = await messaging_outbound.claim(device.id)
+    if c is None:
+        return Response(status_code=204)
+    return {"id": str(c.id), "to": c.to_handle, "kind": c.kind, "text": c.text,
+            "deep_link": c.deep_link, "attempts": c.attempts}
+
+
+class RelayOutboundAck(BaseModel):
+    status: str  # sent | retryable_failed | terminal_failed
+    provider_message_id: str | None = None
+    error: str | None = None
+
+
+@app.post("/v1/relay/outbound/{outbound_id}/ack")
+async def relay_ack_outbound(outbound_id: UUID, req: RelayOutboundAck,
+                             device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
+    """Report the send result. sent → done; terminal_failed → no retry; anything else → the server
+    decides retry vs terminal by attempt count."""
+    if req.status == "sent":
+        await messaging_outbound.mark_sent(outbound_id, provider_message_id=req.provider_message_id, relay_device_id=device.id)
+    else:
+        await messaging_outbound.mark_failed(outbound_id, reason=req.error or "send failed",
+                                             relay_device_id=device.id, force_terminal=(req.status == "terminal_failed"))
+    return {"ok": True}
+
+
+@app.post("/v1/relay/heartbeat")
+async def relay_heartbeat(device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
+    """Device health — authenticating already stamped last_seen_at. Reports whether it's still active."""
+    return {"device_id": str(device.id), "active": device.revoked_at is None}
 
 
 # ------------------------------------------------------- Phase 1 compute endpoints (auth-gated)
