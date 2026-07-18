@@ -26,15 +26,21 @@ from .messaging import Attachment, AttachmentKind, ChannelKind, InboundMessage, 
 from .models import IntakeSourceKind
 
 ACK_TEXT = "Got it — I'm understanding this now. I'll message you when it needs review."
-LINK_PROMPT = "To connect, open Bruce, tap your profile, and get a link code — then text it here."
+# PRIVATE-ALPHA linking copy. No iPhone app or profile screen exists yet, so we NEVER reference one.
+# A code is issued out of band by the Bruce team (operator CLI: scripts/create_link_code). Failure
+# replies are deliberately generic — they never reveal whether a given number/account exists.
+LINK_PROMPT = ("This is Bruce (private alpha). To connect this number, reply with the 6-character "
+               "invite code the Bruce team gave you. Codes expire quickly and are single-use.")
 LINKED_TEXT = "You're linked. Text me a flyer, screenshot, PDF, link, or a note and I'll track it."
-BAD_CODE_TEXT = "That code didn't work — it may have expired. Get a fresh one in the Bruce app."
+BAD_CODE_TEXT = ("That invite code isn't valid or has expired. Invite codes are single-use and short-"
+                 "lived — reply with a current one, or ask the Bruce team for a fresh code.")
+RATE_LIMITED_TEXT = "Too many attempts. Please wait a few minutes before trying another invite code."
 _CODE_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 
 
 @dataclasses.dataclass
 class InboundOutcome:
-    status: str            # processed | duplicate | linked | bad_code | unlinked_prompt | blocked
+    status: str            # processed | duplicate | linked | bad_code | rate_limited | unlinked_prompt | blocked
     user_id: UUID | None = None
     mission_id: UUID | None = None
 
@@ -91,6 +97,12 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
                 await _send(channel, to=reply_target, user_id=r.user_id, kind="acknowledged",
                             text=LINKED_TEXT, dedup_key=f"linked:{msg.provider_message_id}")
                 return InboundOutcome(status="linked", user_id=r.user_id)
+            if r.status == "rate_limited":
+                await _send(channel, to=reply_target, user_id=None, kind="prompt",
+                            text=RATE_LIMITED_TEXT, dedup_key=f"ratelimited:{msg.provider_message_id}")
+                return InboundOutcome(status="rate_limited")
+            # invalid / expired / locked / conflict all get the SAME generic reply — never reveal
+            # whether the number is already linked or an account exists.
             await _send(channel, to=reply_target, user_id=None, kind="acknowledged",
                         text=BAD_CODE_TEXT, dedup_key=f"badcode:{msg.provider_message_id}")
             return InboundOutcome(status="bad_code")

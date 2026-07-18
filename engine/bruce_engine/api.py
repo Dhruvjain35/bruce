@@ -372,8 +372,8 @@ async def create_messaging_link_code(user: AuthenticatedUser = Depends(current_u
     """Generate a one-time code the authenticated user texts to Bruce to link their number. The code
     is hashed at rest; this is the only time the plaintext is returned."""
     await _user_repo.ensure(user.user_id, auth_provider=user.auth_provider)
-    code, expires_at = await messaging_store.create_link_code(user.user_id, channel=ChannelKind.linq)
-    return LinkCodeResponse(code=code, channel=ChannelKind.linq.value, expires_at=expires_at.isoformat())
+    code, expires_at = await messaging_store.create_link_code(user.user_id, channel=ChannelKind.self_hosted_imessage)
+    return LinkCodeResponse(code=code, channel=ChannelKind.self_hosted_imessage.value, expires_at=expires_at.isoformat())
 
 
 @app.get("/v1/messaging/identities", response_model=list[MessagingIdentityView])

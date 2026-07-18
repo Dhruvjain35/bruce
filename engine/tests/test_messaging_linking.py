@@ -71,7 +71,7 @@ def test_redeem_binds_identity_to_the_code_owner(clean_db):
     uid = uuid4()
     asyncio.run(_ensure_user(uid))
     code, _ = asyncio.run(messaging_store.create_link_code(uid))
-    r = asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.linq, PHONE))
+    r = asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.self_hosted_imessage, PHONE))
     assert r.status == "linked" and r.user_id == uid
     idents = asyncio.run(messaging_store.list_identities(uid))
     assert len(idents) == 1 and idents[0].channel_identity == PHONE
@@ -80,30 +80,30 @@ def test_redeem_binds_identity_to_the_code_owner(clean_db):
 def test_code_is_single_use(clean_db):
     uid = uuid4(); asyncio.run(_ensure_user(uid))
     code, _ = asyncio.run(messaging_store.create_link_code(uid))
-    assert asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.linq, PHONE)).status == "linked"
-    assert asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.linq, PHONE)).status == "invalid"
+    assert asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.self_hosted_imessage, PHONE)).status == "linked"
+    assert asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.self_hosted_imessage, PHONE)).status == "invalid"
 
 
 def test_wrong_code_is_invalid(clean_db):
     uid = uuid4(); asyncio.run(_ensure_user(uid))
     asyncio.run(messaging_store.create_link_code(uid))
-    assert asyncio.run(messaging_store.redeem_link_code("ZZZZZZ", ChannelKind.linq, PHONE)).status == "invalid"
+    assert asyncio.run(messaging_store.redeem_link_code("ZZZZZZ", ChannelKind.self_hosted_imessage, PHONE)).status == "invalid"
 
 
 def test_expired_code_is_invalid(clean_db):
     uid = uuid4(); asyncio.run(_ensure_user(uid))
     past = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
     code, _ = asyncio.run(messaging_store.create_link_code(uid, now=past))  # expires an hour ago
-    assert asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.linq, PHONE)).status == "invalid"
+    assert asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.self_hosted_imessage, PHONE)).status == "invalid"
 
 
 def test_second_users_code_does_not_silently_rebind(clean_db):
     a, b = uuid4(), uuid4()
     asyncio.run(_ensure_user(a)); asyncio.run(_ensure_user(b))
     ca, _ = asyncio.run(messaging_store.create_link_code(a))
-    assert asyncio.run(messaging_store.redeem_link_code(ca, ChannelKind.linq, PHONE)).status == "linked"
+    assert asyncio.run(messaging_store.redeem_link_code(ca, ChannelKind.self_hosted_imessage, PHONE)).status == "linked"
     cb, _ = asyncio.run(messaging_store.create_link_code(b))
-    r = asyncio.run(messaging_store.redeem_link_code(cb, ChannelKind.linq, PHONE))
+    r = asyncio.run(messaging_store.redeem_link_code(cb, ChannelKind.self_hosted_imessage, PHONE))
     assert r.status == "conflict"                                  # relink needs explicit confirmation
     # identity still bound to A
     assert asyncio.run(messaging_store.list_identities(a))[0].channel_identity == PHONE
@@ -113,7 +113,7 @@ def test_second_users_code_does_not_silently_rebind(clean_db):
 def test_deletion_cascades_messaging(clean_db):
     uid = uuid4(); asyncio.run(_ensure_user(uid))
     code, _ = asyncio.run(messaging_store.create_link_code(uid))
-    asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.linq, PHONE))
+    asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.self_hosted_imessage, PHONE))
     asyncio.run(api._user_repo.delete(uid))
 
     async def _counts():
@@ -127,18 +127,62 @@ def test_deletion_cascades_messaging(clean_db):
 def test_api_link_code_and_disconnect(clean_db):
     uid = uuid4()
     body = client.post("/v1/messaging/link-code", headers=_auth(uid)).json()
-    assert len(body["code"]) == 6 and body["channel"] == "linq"
-    asyncio.run(messaging_store.redeem_link_code(body["code"], ChannelKind.linq, PHONE))
+    assert len(body["code"]) == 6 and body["channel"] == "self_hosted_imessage"
+    asyncio.run(messaging_store.redeem_link_code(body["code"], ChannelKind.self_hosted_imessage, PHONE))
     idents = client.get("/v1/messaging/identities", headers=_auth(uid)).json()
     assert len(idents) == 1 and idents[0]["handle_hint"] == "…4567" and idents[0]["linked"] is True
     r = client.delete(f"/v1/messaging/identities/{idents[0]['id']}", headers=_auth(uid))
     assert r.status_code == 200 and r.json()["disconnected"] is True
 
 
+def test_handle_locked_out_after_repeated_wrong_codes(clean_db):
+    """Brute force: many wrong invite codes from ONE handle → the handle is rate-limited, and even a
+    subsequently-valid code is refused while locked (defense beyond the per-code cap)."""
+    from bruce_engine.messaging_store import LINK_ATTEMPT_MAX
+    uid = uuid4(); asyncio.run(_ensure_user(uid))
+    statuses = [
+        asyncio.run(messaging_store.redeem_link_code(f"WRONG{i}", ChannelKind.self_hosted_imessage, PHONE)).status
+        for i in range(LINK_ATTEMPT_MAX)
+    ]
+    assert statuses == ["invalid"] * LINK_ATTEMPT_MAX          # each miss recorded
+    code, _ = asyncio.run(messaging_store.create_link_code(uid))
+    assert asyncio.run(
+        messaging_store.redeem_link_code(code, ChannelKind.self_hosted_imessage, PHONE)
+    ).status == "rate_limited"                                  # locked — a valid code can't get through
+
+
+def test_successful_link_clears_handle_attempts(clean_db):
+    """A successful link resets the handle's failure counter so a later stray miss doesn't insta-lock."""
+    from bruce_engine.messaging_store import LINK_ATTEMPT_MAX
+    uid = uuid4(); asyncio.run(_ensure_user(uid))
+    for i in range(LINK_ATTEMPT_MAX - 1):                       # a few misses, below the threshold
+        assert asyncio.run(
+            messaging_store.redeem_link_code(f"NOPE{i:02d}", ChannelKind.self_hosted_imessage, PHONE)
+        ).status == "invalid"
+    code, _ = asyncio.run(messaging_store.create_link_code(uid))
+    assert asyncio.run(
+        messaging_store.redeem_link_code(code, ChannelKind.self_hosted_imessage, PHONE)
+    ).status == "linked"
+
+    async def _attempt_count():
+        async with worker_session() as s:
+            return (await s.execute(select(func.count()).select_from(schema.MessagingLinkAttempt)
+                    .where(schema.MessagingLinkAttempt.channel_identity == PHONE))).scalar_one()
+    assert asyncio.run(_attempt_count()) == 0                   # counter cleared on success
+
+
+def test_locked_handle_does_not_reveal_account(clean_db):
+    """A locked-out / bad-code reply is generic — it never signals whether an account exists."""
+    from bruce_engine.messaging import ChannelKind as CK
+    # unknown handle, wrong code → 'invalid' (no user enumeration); repeated → 'rate_limited'.
+    r = asyncio.run(messaging_store.redeem_link_code("AAAAAA", CK.self_hosted_imessage, "+15550009999"))
+    assert r.status == "invalid" and r.user_id is None         # nothing about any account leaks
+
+
 def test_cross_user_cannot_see_or_disconnect_anothers_identity(clean_db):
     a, b = uuid4(), uuid4()
     code = client.post("/v1/messaging/link-code", headers=_auth(a)).json()["code"]
-    asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.linq, PHONE))
+    asyncio.run(messaging_store.redeem_link_code(code, ChannelKind.self_hosted_imessage, PHONE))
     aid = client.get("/v1/messaging/identities", headers=_auth(a)).json()[0]["id"]
     # B sees none, and cannot disconnect A's identity (RLS -> 404)
     assert client.get("/v1/messaging/identities", headers=_auth(b)).json() == []

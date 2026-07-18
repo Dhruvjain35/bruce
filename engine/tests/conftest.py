@@ -34,7 +34,8 @@ _USER_TABLES = (
     "messaging_identities messaging_conversations inbound_messages message_attachments "  # added 0006
     "outbound_messages message_delivery_events account_link_codes "
     "relay_devices delivery_attempts "  # added 0007 — self-hosted iMessage relay
-    "relay_uploads"  # added 0009 — staged attachment bytes
+    "relay_uploads "  # added 0009 — staged attachment bytes
+    "messaging_link_attempts"  # added 0010 — per-handle link brute-force guard
 ).split()
 
 
