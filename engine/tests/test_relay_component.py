@@ -14,13 +14,16 @@ real Messages + the real Bruce API.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import sys
 
 import pytest
 
 from relay.backend import AuthError, BackendError
 from relay.checkpoint import FileCheckpoint
 from relay.fake_imsg import InProcessImsg
-from relay.imsg import stream_event
+from relay.imsg import SubprocessImsg, stream_event
 from relay.relay import Relay
 
 # 1x1 PNG (valid magic, tiny) — stands in for a screenshot attachment.
@@ -372,3 +375,115 @@ def test_stream_event_skips_request_responses_and_noise():
     assert stream_event({"jsonrpc": "2.0", "method": "ping", "params": {}}) is None            # no guid
     assert stream_event("not-a-dict") is None
     assert stream_event({"hello": "world"}) is None
+
+
+# --- REGRESSION: the 30-second real-message resend loop -------------------------------------------
+# Incident: `run_inbound` (watch) and `run_outbound` (send) shared ONE `imsg rpc` subprocess. A send's
+# stdout.readline() collided with the watch loop's readline on the same stream -> asyncio RuntimeError
+# AFTER the send request had already reached imsg. The message was delivered but recorded as failed,
+# so the durable queue reclaimed + resent it every retry-backoff (30s), up to max_attempts. Two fixes:
+# (1) send uses its OWN subprocess; (2) a durable at-most-once ledger so a reclaimed id is never
+# re-sent to a real person.
+
+
+def _fake_imsg_shim(tmp_path) -> str:
+    """A one-line executable that runs the in-repo fake imsg via this interpreter (works in CI)."""
+    import relay as _relaypkg
+    engine_root = os.path.dirname(os.path.dirname(os.path.abspath(_relaypkg.__file__)))
+    shim = tmp_path / "fake-imsg"
+    shim.write_text(f'#!/bin/sh\nexport PYTHONPATH="{engine_root}"\nexec "{sys.executable}" -m relay.fake_imsg "$@"\n')
+    shim.chmod(0o755)
+    return str(shim)
+
+
+def _relay_with_ledger(tmp_path, imsg, be):
+    return Relay(imsg=imsg, backend=be,
+                 checkpoint=FileCheckpoint(str(tmp_path / "cp.json")),
+                 spool_dir=str(tmp_path / "spool"), poll_interval=0.01,
+                 sent_ledger=FileCheckpoint(str(tmp_path / "sent.json")))
+
+
+def test_outbound_reclaim_sends_exactly_once(tmp_path):
+    """The SAME outbound id, claimed twice (lease-expiry reclaim), must be delivered only once."""
+    be = FakeBackend()
+    job = {"id": "ob-1", "to": "+15551230000", "text": "reply"}
+    be.claims = [dict(job), dict(job)]           # server hands out the same id twice
+    imsg = InProcessImsg()
+    r = _relay_with_ledger(tmp_path, imsg, be)
+    assert _run(r.process_one_outbound()) is True    # 1st: actually sends
+    assert _run(r.process_one_outbound()) is True    # reclaim: MUST NOT resend
+    assert len(imsg.sent) == 1                        # <-- delivered exactly once
+    assert [a["status"] for a in be.acks] == ["sent", "sent"]
+
+
+def test_outbound_reclaim_idempotent_across_relay_restart(tmp_path):
+    """The at-most-once guard is durable: a reclaim after a relay restart still doesn't resend."""
+    be = FakeBackend()
+    job = {"id": "ob-9", "to": "+15551230000", "text": "reply"}
+    be.claims = [dict(job)]
+    imsg = InProcessImsg()
+    _run(_relay_with_ledger(tmp_path, imsg, be).process_one_outbound())
+    assert len(imsg.sent) == 1
+    # brand-new relay objects, SAME ledger file on disk
+    be.claims = [dict(job)]
+    r2 = _relay_with_ledger(tmp_path, imsg, be)
+    assert _run(r2.process_one_outbound()) is True
+    assert len(imsg.sent) == 1                        # STILL once after restart
+
+
+def test_outbound_send_exception_never_resends(tmp_path):
+    """Even the incident's exact condition (send raises) must not cause repeated real sends."""
+    be = FakeBackend()
+    job = {"id": "ob-2", "to": "+15551230000", "text": "x"}
+    be.claims = [dict(job), dict(job)]
+    imsg = InProcessImsg(send_raises=True)       # every send raises (like the old RuntimeError)
+    r = _relay_with_ledger(tmp_path, imsg, be)
+    assert _run(r.process_one_outbound()) is True
+    assert _run(r.process_one_outbound()) is True
+    assert imsg.sent == []                            # never delivered
+    assert be.acks[0]["status"] == "retryable_failed"
+    assert be.acks[1]["status"] == "sent"             # reclaim short-circuits — no further send attempt
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shim")
+def test_send_uses_its_own_process_not_the_watch_stream(tmp_path):
+    """send_text must spawn its OWN imsg process and never touch the watch subprocess (self._proc).
+    This is the direct fix for the shared-stdout RuntimeError that caused the resend loop."""
+    im = SubprocessImsg(_fake_imsg_shim(tmp_path))
+    assert im._proc is None
+    guid = _run(im.send_text("+15551230000", "reply"))
+    assert guid is not None                           # sent via a dedicated process
+    assert im._proc is None                           # watch process was never created/used by send
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shim")
+def test_watch_and_send_run_concurrently_without_collision(tmp_path):
+    """Reproduce the incident: send WHILE the watch loop is blocked on readline. Pre-fix this raised
+    RuntimeError (concurrent readline on one stream); now send uses a separate process and succeeds."""
+    shim = _fake_imsg_shim(tmp_path)
+    events = tmp_path / "events.json"
+    events.write_text(json.dumps([{"guid": "cev-1", "sender": "+1555", "text": "hi"}]))
+    os.environ["BRUCE_FAKE_IMSG_EVENTS"] = str(events)
+    try:
+        im = SubprocessImsg(shim)
+        got: list = []
+
+        async def scenario():
+            watch_task = asyncio.create_task(_collect(im, got))
+            await asyncio.sleep(0.6)                   # watch yields the event, then blocks on readline
+            guid = await im.send_text("+15551230000", "reply")   # concurrent send: must not collide
+            watch_task.cancel()
+            if im._proc and im._proc.returncode is None:
+                im._proc.kill()
+            return guid
+
+        guid = _run(asyncio.wait_for(scenario(), timeout=15))
+        assert guid is not None
+        assert got and got[0].guid == "cev-1"
+    finally:
+        os.environ.pop("BRUCE_FAKE_IMSG_EVENTS", None)
+
+
+async def _collect(im, got):
+    async for ev in im.watch():
+        got.append(ev)

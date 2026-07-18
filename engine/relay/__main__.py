@@ -25,6 +25,8 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log request URLs (keep logs focused)
     cfg = RelayConfig.from_env()
     os.makedirs(os.path.dirname(cfg.checkpoint_path), exist_ok=True)
+    import os.path
+    sent_ledger_path = os.path.join(os.path.dirname(cfg.checkpoint_path), "outbound_sent.json")
     relay = Relay(
         imsg=SubprocessImsg(cfg.imsg_bin),
         backend=HttpBackend(cfg.base_url, cfg.secret),
@@ -32,6 +34,7 @@ def main() -> None:
         spool_dir=cfg.spool_dir,
         poll_interval=cfg.poll_interval,
         reconnect_delay=cfg.reconnect_delay,
+        sent_ledger=FileCheckpoint(sent_ledger_path),   # durable at-most-once outbound guard
     )
     logging.getLogger("bruce.relay").info("relay_start base=%s", cfg.base_url)
     try:
