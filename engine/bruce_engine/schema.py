@@ -448,6 +448,22 @@ class AccountLinkCode(Base, TSV):
     )
 
 
+class MessagingLinkAttempt(Base, TSV):
+    """Per-handle brute-force guard for account linking (private-alpha bridge). Keyed by the channel
+    identity, NOT a user — a handle that texts many wrong invite codes is locked out for a window,
+    independent of the per-code attempt cap. INFRASTRUCTURE (no user_id): worker-only RLS (migration
+    0010). Holds no message content — only a failure counter and a lockout timestamp."""
+
+    __tablename__ = "messaging_link_attempts"
+    id = _pk()
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    window_start: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    locked_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("channel", "channel_identity", name="uq_link_attempt_handle"),)
+
+
 class RelayDevice(Base, TSV):
     """A dedicated Mac relay's credential. INFRASTRUCTURE, not user-owned — the server stores only a
     HASH of the device secret (the secret is shown once at registration, held in the Mac Keychain).

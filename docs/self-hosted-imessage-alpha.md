@@ -161,6 +161,43 @@ These fakes stand in for real Messages and the real API. Green tests prove the c
 
 ---
 
+## 6.5 Account linking (private-alpha bridge — no app yet)
+
+The native app and Sign in with Apple aren't built, and there's no Apple Developer account yet, so
+there is **no in-app way to get a link code**. Until then, linking runs entirely through iMessage +
+an operator CLI. This is a **temporary bridge** and will be replaced by the native onboarding flow.
+
+**Flow**
+1. An **unlinked** handle texts Bruce → generic private-alpha prompt (no app/profile mentioned):
+   *"This is Bruce (private alpha). To connect this number, reply with the 6-character invite code the
+   Bruce team gave you. Codes expire quickly and are single-use."*
+2. The **operator** mints a one-time code for a user (out of band, DB access via the Cloud SQL proxy):
+   ```
+   BRUCE_APP_DATABASE_URL=... python -m scripts.create_link_code --label dhruv-alpha
+   # or an existing id:  --user <uuid>
+   ```
+   `--label` derives a **stable, reproducible** user_id (uuid5) and creates the user row if needed.
+   The plaintext code is printed **once**.
+3. The user texts that code to Bruce **from the target number** → the handle binds to that user.
+4. Any wrong/expired code → one **generic** reply (never reveals whether an account exists).
+
+**Safety properties** (enforced in `messaging_store` + migration 0010):
+- Codes are **short-lived** (10 min), **single-use** (`consumed_at`), and **stored hashed**
+  (sha256 of the normalized code — plaintext is never persisted).
+- **Per-code** attempt cap (`MAX_REDEEM_ATTEMPTS`) and a **per-handle brute-force lockout**
+  (`messaging_link_attempts`, worker-only RLS): 5 failed attempts in 15 min → the handle is locked
+  out for 15 min; a successful link clears the counter.
+- **No silent rebind**: a handle already bound to user A is never rebound by user B's code
+  (`conflict`) — prevents one number from hijacking another user.
+- **No account enumeration**: `invalid` / `expired` / `locked` / `conflict` all return the *same*
+  generic text; `rate_limited` returns a generic wait message.
+- Provisioning is an **operator action** — there is no public endpoint to mint a code without the app.
+
+**Not yet done:** migration `0010_link_attempts` and this code must be deployed to staging before the
+next live test (the current staging revision predates it).
+
+---
+
 ## 7. Dedicated-Mac dry-run (the verification gate)
 
 Live iMessage is **UNVERIFIED** until every scenario below is confirmed end-to-end on the dedicated

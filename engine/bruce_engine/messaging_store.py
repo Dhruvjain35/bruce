@@ -26,7 +26,10 @@ from . import schema
 from .db import user_session, worker_session
 from .messaging import LINK_CODE_TTL, ChannelKind, generate_link_code
 
-MAX_REDEEM_ATTEMPTS = 5
+MAX_REDEEM_ATTEMPTS = 5                                    # per-CODE reuse cap
+LINK_ATTEMPT_MAX = 5                                       # failed attempts per HANDLE before lockout
+LINK_ATTEMPT_WINDOW = datetime.timedelta(minutes=15)      # rolling window for the handle counter
+LINK_ATTEMPT_LOCKOUT = datetime.timedelta(minutes=15)     # how long a handle stays locked out
 
 
 def _hash(code: str) -> str:
@@ -36,12 +39,36 @@ def _hash(code: str) -> str:
 
 @dataclasses.dataclass
 class RedeemResult:
-    status: str  # "linked" | "invalid" | "locked" | "conflict"
+    status: str  # "linked" | "invalid" | "locked" | "conflict" | "rate_limited"
     user_id: UUID | None = None
     identity_id: UUID | None = None
 
 
-async def create_link_code(user_id: UUID, channel: ChannelKind = ChannelKind.linq,
+async def _attempt_row(s, channel: ChannelKind, identity: str):
+    return (await s.execute(
+        select(schema.MessagingLinkAttempt).where(
+            schema.MessagingLinkAttempt.channel == channel.value,
+            schema.MessagingLinkAttempt.channel_identity == identity)
+    )).scalar_one_or_none()
+
+
+async def _record_failure(s, att, channel: ChannelKind, identity: str, now: datetime.datetime) -> None:
+    """Increment the per-handle failure counter; lock the handle out once it crosses the threshold
+    inside the rolling window. A brute-forcer texting many wrong codes is stopped regardless of the
+    per-code cap."""
+    if att is None:
+        s.add(schema.MessagingLinkAttempt(
+            channel=channel.value, channel_identity=identity, failed_count=1, window_start=now))
+        return
+    if now - att.window_start > LINK_ATTEMPT_WINDOW:
+        att.failed_count, att.window_start, att.locked_until = 1, now, None   # window rolled over
+    else:
+        att.failed_count += 1
+        if att.failed_count >= LINK_ATTEMPT_MAX:
+            att.locked_until = now + LINK_ATTEMPT_LOCKOUT
+
+
+async def create_link_code(user_id: UUID, channel: ChannelKind = ChannelKind.self_hosted_imessage,
                            now: datetime.datetime | None = None) -> tuple[str, datetime.datetime]:
     """Generate a one-time code for an authenticated user. Returns the PLAINTEXT once (never stored)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
@@ -62,6 +89,10 @@ async def redeem_link_code(code: str, channel: ChannelKind, channel_identity: st
     now = now or datetime.datetime.now(datetime.timezone.utc)
     h = _hash(code)
     async with worker_session() as s:
+        att = await _attempt_row(s, channel, channel_identity)
+        if att is not None and att.locked_until is not None and att.locked_until > now:
+            return RedeemResult(status="rate_limited")   # handle is locked out — don't even look it up
+
         row = (await s.execute(
             select(schema.AccountLinkCode)
             .where(schema.AccountLinkCode.code_hash == h, schema.AccountLinkCode.channel == channel.value,
@@ -69,9 +100,11 @@ async def redeem_link_code(code: str, channel: ChannelKind, channel_identity: st
             .order_by(schema.AccountLinkCode.created_at.desc())
         )).scalars().first()
         if row is None or row.expires_at <= now:
+            await _record_failure(s, att, channel, channel_identity, now)
             return RedeemResult(status="invalid")
         row.attempts = (row.attempts or 0) + 1
         if row.attempts > MAX_REDEEM_ATTEMPTS:
+            await _record_failure(s, att, channel, channel_identity, now)
             return RedeemResult(status="locked")
 
         ident = (await s.execute(
@@ -85,13 +118,16 @@ async def redeem_link_code(code: str, channel: ChannelKind, channel_identity: st
             s.add(ident)
             await s.flush()
         elif ident.user_id is not None and ident.user_id != row.user_id:
-            # Already bound to a DIFFERENT user — never silently rebind.
+            # Already bound to a DIFFERENT user — never silently rebind (prevents number hijacking).
+            await _record_failure(s, att, channel, channel_identity, now)
             return RedeemResult(status="conflict")
         else:
             ident.user_id = row.user_id
             ident.disconnected_at = None  # re-link reactivates
         row.consumed_at = now
         row.bound_identity_id = ident.id
+        if att is not None:
+            await s.delete(att)          # success clears the handle's failure counter
         return RedeemResult(status="linked", user_id=row.user_id, identity_id=ident.id)
 
 

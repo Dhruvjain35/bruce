@@ -42,7 +42,7 @@ def _now():
 
 
 def _msg(*, mid="m1", text=None, attachments=None, frm=PHONE):
-    return InboundMessage(provider_message_id=mid, channel=ChannelKind.linq, channel_identity=frm,
+    return InboundMessage(provider_message_id=mid, channel=ChannelKind.self_hosted_imessage, channel_identity=frm,
                           text=text, attachments=attachments or [], timestamp=_now())
 
 
@@ -55,7 +55,7 @@ async def _ensure_user(uid):
 async def _link(uid, phone=PHONE):
     """Directly bind an identity to a user (the app-side link flow is tested in Phase 5)."""
     async with worker_session() as s:
-        s.add(schema.MessagingIdentity(user_id=uid, channel=ChannelKind.linq.value, channel_identity=phone))
+        s.add(schema.MessagingIdentity(user_id=uid, channel=ChannelKind.self_hosted_imessage.value, channel_identity=phone))
 
 
 async def _mission_count(uid):
@@ -84,6 +84,29 @@ def test_bad_code_is_rejected_without_linking(clean_db):
     ch = FakeChannel()
     out = asyncio.run(handle_inbound(ch, _msg(text="ZZZZZZ")))
     assert out.status == "bad_code" and out.user_id is None
+
+
+def test_private_alpha_copy_never_references_a_nonexistent_app():
+    """Requirement 1: the unlinked/bad-code copy must NOT reference an iPhone app or profile screen
+    that doesn't exist yet."""
+    from bruce_engine.messaging_inbound import LINK_PROMPT, BAD_CODE_TEXT, RATE_LIMITED_TEXT
+    for t in (LINK_PROMPT, BAD_CODE_TEXT, RATE_LIMITED_TEXT):
+        low = t.lower()
+        for banned in ("app", "profile", "open bruce", "download", "tap your"):
+            assert banned not in low, f"copy references '{banned}': {t!r}"
+    assert "alpha" in LINK_PROMPT.lower()          # explicitly a private-alpha bridge
+
+
+def test_rate_limited_handle_gets_generic_reply(clean_db):
+    """Requirement 5/2: a brute-forced handle gets a generic rate-limit reply, not account info."""
+    from bruce_engine.messaging_store import LINK_ATTEMPT_MAX
+    from bruce_engine.messaging_inbound import RATE_LIMITED_TEXT
+    ch = FakeChannel()
+    for i in range(LINK_ATTEMPT_MAX):
+        asyncio.run(handle_inbound(ch, _msg(mid=f"bf{i}", text=f"WRONG{i}")))
+    out = asyncio.run(handle_inbound(ch, _msg(mid="bf-final", text="ABCDEF")))
+    assert out.status == "rate_limited"
+    assert ch.sent[-1][1].text == RATE_LIMITED_TEXT
 
 
 def test_linked_flyer_becomes_a_durable_mission_with_ack_and_lineage(clean_db):
@@ -124,7 +147,7 @@ def test_blocked_identity_is_ignored(clean_db):
 
     async def _blocked():
         async with worker_session() as s:
-            s.add(schema.MessagingIdentity(user_id=uid, channel=ChannelKind.linq.value,
+            s.add(schema.MessagingIdentity(user_id=uid, channel=ChannelKind.self_hosted_imessage.value,
                                            channel_identity=PHONE, blocked_at=_now()))
     asyncio.run(_blocked())
     out = asyncio.run(handle_inbound(FakeChannel(), _msg(text="hello")))
