@@ -1,0 +1,242 @@
+# Bruce capability registry (v1). Machine-readable source of truth mapping the capability universe
+# (bruce_complete_capability_universe_voice_life_finance_v2.md) to real code + honest status.
+#
+# STATUS is honest and evidence-based. Nothing is `implemented`/`deployed`/`live_verified` merely
+# because an interface, schema, prompt, fake adapter, or test fixture exists.
+#   implemented    code + tests exist and pass, not necessarily deployed
+#   partial        some real behavior, known gaps
+#   mock_only      UI/interface/fixture only, no real behavior
+#   deployed       running in staging (may be flag-gated / not live-verified)
+#   live_verified  proven end-to-end against the real external system with a real user
+#   planned        designed / next, not built
+#   blocked        needs a decision/credential/approval before it can proceed
+#   partner_required  needs an external partner/agreement (e.g. Apple MfB, payment provider)
+#   unsupported    intentionally not built (policy / platform limit)
+#
+# Capabilities are grouped UNDER shared platform primitives (the universe's 36) to avoid fake breadth:
+# a primitive that unlocks ten real outcomes beats ten disconnected feature tickets.
+
+meta:
+  version: 1
+  source_universe: bruce_complete_capability_universe_voice_life_finance_v2.md
+  repo_commit_at_audit: 8bec4a5
+  staging_commit: 8bec4a5           # api + worker; migration head 0011; conversation flag OFF
+  note: >
+    live iMessage remains UNVERIFIED (dedicated-Mac dry-run pending); the conversation runtime is
+    deployed but flag-gated OFF; account linking is the only messaging capability live-verified.
+
+# --- P0: messaging-first conversation brain (Bite 1) — the built wave ---------------------------
+primitives:
+  universal_source_intake:
+    universe_primitive: 1
+    capabilities:
+      - id: CAP-MSG-001
+        name: Self-hosted iMessage relay transport
+        wave: 1
+        autonomy: A1
+        risk: medium
+        primitives: [universal_source_intake, evidence_provenance]
+        status: deployed
+        live_verified: false
+        evidence: engine/relay/*; docs/self-hosted-imessage-alpha.md; staging /v1/relay/*
+        gaps: live dry-run pending; imsg message.get absent (delayed-attachment re-fetch relies on 2nd watch push)
+        tests: engine/tests/test_relay_component.py, test_relay_attachments.py
+      - id: CAP-MSG-002
+        name: Multimodal attachment transport (image/PDF)
+        wave: 1
+        autonomy: A1
+        risk: medium
+        status: deployed
+        live_verified: false          # fake-verified; imsg {attachments:true} confirmed, field shapes not
+        evidence: engine/relay/imsg.py watch.subscribe{attachments:true}; relay.py delayed-resolve+hardening
+        tests: engine/tests/test_relay_attachments.py
+      - id: CAP-MSG-003
+        name: Account linking (invite code, HMAC-peppered)
+        wave: 1
+        autonomy: A2
+        risk: high
+        status: live_verified          # a real handle linked live in staging
+        evidence: engine/bruce_engine/messaging_store.py; scripts/create_link_code.py
+        tests: engine/tests/test_messaging_linking.py
+      - id: CAP-MSG-004
+        name: Durable async intake (202 + Cloud Tasks worker)
+        wave: 1
+        autonomy: A2
+        risk: medium
+        status: deployed
+        evidence: engine/bruce_engine/intake_store.py, worker_api.py, task_dispatch.py
+        tests: engine/tests/test_async_intake_pg.py
+
+  conversation_reasoning_router:
+    universe_primitive: 29
+    capabilities:
+      - id: CAP-CONV-001
+        name: General-purpose conversation + reasoning router
+        wave: 1
+        autonomy: A1
+        risk: medium
+        primitives: [conversation_reasoning_router, conversation_style_engine, evidence_provenance]
+        status: deployed              # merged + on staging, flag OFF
+        live_verified: false
+        evidence: engine/bruce_engine/conversation_runtime.py (flag BRUCE_CONVERSATION_RUNTIME, default off)
+        tests: engine/tests/test_conversation_runtime.py; staging LEVEL A + LEVEL B (real gpt-5.4-mini)
+        gaps: 1:1 only; no autonomous missions; no follow-up push (deferred)
+      - id: CAP-CONV-002
+        name: Provider-neutral multimodal reasoner (one vision pass, typed 13-field decision)
+        wave: 1
+        autonomy: A0
+        risk: medium
+        status: deployed
+        live_verified: false
+        evidence: engine/bruce_engine/conversation_model.py, conversation_contract.py; llm.py MODEL_CONVERSATION
+        tests: staging LEVEL B (real model, worksheet/event/casual/unreadable/timeout)
+      - id: CAP-CONV-003
+        name: Immediate educational / tutoring path (hint / walkthrough / answer-check, no auto-complete)
+        wave: 4
+        autonomy: A1
+        risk: low
+        status: deployed
+        live_verified: false
+        evidence: conversation_runtime.py branches; academic boundary in the reasoner system prompt
+        tests: LEVEL B worksheet -> tutoring (real model), test_conversation_runtime tutoring case
+      - id: CAP-CONV-004
+        name: Event-image -> structured EventCandidate (persist + provenance, calendar honestly deferred)
+        wave: 2
+        autonomy: A1
+        risk: low
+        status: deployed
+        live_verified: false
+        evidence: conversation_runtime._is_event/_event_fields; schema.EventCandidate; event_saved_calendar_unavailable template
+        tests: test_event_detected_by_entities_not_capability_string; LEVEL B event (real model)
+        note: NEVER claims "added to your calendar" — a fact-locked template + guard prove it
+      - id: CAP-CONV-005
+        name: Model + attachment failure recovery (timeout/invalid-JSON/unreadable -> honest resend)
+        wave: 1
+        autonomy: A0
+        risk: low
+        status: deployed
+        evidence: conversation_model retry+timeout; runtime fallback; could_not_read_attachment template
+        tests: LEVEL B timeout + unreadable (real model, no hallucination)
+
+  conversation_style_engine:
+    universe_primitive: 26
+    capabilities:
+      - id: CAP-VOICE-001
+        name: Bruce Voice OS (mirroring, serious-context, prohibited-phrase strip)
+        wave: 6
+        autonomy: A0
+        risk: low
+        status: deployed
+        evidence: engine/bruce_engine/conversation_style.py; product/voice_profiles.yaml, message_templates.yaml
+        tests: engine/tests/test_conversation_style.py
+      - id: CAP-VOICE-002
+        name: Fact-preservation guard (styling may never alter a date/price/@handle/url/email)
+        wave: 6
+        autonomy: A0
+        risk: high
+        status: implemented
+        evidence: conversation_style.assert_facts_preserved (raises StyleViolation)
+        tests: test_conversation_style fact-preservation cases
+
+  durable_mission_engine:
+    universe_primitive: 5
+    capabilities:
+      - id: CAP-MISSION-001
+        name: Durable mission engine (states, phases, at-most-once outbound, restart recovery)
+        wave: 1
+        autonomy: A2
+        risk: medium
+        status: deployed
+        live_verified: partial          # at-most-once proven live during the 30s-resend incident fix
+        evidence: schema.Mission/mission_phase_events; messaging_outbound lease + sent-ledger
+        tests: test_no_false_completion, test_relay_component (outbound), test_async_intake_pg
+
+  evidence_provenance:
+    universe_primitive: 10
+    capabilities:
+      - id: CAP-EVID-001
+        name: Source + span provenance for extracted items
+        wave: 1
+        autonomy: A0
+        risk: low
+        status: deployed
+        evidence: schema.sources/source_spans; EventCandidate.provenance
+        tests: test_intake_persistence
+
+  permission_privacy_controls:
+    universe_primitive: 25
+    capabilities:
+      - id: CAP-PRIV-001
+        name: Postgres FORCE-RLS tenant isolation (all user tables incl. brain tables)
+        wave: 1
+        autonomy: A0
+        risk: high
+        status: deployed
+        live_verified: true             # two-user denial proven on the deployed staging DB
+        evidence: migrations 0002/0011; test_postgres_integration test_05/05b/08
+      - id: CAP-PRIV-002
+        name: Content-free relay + brain logs (ids/statuses only, never text/paths)
+        wave: 1
+        autonomy: A0
+        risk: medium
+        status: deployed
+        evidence: engine/relay/relay.py; conversation_runtime logging
+        tests: test_relay_attachments content-free-logs
+
+# --- P1: student command center (planned) ------------------------------------------------------
+  school_connector_framework:
+    universe_primitive: 2
+    capabilities:
+      - {id: CAP-SCH-001, name: Provider-neutral SchoolConnector protocol + capability matrix, wave: 1, status: planned, autonomy: A0, risk: medium}
+      - {id: CAP-SCH-002, name: Connector access ladder (OAuth/LTI/OneRoster/export/browser/screenshot/unsupported), wave: 1, status: planned, autonomy: A0, risk: medium}
+  canonical_academic_graph:
+    universe_primitive: 3
+    capabilities:
+      - {id: CAP-ACG-001, name: Canonical courses/assignments/submissions/grades graph + sync cursors, wave: 1, status: planned, autonomy: A0, risk: medium}
+  change_detection_engine:
+    universe_primitive: 4
+    capabilities:
+      - {id: CAP-CHG-001, name: Change-detection (new/updated/removed) with original-object links, wave: 1, status: planned, autonomy: A1, risk: medium}
+  canvas_adapter:
+    universe_primitive: 2
+    capabilities:
+      - {id: CAP-CANVAS-001, name: Canvas read/sync (courses, due buckets, announcements, grades where authorized), wave: 1, status: planned, autonomy: A1, risk: medium, blocked_on: founder Canvas OAuth credentials}
+      - {id: CAP-Q-DUE, name: "'What do I have due?'", wave: 1, status: planned, autonomy: A1, risk: low, primitives: [canonical_academic_graph]}
+      - {id: CAP-Q-CHANGED, name: "'What changed at school?'", wave: 1, status: planned, autonomy: A1, risk: low, primitives: [change_detection_engine]}
+      - {id: CAP-Q-MISSING, name: "'What am I missing?'", wave: 1, status: planned, autonomy: A1, risk: low}
+
+# --- P2: work + communication (planned) --------------------------------------------------------
+  grades_feedback:
+    universe_primitive: 3
+    capabilities:
+      - {id: CAP-GRD-001, name: Grades + feedback + academic-risk intelligence, wave: 2, status: planned, autonomy: A1, risk: medium}
+  communication_adapters:
+    universe_primitive: 12
+    capabilities:
+      - {id: CAP-EMAIL-001, name: Gmail/Outlook ingestion -> mission, wave: 2, status: planned, autonomy: A2, risk: high, permissions: read-first, no send at connect}
+      - {id: CAP-EMAIL-002, name: Draft/send/verify under user rules (approval-gated), wave: 2, status: planned, autonomy: A3, risk: high}
+  calendar_execution:
+    universe_primitive: 34
+    capabilities:
+      - {id: CAP-CAL-001, name: Real Calendar write (create/verify event from an EventCandidate), wave: 2, status: planned, autonomy: A2, risk: medium, note: Bite-1 only captures candidates + says not connected}
+  approval_verification:
+    universe_primitive: 7
+    capabilities:
+      - {id: CAP-APPROVE-001, name: Exact approval before consequential actions, wave: 2, status: planned, autonomy: A0, risk: high, note: approvals table exists; runtime does not yet drive it}
+      - {id: CAP-VERIFY-001, name: External verification adapters (confirm the action actually happened), wave: 2, status: planned, autonomy: A0, risk: high}
+  notification_policy:
+    universe_primitive: 20
+    capabilities:
+      - {id: CAP-NOTIFY-001, name: Durable follow-up notifications (proactive push when a mission needs review), wave: 2, status: planned, autonomy: A1, risk: medium, note: Bite-1 never promises a follow-up (no notifier yet)}
+
+# --- longer horizon (planned / partner-required / unsupported) ----------------------------------
+  later:
+    capabilities:
+      - {id: CAP-TUTOR-VISUAL, name: Interactive visual lesson engine (primitive 28), wave: 4, status: planned, autonomy: A1, risk: low}
+      - {id: CAP-OPP-001, name: Opportunity ingestion + ranking + grounded cold outreach, wave: 3, status: partial, autonomy: A2, risk: high, evidence: engine discovery/drafting exist from the research wedge; not wired to messaging}
+      - {id: CAP-FORMS-001, name: Trusted-domain form/registration browser automation (primitive 11), wave: 5, status: planned, autonomy: A3, risk: high}
+      - {id: CAP-TRAVEL-001, name: Travel search/itinerary/booking adapters (primitive 32), wave: 7, status: planned, autonomy: A2, risk: high}
+      - {id: CAP-PAY-001, name: Payment authorization envelope + spend policy (primitives 30/31/36), wave: 8, status: planned, autonomy: A3, risk: critical, note: minors require guardian/account-owner authorization; provider-tokenized only}
+      - {id: CAP-MFB-001, name: Apple Messages for Business verified channel, wave: 9, status: partner_required, autonomy: A1, risk: medium}
+      - {id: CAP-LTI-001, name: LTI 1.3 / OneRoster institutional integration, wave: 9, status: partner_required, autonomy: A1, risk: medium}
+      - {id: CAP-UNSUPPORTED, name: Illegal/age-restricted/gambling/weapon/policy-bypass purchases, status: unsupported}
