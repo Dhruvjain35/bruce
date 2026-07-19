@@ -18,6 +18,8 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
+import hmac
+import os
 from uuid import UUID
 
 from sqlalchemy import select
@@ -32,9 +34,21 @@ LINK_ATTEMPT_WINDOW = datetime.timedelta(minutes=15)      # rolling window for t
 LINK_ATTEMPT_LOCKOUT = datetime.timedelta(minutes=15)     # how long a handle stays locked out
 
 
+def _pepper() -> bytes:
+    """The server-side link-code pepper — held ONLY in Secret Manager / env, NEVER in the database.
+    Required: we fail closed rather than fall back to an unpeppered digest."""
+    p = os.environ.get("BRUCE_LINK_CODE_PEPPER")
+    if not p:
+        raise RuntimeError("BRUCE_LINK_CODE_PEPPER is not set — required to hash link codes")
+    return p.encode()
+
+
 def _hash(code: str) -> str:
-    # Normalize (upper, strip) so a texted code matches regardless of casing/whitespace, then hash.
-    return hashlib.sha256(code.strip().upper().encode()).hexdigest()
+    # HMAC-SHA256 with a server-side pepper. A 6-char code has too little entropy for plain SHA-256 to
+    # resist offline brute-force if the DB leaks; the pepper (not stored in the DB) makes the digest
+    # uninvertible unless the attacker ALSO steals the secret from Secret Manager. Normalize first so a
+    # texted code matches regardless of casing/whitespace.
+    return hmac.new(_pepper(), code.strip().upper().encode(), hashlib.sha256).hexdigest()
 
 
 @dataclasses.dataclass
@@ -99,7 +113,8 @@ async def redeem_link_code(code: str, channel: ChannelKind, channel_identity: st
                    schema.AccountLinkCode.consumed_at.is_(None))
             .order_by(schema.AccountLinkCode.created_at.desc())
         )).scalars().first()
-        if row is None or row.expires_at <= now:
+        # Constant-time re-verification of the digest (defense in depth; matches relay_auth).
+        if row is None or not hmac.compare_digest(row.code_hash, h) or row.expires_at <= now:
             await _record_failure(s, att, channel, channel_identity, now)
             return RedeemResult(status="invalid")
         row.attempts = (row.attempts or 0) + 1

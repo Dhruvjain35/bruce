@@ -25,6 +25,9 @@ from sqlalchemy.engine import make_url
 ENGINE = Path(__file__).resolve().parents[1]
 load_dotenv(ENGINE / ".env")
 
+# Link codes are HMAC-peppered; tests need a (non-secret) pepper if .env didn't provide one.
+os.environ.setdefault("BRUCE_LINK_CODE_PEPPER", "test-link-code-pepper-not-a-real-secret")
+
 TEST_DB = "bruce_test"
 _USER_TABLES = (
     "users sources source_spans opportunities tasks calendar_proposals briefs missions "
