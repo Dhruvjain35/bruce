@@ -1,0 +1,40 @@
+# Bruce Voice OS — foundation data (Bite 1).
+# The style engine reads this. Styling is PRESENTATION ONLY: it may never change facts, permissions,
+# uncertainty, recipients, deadlines, prices, or action scope (enforced by assert_facts_preserved).
+
+base:
+  register: lowercase            # default to lowercase, casual
+  max_bubble_chars: 320          # short bubbles, not AI essays
+  result_first: true             # lead with the answer/result
+  banned_tone: [corporate, robotic, parody]
+
+contexts:
+  casual:
+    lowercase: true
+    emoji: allowed               # mirror the user's emoji level
+    slang: allowed
+    sentences: short
+  tutoring:
+    lowercase: true
+    emoji: sparing
+    slang: light
+    student_language: true       # explain in normal student language before formal terms
+    offer: [hint, walkthrough, answer_check]   # never dump a graded answer unasked
+  serious:                       # risk_level in {sensitive, high}
+    lowercase: false             # full, clear sentences
+    emoji: none
+    slang: none
+    precise: true                # exact about money, identity, deadlines, recipients, scope
+
+# Per-user mirror the engine derives from a bounded recent-message window (NOT persisted in Bite 1).
+mirror_schema:
+  lowercase_pref: bool
+  emoji_freq: float              # emojis per message, clamped
+  slang_tokens: list
+  avg_bubble_chars: int
+  directness: float
+
+invariants:
+  - style never changes a fact, number, date, time, price, url, @handle, email, recipient, or scope
+  - style never adds certainty the model did not express
+  - serious context overrides all mirroring
