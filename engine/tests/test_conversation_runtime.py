@@ -142,6 +142,24 @@ def test_event_add_to_calendar_persists_candidate_never_claims_added(clean_db):
     assert ec.provenance and ec.provenance.get("inbound_provider_message_id") == "ev1"   # grounded
 
 
+def test_event_detected_by_entities_not_capability_string(clean_db):
+    """Regression (found in LEVEL B staging): the real model phrases the capability freely
+    ('calendar integration'/'calendar creation'), so the event branch must fire on title+date
+    entities — NOT an exact 'calendar_write' id — and still persist the candidate + honest template."""
+    uid = uuid4(); _run(_ensure_user(uid))
+    d = _decision(IntentKind.unsupported, ResponseType.refusal, text="here's what i can read",
+                  caps=["calendar integration"],   # NOT the exact 'calendar_write' id
+                  entities=[ExtractedEntity(type="title", value="Club Fair", source_span="Club Fair"),
+                            ExtractedEntity(type="date", value="Fri Sep 12", normalized="2026-09-12", source_span="Fri Sep 12")])
+    out = _run(conversation_runtime.handle(FakeChannel(), _msg("ev2", text="add this to my calendar"),
+                                           user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(d)))
+    assert out.status == "processed"
+    ec, ij, at = _run(_counts(uid))
+    assert ec == 1                                       # candidate persisted despite free-form cap string
+    ob = _run(_outbound(uid))
+    assert "added to your calendar" not in ob[0].text.lower() and "club fair" in ob[0].text.lower()
+
+
 def test_casual_reply(clean_db):
     uid = uuid4(); _run(_ensure_user(uid))
     d = _decision(IntentKind.casual, ResponseType.direct_answer, text="not much, what's good")
