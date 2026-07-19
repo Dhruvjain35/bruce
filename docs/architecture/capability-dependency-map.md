@@ -24,12 +24,14 @@ graph TD
   RLS --- RUNTIME
   RLS --- MISSION
 
+  %% P1 school core — built (offline, fake Canvas adapter) — solid
+  SCH[2 SchoolConnector framework<br/>protocol + capability matrix]:::done
+  ACG[3 Canonical academic graph<br/>+ sync cursors, RLS]:::done
+  CHG[4 Change-detection engine<br/>created/updated/deleted]:::done
+  QUERIES["What's due / changed / missing / next"]:::done
+
   %% planned — dashed
-  SCH[2 SchoolConnector framework]:::plan
-  ACG[3 Canonical academic graph]:::plan
-  CHG[4 Change-detection engine]:::plan
-  CANVAS[Canvas adapter]:::plan
-  QUERIES["What's due / changed / missing"]:::plan
+  CANVAS[Canvas adapter<br/>FAKE only — real OAuth blocked]:::plan
   DECIDE[7 Decision + approval engine]:::plan
   VERIFY[14 External verification]:::plan
   COMMS[12 Communication adapters<br/>Gmail/Outlook]:::plan
@@ -62,9 +64,10 @@ graph TD
 ## Reading it
 - **Everything routes through the conversation runtime (29)** — it's the single entry point the
   built primitives feed and the planned ones will hang off of.
-- **Highest-leverage next node = SchoolConnector (2) → academic graph (3) → Canvas + change detection
-  (4)**, which unlocks the three north-star queries and later grades/briefs. Build the primitive, not
-  the leaf features.
+- **SchoolConnector (2) → academic graph (3) → change detection (4) → the north-star queries are now
+  BUILT** (provider-neutral, RLS-isolated, migration 0012), validated end-to-end against a FAKE Canvas
+  adapter. The real Canvas leaf stays dashed: it needs founder OAuth credentials + an institution to read
+  against. We built the primitive, not the leaf — a real adapter drops in behind the same Protocol.
 - **The decision + approval engine (7) + external verification (14)** are the safety spine every
   consequential action (email send, calendar write, browser action, payment) must pass through. They
   are prerequisites for anything with `risk: high/critical`.
