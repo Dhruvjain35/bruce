@@ -1,0 +1,26 @@
+# Fact-locked message fragments (Bite 1). Safety-critical copy is NEVER model-freeformed — the style
+# engine emits these verbatim with slot interpolation only, so a styling pass can't alter the facts.
+# {slots} are the ONLY interpolation points.
+
+event_saved_calendar_unavailable: |
+  got it — saved this event:
+  {title}
+  {when}{where}
+  heads up: i can't add it to your calendar yet (not connected). i've kept it so you don't have to resend.
+
+could_not_read_attachment: |
+  couldn't read that one 😕 can you resend it? (a clearer photo or the file works)
+
+unsupported_capability: |
+  can't do {capability} yet — that's not wired up on my end. i can still {alternative}.
+
+tutoring_offer: |
+  looks like {topic}. want a hint, a full walkthrough, or should i just check your answers?
+
+needs_clarification_wrapper: |
+  {question}
+
+# Used when a durable mission actually starts. NEVER promises an unsolicited follow-up/push (no
+# notifier exists in Bite 1) — it states what's happening, nothing more.
+mission_started_no_push: |
+  on it — {what}. i'll have it ready next time you check in.
