@@ -68,8 +68,21 @@ def _event_fields(decision: ConversationDecision) -> tuple[str, str, str, dict]:
     return title, when, where, {"entities": spans}
 
 
-def _wants_deferred_calendar(decision: ConversationDecision) -> bool:
-    return "calendar_write" in [c.lower() for c in decision.required_capabilities]
+def _is_event(decision: ConversationDecision) -> bool:
+    """An event = a title-like AND a date-like entity. Robust to model phrasing (do NOT rely on an
+    exact capability id — the real model says 'calendar creation', 'add to calendar', etc.)."""
+    types = [(e.type or "").lower() for e in decision.extracted_entities]
+    has_title = any(("title" in t) or ("event" in t) or ("name" in t) for t in types)
+    has_date = any(("date" in t) or ("time" in t) or ("day" in t) for t in types)
+    return has_title and has_date
+
+
+def _wants_calendar(decision: ConversationDecision, msg_text: str | None) -> bool:
+    if decision.intent is IntentKind.actionable:
+        return True
+    if any("calendar" in c.lower() for c in decision.required_capabilities):
+        return True
+    return "calendar" in (msg_text or "").lower()
 
 
 class _Runtime:
@@ -113,23 +126,26 @@ class _Runtime:
         decision = rr.decision
         event_candidate_id: UUID | None = None
 
-        if _wants_deferred_calendar(decision) and decision.extracted_entities:
-            # event ask, calendar not wired: PERSIST the candidate + honest template. NEVER "added".
+        if _is_event(decision):
+            # An event was extracted: PERSIST the candidate with provenance (a durable, useful artifact
+            # regardless of exact model phrasing). If the user wanted it on a calendar, reply with the
+            # fact-locked "can't add yet" template — NEVER claim it was added.
             title, when, where, provenance = _event_fields(decision)
             event_candidate_id = await conversation_store.persist_event_candidate(
                 user_id, title=title,
                 idempotency_key=f"ec:{ch}:{pmid}",
                 confidence=decision.confidence,
-                missing_fields=[e for e in ("date",) if not when] or None,
+                missing_fields=[f for f in ("date",) if not when] or None,
                 provenance={**provenance, "inbound_provider_message_id": pmid})
-            reply = self.style.template("event_saved_calendar_unavailable", title=title,
-                                        when=when, where=where)
-        elif decision.intent is IntentKind.unsupported or (
-                decision.needs_mission and not _wants_deferred_calendar(decision)):
-            # unsupported / would-need-a-mission: honest, no false "on it", no autonomous mission.
-            reply = self.style.render(decision.user_visible_response, risk_level=decision.risk_level,
-                                      profile=profile)
+            if _wants_calendar(decision, msg.text):
+                reply = self.style.template("event_saved_calendar_unavailable", title=title,
+                                            when=when, where=where)
+            else:
+                reply = self.style.render(decision.user_visible_response,
+                                          risk_level=decision.risk_level, profile=profile)
         else:
+            # everything else (casual, tutoring, extraction, unsupported): the model's honest reply,
+            # styled. No autonomous mission is ever created from the model in Bite 1.
             reply = self.style.render(decision.user_visible_response, risk_level=decision.risk_level,
                                       profile=profile)
 
