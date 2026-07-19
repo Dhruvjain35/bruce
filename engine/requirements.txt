@@ -12,6 +12,8 @@ sqlalchemy[asyncio]>=2.0  # ORM + async engine for Postgres persistence
 asyncpg>=0.29          # async PostgreSQL driver
 alembic>=1.13          # schema migrations (upgrade-from-empty + downgrade)
 pyjwt[crypto]>=2.9     # verify IdP (Supabase/Apple) JWTs at the auth boundary
+pillow>=11.1           # attachment normalization: decode/re-encode student photos + screenshots
+pillow-heif>=1.0       # decode iPhone HEIC/HEIF (vision models reject HEIC) -> converted to JPEG
 
 # dev
 pytest>=8.0
