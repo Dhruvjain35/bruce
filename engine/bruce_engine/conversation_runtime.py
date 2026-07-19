@@ -9,7 +9,6 @@ never promises an unsolicited follow-up (deferred). Never claims an action happe
 from __future__ import annotations
 
 import logging
-import os
 from uuid import UUID
 
 from . import conversation_store, messaging_outbound
@@ -25,12 +24,13 @@ log = logging.getLogger("bruce.conversation")   # content-free: ids/intents/stat
 _FALLBACK = "ngl something glitched on my end 😅 mind sending that again?"
 
 
-def enabled_for(handle: str) -> bool:
-    """Master flag ON *and* the handle explicitly allow-listed. Empty list => no one (fail closed)."""
-    if os.environ.get("BRUCE_CONVERSATION_RUNTIME", "").strip().lower() not in {"1", "true", "yes", "on"}:
-        return False
-    allow = {h.strip() for h in os.environ.get("BRUCE_CONVERSATION_TEST_HANDLES", "").split(",") if h.strip()}
-    return handle in allow
+async def enabled_for(user_id: UUID, capability: str = "conversation") -> bool:
+    """Whether this LINKED user may use the conversation runtime — decided by the DB access gate, not an
+    env allow-list. Fail-closed: any error inside the gate resolves to DENY. Per-user access comes from a
+    ProductionAccountEntitlement (persistent) or a live StagingTestEnrollment (temporary); a global kill
+    or an explicit BRUCE_CONVERSATION_RUNTIME hard-off overrides to DENY. See access_control."""
+    from . import access_control
+    return (await access_control.conversation_access(user_id, capability)).allow
 
 
 def _prepare_images(msg: InboundMessage) -> tuple[list[VisionInput], int]:

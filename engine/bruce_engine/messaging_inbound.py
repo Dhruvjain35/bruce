@@ -110,12 +110,13 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
                     dedup_key=f"prompt:{msg.provider_message_id}")
         return InboundOutcome(status="unlinked_prompt")
 
-    # 2b. CONVERSATION RUNTIME (Bite 1) — flag-gated, 1:1 staging test handles only. A LINKED inbound
-    # goes to the multimodal conversation brain instead of the legacy intake + hard-coded ACK. Gate on
-    # the SENDER identity (reply_target is the chat guid in groups); the runtime also refuses groups.
-    # When the flag is off / the handle isn't allow-listed, fall through to the unchanged legacy path.
+    # 2b. CONVERSATION RUNTIME (Bite 1) — DB-gated per user (Bite 1.5 keystone). A LINKED inbound goes to
+    # the multimodal conversation brain instead of the legacy intake + hard-coded ACK, but only if the DB
+    # access gate allows THIS user (an active production entitlement or a live staging enrollment, unless a
+    # global kill / hard-off overrides). The gate is by user_id, not a fragile handle allow-list; the
+    # runtime also refuses groups. When access is denied, fall through to the unchanged legacy path.
     from . import conversation_runtime  # local import: breaks the runtime<->inbound circular import
-    if not msg.is_group and conversation_runtime.enabled_for(msg.channel_identity):
+    if not msg.is_group and await conversation_runtime.enabled_for(user_id):
         return await conversation_runtime.handle(channel, msg, user_id=user_id, reply_target=reply_target)
 
     # 3. Idempotency: has this exact provider message already been handled?
