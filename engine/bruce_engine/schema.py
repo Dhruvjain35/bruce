@@ -555,6 +555,56 @@ class IntakeJob(Base, TSV):
     )
 
 
+class EventCandidate(Base, TSV):
+    """A structured event extracted from a message, captured for REVIEW (Bite 1 conversation brain).
+
+    Bruce persists this and honestly tells the user calendar isn't wired yet — it NEVER claims the
+    event was added (status stays 'proposed'). provenance holds the verbatim source span + inbound
+    message id so the extraction is grounded and auditable. Tenant-isolated."""
+
+    __tablename__ = "event_candidates"
+    id = _pk()
+    user_id = _owner()
+    source_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sources.id", ondelete="SET NULL"), nullable=True)
+    inbound_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("inbound_messages.id", ondelete="SET NULL"), nullable=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    starts_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ends_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    all_day: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    location: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    missing_fields: Mapped[dict | None] = mapped_column(JSONB, nullable=True)   # e.g. ["end_time"]
+    provenance: Mapped[dict | None] = mapped_column(JSONB, nullable=True)       # {"span":..., "inbound_message_id":...}
+    status: Mapped[str] = mapped_column(String(24), nullable=False, server_default="proposed")
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    __table_args__ = (UniqueConstraint("user_id", "idempotency_key", name="uq_event_candidate_idem"),)
+
+
+class ConversationTurn(Base, TSV):
+    """One turn of a LINKED user's iMessage conversation with Bruce (Bite 1 runtime).
+
+    role='user' or 'assistant'. The assistant turn stores the VALIDATED 13-field ConversationDecision
+    as JSONB — and NOTHING else: no chain-of-thought / scratchpad is ever persisted. Holds the most
+    sensitive student free-text, so it is tenant-isolated and cascades on account delete."""
+
+    __tablename__ = "conversation_turns"
+    id = _pk()
+    user_id = _owner()
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    channel_identity: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)               # user | assistant
+    intent: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    response_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)               # user text OR styled reply
+    decision: Mapped[dict | None] = mapped_column(JSONB, nullable=True)         # 13-field contract (assistant only)
+    risk_level: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mission_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("missions.id", ondelete="SET NULL"), nullable=True)
+    event_candidate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("event_candidates.id", ondelete="SET NULL"), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "channel", "provider_message_id", "role", name="uq_turn_msg_role"),)
+
+
 # user-owned tables that get row-level security (users handled separately: a user sees only self)
 RLS_TABLES: tuple[str, ...] = (
     "sources",
@@ -568,4 +618,6 @@ RLS_TABLES: tuple[str, ...] = (
     "approvals",
     "receipts",
     "model_costs",
+    "event_candidates",       # added 0011 — conversation brain (most sensitive student free-text)
+    "conversation_turns",     # added 0011
 )

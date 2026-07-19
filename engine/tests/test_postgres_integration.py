@@ -69,6 +69,10 @@ _RLS_TABLES = [
     # single-use PKCE verifiers — a new table that quietly missed RLS would be the worst possible
     # place for the gap, so they are covered by the same all-tables guarantee as everything else.
     "integrations", "oauth_states",
+    # Added 0011. conversation_turns + event_candidates hold the MOST sensitive student free-text —
+    # exactly where a silently-missed RLS policy would do the most damage. test_08 covers the flags;
+    # test_11_* below proves a second user actually cannot read/write them.
+    "conversation_turns", "event_candidates",
 ]
 
 
@@ -216,6 +220,50 @@ def test_05_cross_user_read_insert_update_delete_fk_all_fail(clean_db):
         # A's row survived every attempt, untouched
         still = await missions.get_for_user(m_a.id, a)
         assert still is not None and still.short_status != "hacked"
+
+    asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- 5b (0011 brain tables)
+
+
+def test_05b_conversation_tables_isolated_across_users(clean_db):
+    """conversation_turns + event_candidates hold the MOST sensitive student free-text. Prove a second
+    user cannot READ, UPDATE, DELETE, or cross-INSERT them — not merely that the RLS flags are on."""
+    import uuid as _uuid
+
+    async def run():
+        a, b = uuid4(), uuid4()
+        await users_repo.ensure(a)
+        await users_repo.ensure(b)
+        turn_id, ec_id = _uuid.uuid4(), _uuid.uuid4()
+
+        async with user_session(a) as s:   # A writes private rows under its own RLS context
+            await s.execute(schema.EventCandidate.__table__.insert().values(
+                id=ec_id, user_id=a, title="a private event", idempotency_key="ec-a"))
+            await s.execute(schema.ConversationTurn.__table__.insert().values(
+                id=turn_id, user_id=a, channel="self_hosted_imessage", channel_identity="+1a",
+                provider_message_id="pm-a", role="user", text="a private note"))
+
+        async with user_session(b) as s:   # cross-READ: B sees zero rows
+            assert (await s.execute(schema.ConversationTurn.__table__.select())).all() == []
+            assert (await s.execute(schema.EventCandidate.__table__.select())).all() == []
+
+        async with user_session(b) as s:   # cross-UPDATE / cross-DELETE: 0 rows
+            assert (await s.execute(update(schema.ConversationTurn).where(
+                schema.ConversationTurn.id == turn_id).values(text="hacked"))).rowcount == 0
+            assert (await s.execute(delete(schema.EventCandidate).where(
+                schema.EventCandidate.id == ec_id))).rowcount == 0
+
+        with pytest.raises(Exception):     # cross-INSERT: WITH CHECK rejects a row owned by A
+            async with user_session(b) as s:
+                await s.execute(schema.ConversationTurn.__table__.insert().values(
+                    user_id=a, channel="c", channel_identity="+1a", provider_message_id="pm-x", role="user"))
+
+        async with user_session(a) as s:   # A's rows survived untouched
+            rows = (await s.execute(schema.ConversationTurn.__table__.select().where(
+                schema.ConversationTurn.id == turn_id))).all()
+            assert len(rows) == 1 and rows[0].text == "a private note"
 
     asyncio.run(run())
 
