@@ -182,8 +182,11 @@ an operator CLI. This is a **temporary bridge** and will be replaced by the nati
 4. Any wrong/expired code → one **generic** reply (never reveals whether an account exists).
 
 **Safety properties** (enforced in `messaging_store` + migration 0010):
-- Codes are **short-lived** (10 min), **single-use** (`consumed_at`), and **stored hashed**
-  (sha256 of the normalized code — plaintext is never persisted).
+- Codes are **short-lived** (10 min), **single-use** (`consumed_at`), and **stored as an HMAC-SHA256
+  digest** keyed by a server-side **pepper** (`BRUCE_LINK_CODE_PEPPER`, held only in Secret Manager —
+  never in the DB). A 6-char code is too low-entropy for a plain hash to resist offline brute-force if
+  the DB leaks; the pepper makes the stored digest uninvertible unless the secret is *also* stolen.
+  Redemption re-verifies with a constant-time compare.
 - **Per-code** attempt cap (`MAX_REDEEM_ATTEMPTS`) and a **per-handle brute-force lockout**
   (`messaging_link_attempts`, worker-only RLS): 5 failed attempts in 15 min → the handle is locked
   out for 15 min; a successful link clears the counter.

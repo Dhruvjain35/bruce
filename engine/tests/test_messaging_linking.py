@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import hashlib
+import hmac
 import os
 import time
 from uuid import UUID, uuid4
@@ -64,7 +65,10 @@ def test_link_code_is_hashed_at_rest(clean_db):
             return (await s.execute(select(schema.AccountLinkCode).where(schema.AccountLinkCode.user_id == uid))).scalar_one()
     row = asyncio.run(_row())
     assert row.code_hash != code                                   # plaintext never stored
-    assert row.code_hash == hashlib.sha256(code.upper().encode()).hexdigest()
+    # HMAC-peppered, NOT a plain sha256 (an attacker with the DB but not the pepper can't invert it).
+    assert row.code_hash != hashlib.sha256(code.upper().encode()).hexdigest()
+    pepper = os.environ["BRUCE_LINK_CODE_PEPPER"].encode()
+    assert row.code_hash == hmac.new(pepper, code.upper().encode(), hashlib.sha256).hexdigest()
 
 
 def test_redeem_binds_identity_to_the_code_owner(clean_db):
