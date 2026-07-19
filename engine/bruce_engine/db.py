@@ -54,6 +54,38 @@ async def user_session(user_id: UUID) -> AsyncIterator[AsyncSession]:
 
 
 @asynccontextmanager
+async def admin_session() -> AsyncIterator[AsyncSession]:
+    """Session for OPERATOR capability management (grant/enroll/revoke/kill + audit) ONLY.
+
+    Sets the transaction-local ``app.admin='on'`` flag, which the capability-access RLS policies
+    (migration 0013) admit for writing the admin-write / worker-read state tables and appending to the
+    audit log. Like ``worker_session``, this is set ONLY in operator/server code — NEVER in a request
+    handler, NEVER from user input.
+
+    An admin context can never coexist with a tenant context, so this ASSERTS ``app.user_id`` is unset
+    on the connection before enabling admin; if a tenant context is present (e.g. this was reached from
+    a user/request handler on a connection that carries app.user_id), it refuses rather than granting a
+    tenant an admin-scoped write path.
+    """
+    get_engine()
+    assert _sessionmaker is not None
+    async with _sessionmaker() as session:
+        current = (await session.execute(
+            text("SELECT current_setting('app.user_id', true)"))).scalar()
+        if current not in (None, ""):
+            raise RuntimeError(
+                "admin_session() opened while a tenant app.user_id is set — refusing "
+                "(an admin context must never coexist with a tenant context)")
+        await session.execute(text("SELECT set_config('app.admin', 'on', true)"))
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+@asynccontextmanager
 async def worker_session() -> AsyncIterator[AsyncSession]:
     """Session for the intake worker's QUEUE operations ONLY (claim/lease/status transitions).
 

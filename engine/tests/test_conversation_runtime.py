@@ -236,10 +236,17 @@ def test_no_chain_of_thought_persisted(clean_db):
     assert not (keys & {"reasoning", "scratchpad", "thoughts", "chain_of_thought", "cot"})
 
 
-def test_flag_off_falls_through_to_legacy(monkeypatch):
+def test_enabled_for_is_async_db_backed_and_denies_by_default(clean_db, monkeypatch):
+    """enabled_for is async + DB-backed (Bite 1.5): no allow-list env. With no entitlement/enrollment it
+    DENIES (the inbound gate falls through to legacy); a live staging enrollment flips it to ALLOW; and an
+    explicit BRUCE_CONVERSATION_RUNTIME hard-off overrides back to DENY."""
+    from scripts import capability_admin
     monkeypatch.delenv("BRUCE_CONVERSATION_RUNTIME", raising=False)
-    assert conversation_runtime.enabled_for(PHONE) is False
-    monkeypatch.setenv("BRUCE_CONVERSATION_RUNTIME", "1")
-    monkeypatch.setenv("BRUCE_CONVERSATION_TEST_HANDLES", "+1999,%s" % PHONE)
-    assert conversation_runtime.enabled_for(PHONE) is True
-    assert conversation_runtime.enabled_for("+15550000000") is False   # not allow-listed
+    uid = uuid4(); _run(_ensure_user(uid))
+
+    assert _run(conversation_runtime.enabled_for(uid)) is False            # no grant -> DENY (fall through)
+    _run(capability_admin.enroll_staging(uid, reason="runtime-wiring", actor="tester@host"))
+    assert _run(conversation_runtime.enabled_for(uid)) is True             # live staging enrollment -> ALLOW
+
+    monkeypatch.setenv("BRUCE_CONVERSATION_RUNTIME", "off")                # global hard-off overrides
+    assert _run(conversation_runtime.enabled_for(uid)) is False
