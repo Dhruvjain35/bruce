@@ -16,6 +16,7 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
 
 from .backend import AuthError, Backend, BackendError
 from .checkpoint import FileCheckpoint
@@ -24,6 +25,7 @@ from .imsg import Imsg, ImsgEvent, parse_event
 log = logging.getLogger("bruce.relay")
 
 MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024
+MAX_ATTACHMENTS_PER_MESSAGE = 10
 ALLOWED_MIME = {"image/png", "image/jpeg", "image/heic", "image/heif", "image/webp", "application/pdf", "text/plain"}
 _EXE_MAGIC = (b"\x7fELF", b"MZ", b"\xca\xfe\xba\xbe", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"#!", b"PK\x03\x04")
 
@@ -39,7 +41,8 @@ def _kind_for(mime: str) -> str | None:
 class Relay:
     def __init__(self, imsg: Imsg, backend: Backend, checkpoint: FileCheckpoint, *,
                  spool_dir: str, poll_interval: float = 2.0, reconnect_delay: float = 3.0,
-                 sent_ledger: FileCheckpoint | None = None) -> None:
+                 sent_ledger: FileCheckpoint | None = None,
+                 attachment_max_retries: int = 5, attachment_retry_delay: float = 2.0) -> None:
         self.imsg = imsg
         self.backend = backend
         self.checkpoint = checkpoint
@@ -49,8 +52,15 @@ class Relay:
         self.spool_dir = spool_dir
         self.poll_interval = poll_interval
         self.reconnect_delay = reconnect_delay
+        self.attachment_max_retries = attachment_max_retries
+        self.attachment_retry_delay = attachment_retry_delay
+        self._pending: set[asyncio.Task] = set()   # off-hot-path delayed-attachment resolvers
         self._stop = asyncio.Event()
         os.makedirs(spool_dir, exist_ok=True)
+        try:
+            os.chmod(spool_dir, 0o700)             # private spool: owner-only
+        except OSError:
+            pass
 
     def stop(self) -> None:
         self._stop.set()
@@ -59,20 +69,28 @@ class Relay:
 
     async def _stage_attachments(self, event: ImsgEvent) -> tuple[list[dict], bool]:
         """Upload the message's attachments. Returns (normalized_attachments, deferred). deferred=True
-        means a file is still downloading — the WHOLE message is retried later (not checkpointed)."""
+        means a file is still downloading — resolved later off the hot path. Hardened: reject symlinks
+        and non-regular files, realpath the source, cap the count. Logs stay content-free (no paths)."""
         out: list[dict] = []
-        for a in event.attachments:
+        for a in event.attachments[:MAX_ATTACHMENTS_PER_MESSAGE]:
             if a.get("missing"):
-                return [], True  # still downloading -> defer the message
+                return [], True  # still downloading -> defer the WHOLE message
             path = a.get("original_path") or a.get("converted_path")
             mime = a.get("mime_type") or a.get("converted_mime_type") or ""
             kind = _kind_for(mime)
-            if not path or not os.path.exists(path) or kind is None or mime not in ALLOWED_MIME:
+            if not path or kind is None or mime not in ALLOWED_MIME:
                 continue  # unsupported / unresolved -> skip this attachment (never fail the message)
-            if os.path.getsize(path) > MAX_ATTACHMENT_BYTES:
+            try:
+                lst = os.lstat(path)                          # lstat: see the link itself, don't follow
+            except OSError:
                 continue
-            spool = os.path.join(self.spool_dir, hashlib.sha256(path.encode()).hexdigest())
-            shutil.copy(path, spool)  # private spool copy
+            if stat.S_ISLNK(lst.st_mode):
+                continue  # reject symlinks — never follow a link out of Messages' attachment store
+            real = os.path.realpath(path)
+            if not os.path.isfile(real) or os.path.getsize(real) > MAX_ATTACHMENT_BYTES:
+                continue  # reject non-regular files / oversize
+            spool = os.path.join(self.spool_dir, hashlib.sha256(real.encode()).hexdigest())
+            shutil.copy(real, spool)  # private spool copy
             try:
                 with open(spool, "rb") as f:
                     data = f.read()
@@ -81,12 +99,29 @@ class Relay:
                 ref = await self.backend.upload(data, mime, a.get("transfer_name"))
                 out.append({"kind": kind, "media_type": mime, "upload_ref": ref})
             finally:
-                # Delete the spool copy once the upload is confirmed (or on any failure — we retry).
                 try:
-                    os.remove(spool)
+                    os.remove(spool)                          # delete the spool copy either way
                 except OSError:
                     pass
         return out, False
+
+    async def _post_and_checkpoint(self, event: ImsgEvent, atts: list[dict], *,
+                                   attachment_unavailable: bool = False) -> str:
+        resp = await self.backend.post_inbound({
+            "provider_message_id": event.guid,
+            "channel_identity": event.sender or "",
+            "chat_guid": event.chat_guid,
+            "is_group": event.is_group,
+            "is_from_me": False,
+            "text": event.text,
+            "attachments": atts,
+            "attachment_unavailable": attachment_unavailable,
+            "reply_to_message_id": event.reply_to_guid,
+            "timestamp": event.created_at,
+        })
+        self.checkpoint.mark(event.guid)                    # durable ack -> safe to not reprocess
+        log.info("inbound_ok guid=%s status=%s", event.guid, resp.get("status"))
+        return resp.get("status", "processed")
 
     async def process_inbound(self, event: ImsgEvent) -> str:
         if event.is_from_me:
@@ -96,24 +131,53 @@ class Relay:
         try:
             atts, deferred = await self._stage_attachments(event)
             if deferred:
-                return "deferred"                           # attachment still downloading; retry later
-            resp = await self.backend.post_inbound({
-                "provider_message_id": event.guid,
-                "channel_identity": event.sender or "",
-                "chat_guid": event.chat_guid,
-                "is_group": event.is_group,
-                "is_from_me": False,
-                "text": event.text,
-                "attachments": atts,
-                "reply_to_message_id": event.reply_to_guid,
-                "timestamp": event.created_at,
-            })
+                self._spawn_resolve(event)                  # resolve OFF the watch hot path
+                return "deferred"
+            return await self._post_and_checkpoint(event, atts)
         except BackendError:
             log.warning("inbound_retry guid=%s", event.guid)   # do NOT checkpoint -> retried
             return "retry"
-        self.checkpoint.mark(event.guid)                    # durable ack -> safe to not reprocess
-        log.info("inbound_ok guid=%s status=%s", event.guid, resp.get("status"))
-        return resp.get("status", "processed")
+
+    def _spawn_resolve(self, event: ImsgEvent) -> None:
+        if any(getattr(t, "_guid", None) == event.guid for t in self._pending):
+            return                                          # already resolving this guid
+        task = asyncio.create_task(self._resolve_and_post(event))
+        task._guid = event.guid  # type: ignore[attr-defined]
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def _resolve_and_post(self, event: ImsgEvent) -> None:
+        """Bounded, backed-off resolution of a still-downloading attachment via imsg.get_message (a
+        DEDICATED subprocess). On resolve -> post + checkpoint. On give-up -> post the message flagged
+        attachment_unavailable + checkpoint, so it is never lost NOR retried forever."""
+        for _ in range(self.attachment_max_retries):
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.attachment_retry_delay)
+                return                                      # relay stopping
+            except asyncio.TimeoutError:
+                pass
+            try:
+                ev2 = await self.imsg.get_message(event.guid)
+                if ev2 is not None:
+                    atts, deferred = await self._stage_attachments(ev2)
+                    if not deferred:
+                        await self._post_and_checkpoint(ev2, atts)
+                        log.info("inbound_resolved guid=%s", event.guid)
+                        return
+            except BackendError:
+                continue                                    # transient upload/post error; keep trying
+            except Exception:
+                continue
+        try:
+            await self._post_and_checkpoint(event, [], attachment_unavailable=True)
+            log.info("inbound_attachment_unavailable guid=%s", event.guid)
+        except BackendError:
+            log.warning("inbound_retry guid=%s (give-up post failed)", event.guid)
+
+    async def drain_pending(self) -> None:
+        """Await any in-flight delayed-attachment resolvers (used by tests + graceful stop)."""
+        while self._pending:
+            await asyncio.gather(*list(self._pending), return_exceptions=True)
 
     async def process_inbound_dict(self, raw: dict) -> str:
         """Convenience wrapper: parse a raw imsg watch object then process it (used by the dry-run

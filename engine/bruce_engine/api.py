@@ -435,6 +435,7 @@ class RelayInboundRequest(BaseModel):
     is_from_me: bool = False                          # Bruce's own echo
     text: str | None = None
     attachments: list[RelayAttachment] = Field(default_factory=list)
+    attachment_unavailable: bool = False   # relay gave up resolving a still-downloading attachment
     reply_to_message_id: str | None = None
     timestamp: str | None = None
 
