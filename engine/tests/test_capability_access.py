@@ -413,3 +413,48 @@ def test_admin_session_opens_cleanly_without_tenant_context(clean_db):
             assert (await s.execute(select(func.count()).select_from(schema.CapabilityGlobalState))).scalar_one() >= 0
 
     _run(run())
+
+
+def test_unverified_production_entitlement_denies(clean_db):
+    """An active, messaging-enabled entitlement whose identity is NOT verified must be DENIED — access
+    resolves from a VERIFIED linked identity, not merely the presence of an entitlement row."""
+
+    async def run():
+        a = uuid4()
+        await users_repo.ensure(a)
+        async with admin_session() as s:
+            s.add(schema.ProductionAccountEntitlement(
+                user_id=a, account_status="active", messaging_enabled=True, verified_identity=False,
+                capability_availability=["conversation"]))
+        assert (await access_control.conversation_access(a)).allow is False   # unverified -> DENY
+
+        async with admin_session() as s:   # verify the identity -> now ALLOW
+            await s.execute(update(schema.ProductionAccountEntitlement).where(
+                schema.ProductionAccountEntitlement.user_id == a).values(verified_identity=True))
+        d = await access_control.conversation_access(a)
+        assert d.allow is True and d.source == "production"
+
+    _run(run())
+
+
+def test_activate_production_entitlement_is_automatic_verified_and_idempotent(clean_db):
+    """The programmatic path D1 uses: one call creates a persistent, verified, messaging-enabled
+    entitlement that ALLOWs access; a second call is idempotent (still one row, still allowed)."""
+
+    async def run():
+        a = uuid4()
+        await users_repo.ensure(a)
+        created = await access_control.activate_production_entitlement(a, reason="signup")
+        assert created is True
+        d = await access_control.conversation_access(a)
+        assert d.allow is True and d.source == "production"
+
+        created2 = await access_control.activate_production_entitlement(a, reason="signup")
+        assert created2 is False                              # idempotent by user_id
+        async with worker_session() as s:
+            n = (await s.execute(select(func.count()).select_from(schema.ProductionAccountEntitlement).where(
+                schema.ProductionAccountEntitlement.user_id == a))).scalar_one()
+        assert n == 1
+        assert (await access_control.conversation_access(a)).allow is True
+
+    _run(run())
