@@ -605,6 +605,241 @@ class ConversationTurn(Base, TSV):
     __table_args__ = (UniqueConstraint("user_id", "channel", "provider_message_id", "role", name="uq_turn_msg_role"),)
 
 
+# ================================================================================================
+# SCHOOL CONNECTOR DOMAIN (provider-neutral canonical academic graph). NO provider (Canvas/Classroom)
+# field may enter these — the adapter normalizes into these rows at the boundary (see canvas_fake.py,
+# school_store.py). Every synced object is tenant-owned and processed under user_session(user_id), so
+# RLS is tenant_isolation (owner-only, no worker path). Conditional-create + policies in migration 0012.
+#
+# Provenance is not optional: every object row carries the ORIGINAL provider id + URL, the provider's own
+# source_timestamp, Bruce's last_synced_at, the capability_state it was produced under, a content_hash
+# (change detection), and a source_id link to the school_sources evidence anchor. Change history lives in
+# school_object_changes. This is what lets the query layer cite every item it returns.
+# ================================================================================================
+
+
+class _SchoolProv:
+    """Provenance columns shared by every persisted canonical school object (mixin, copied per table).
+
+    Mirrors the TSV mixin pattern already used above. source_id links to the school_sources evidence
+    anchor (SET NULL so pruning a source never deletes the object). Uniqueness on (user_id, provider,
+    provider_id) is declared per-table so a re-sync UPSERTS the same logical object instead of duplicating.
+    """
+
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, server_default="canvas")
+    provider_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    source_timestamp: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_synced_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    capability_state: Mapped[str] = mapped_column(String(16), nullable=False, server_default="supported")
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
+    source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("school_sources.id", ondelete="SET NULL"), nullable=True
+    )
+
+
+class SchoolSyncCursor(Base, TSV):
+    """A restart-safe incremental-sync position, one row per (user, provider, resource).
+
+    cursor_value is the OPAQUE provider token (Canvas: an ISO updated_since). The store persists it after
+    each sync and hands it back on the next one — so a crash mid-sync loses no progress; the next run
+    resumes from the last committed cursor."""
+
+    __tablename__ = "school_sync_cursors"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource: Mapped[str] = mapped_column(String(48), nullable=False)  # assignments | announcements | courses | ...
+    cursor_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    synced_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "provider", "resource", name="uq_school_cursor"),)
+
+
+class SchoolSource(Base, TSV):
+    """The evidence anchor for a synced provider object (the canonical "source"). Holds the minimized
+    normalized payload + a content_hash; every canonical object row points back here via source_id."""
+
+    __tablename__ = "school_sources"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    object_type: Mapped[str] = mapped_column(String(32), nullable=False)  # course|assignment|announcement|...
+    provider_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    source_timestamp: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_synced_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, server_default="")
+    capability_state: Mapped[str] = mapped_column(String(16), nullable=False, server_default="supported")
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))  # minimized
+    __table_args__ = (UniqueConstraint("user_id", "provider", "object_type", "provider_id", name="uq_school_source"),)
+
+
+class SchoolSourceSpan(Base, TSV):
+    """A verbatim span of a provider object (the canonical "source_span") — the grounding anchor a fact
+    (e.g. a due date) traces back to. Mirrors source_spans in the intake domain."""
+
+    __tablename__ = "school_source_spans"
+    id = _pk()
+    user_id = _owner()
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("school_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    span_text: Mapped[str] = mapped_column(Text, nullable=False)
+    label: Mapped[str | None] = mapped_column(String(64), nullable=True)  # what the span grounds (e.g. "due_at")
+    ordinal: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class SchoolInstitution(Base, TSV, _SchoolProv):
+    __tablename__ = "school_institutions"
+    id = _pk()
+    user_id = _owner()
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_institution"),)
+
+
+class SchoolTerm(Base, TSV, _SchoolProv):
+    __tablename__ = "school_terms"
+    id = _pk()
+    user_id = _owner()
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    start_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_term"),)
+
+
+class SchoolInstructor(Base, TSV, _SchoolProv):
+    __tablename__ = "school_instructors"
+    id = _pk()
+    user_id = _owner()
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    role: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_instructor"),)
+
+
+class SchoolCourse(Base, TSV, _SchoolProv):
+    """A course. Sections + instructors are folded into ``detail`` JSONB (thin sub-objects that only ever
+    render with their course), matching the schema's "structured columns for what we query, JSONB for the
+    rest" rule. They remain first-class canonical objects when read back."""
+
+    __tablename__ = "school_courses"
+    id = _pk()
+    user_id = _owner()
+    name: Mapped[str] = mapped_column(String(500), nullable=False)
+    course_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    workflow_state: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)  # available|completed
+    term_provider_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    term_name: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    institution_provider_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))  # instructors+sections
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_course"),)
+
+
+class SchoolAssignment(Base, TSV, _SchoolProv):
+    """An assignment. The submission STATE is denormalized onto structured columns (the due-buckets pivot
+    on due_at + submission_state, so they must be queryable); full submission detail lives in
+    school_submissions."""
+
+    __tablename__ = "school_assignments"
+    id = _pk()
+    user_id = _owner()
+    course_provider_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    due_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    unlock_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lock_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    points_possible: Mapped[float | None] = mapped_column(Float, nullable=True)
+    submission_types: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    submission_state: Mapped[str] = mapped_column(String(16), nullable=False, server_default="unknown", index=True)
+    submitted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    grade: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    late: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    missing: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_assignment"),)
+
+
+class SchoolMaterial(Base, TSV, _SchoolProv):
+    __tablename__ = "school_materials"
+    id = _pk()
+    user_id = _owner()
+    course_provider_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, server_default="file")  # file|page|link
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_material"),)
+
+
+class SchoolAnnouncement(Base, TSV, _SchoolProv):
+    __tablename__ = "school_announcements"
+    id = _pk()
+    user_id = _owner()
+    course_provider_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    posted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_announcement"),)
+
+
+class SchoolSubmission(Base, TSV, _SchoolProv):
+    """Full submission detail. grade / rubric / feedback are facets of the submission's assessment (that IS
+    the Canvas data model — score, rubric_assessment, and submission_comments all hang off the submission),
+    so they are persisted here (structured columns + JSONB) and re-exposed as their own canonical objects."""
+
+    __tablename__ = "school_submissions"
+    id = _pk()
+    user_id = _owner()
+    assignment_provider_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, server_default="unknown")
+    submitted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    late: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    missing: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    grade: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    points_possible: Mapped[float | None] = mapped_column(Float, nullable=True)
+    graded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rubric: Mapped[dict | None] = mapped_column(JSONB, nullable=True)     # canonical Rubric dump
+    feedback: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))  # Feedback dumps
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_submission"),)
+
+
+class SchoolScheduleEvent(Base, TSV, _SchoolProv):
+    """A schedule/calendar event. Canvas declares this capability unsupported (no ICS feed wired), so this
+    table stays empty for Canvas — it exists for a provider (e.g. an ICS feed) that DOES expose events."""
+
+    __tablename__ = "school_schedule_events"
+    id = _pk()
+    user_id = _owner()
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    start_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    end_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    course_provider_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_id", name="uq_school_schedule_event"),)
+
+
+class SchoolObjectChange(Base):
+    """The change-history log: one row per created/updated/deleted classification observed during a sync.
+
+    Powers "what changed at school?" and the ``changes`` provenance field on every object. changed_fields
+    lists the canonical field names that differed on an update (empty for create/delete)."""
+
+    __tablename__ = "school_object_changes"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    object_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    change_type: Mapped[str] = mapped_column(String(16), nullable=False)  # created|updated|deleted
+    cursor_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    changed_fields: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    detected_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (Index("ix_school_change_lookup", "user_id", "object_type", "provider_id"),)
+
+
 # user-owned tables that get row-level security (users handled separately: a user sees only self)
 RLS_TABLES: tuple[str, ...] = (
     "sources",
@@ -620,4 +855,18 @@ RLS_TABLES: tuple[str, ...] = (
     "model_costs",
     "event_candidates",       # added 0011 — conversation brain (most sensitive student free-text)
     "conversation_turns",     # added 0011
+    # added 0012 — SchoolConnector canonical academic graph (per-student synced school data)
+    "school_sync_cursors",
+    "school_sources",
+    "school_source_spans",
+    "school_institutions",
+    "school_terms",
+    "school_instructors",
+    "school_courses",
+    "school_assignments",
+    "school_materials",
+    "school_announcements",
+    "school_submissions",
+    "school_schedule_events",
+    "school_object_changes",
 )

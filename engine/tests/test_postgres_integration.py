@@ -73,6 +73,11 @@ _RLS_TABLES = [
     # exactly where a silently-missed RLS policy would do the most damage. test_08 covers the flags;
     # test_11_* below proves a second user actually cannot read/write them.
     "conversation_turns", "event_candidates",
+    # Added 0012. The SchoolConnector canonical academic graph — a student's entire synced school record.
+    # Covered by the same all-tables FORCE-RLS guarantee; test_school_rls_isolation proves cross-user denial.
+    "school_sync_cursors", "school_sources", "school_source_spans", "school_institutions", "school_terms",
+    "school_instructors", "school_courses", "school_assignments", "school_materials", "school_announcements",
+    "school_submissions", "school_schedule_events", "school_object_changes",
 ]
 
 

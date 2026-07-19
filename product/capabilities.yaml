@@ -187,23 +187,66 @@ primitives:
   school_connector_framework:
     universe_primitive: 2
     capabilities:
-      - {id: CAP-SCH-001, name: Provider-neutral SchoolConnector protocol + capability matrix, wave: 1, status: planned, autonomy: A0, risk: medium}
-      - {id: CAP-SCH-002, name: Connector access ladder (OAuth/LTI/OneRoster/export/browser/screenshot/unsupported), wave: 1, status: planned, autonomy: A0, risk: medium}
+      - id: CAP-SCH-001
+        name: Provider-neutral SchoolConnector protocol + capability matrix
+        wave: 1
+        autonomy: A0
+        risk: medium
+        status: implemented            # code + passing tests; not deployed (no real provider connected)
+        primitives: [school_connector_framework, evidence_provenance]
+        evidence: engine/bruce_engine/school_connector.py (Protocol + canonical objects), school_capability.py (matrix)
+        tests: engine/tests/test_school_connector_contract.py (reusable contract any connector must satisfy)
+        gaps: only a FAKE Canvas adapter exists; no real provider auth
+      - id: CAP-SCH-002
+        name: Honest capability states (supported/limited/unsupported/unknown) so callers never get a fabricated value
+        wave: 1
+        autonomy: A0
+        risk: medium
+        status: partial                # the state model + honest declines exist; the full access ladder does not
+        evidence: school_capability.py CapabilityState; canvas_fake declares grades=limited, schedule_events=unsupported
+        tests: test_school_connector_contract (unsupported/limited assertions)
+        gaps: OAuth/LTI/OneRoster/export/browser/screenshot access methods not built — only in-memory fake
   canonical_academic_graph:
     universe_primitive: 3
     capabilities:
-      - {id: CAP-ACG-001, name: Canonical courses/assignments/submissions/grades graph + sync cursors, wave: 1, status: planned, autonomy: A0, risk: medium}
+      - id: CAP-ACG-001
+        name: Canonical courses/assignments/submissions/grades graph + sync cursors (RLS-isolated)
+        wave: 1
+        autonomy: A0
+        risk: medium
+        status: implemented
+        primitives: [canonical_academic_graph, evidence_provenance, permission_privacy_controls]
+        evidence: schema.py school_* tables (migration 0012, FORCE RLS tenant_isolation); school_store.py (persist + read-back); school_connector.py canonical objects
+        tests: engine/tests/test_school_queries.py, test_school_rls_isolation.py
+        gaps: populated only from the fake adapter; grades/rubric/feedback folded onto submissions
   change_detection_engine:
     universe_primitive: 4
     capabilities:
-      - {id: CAP-CHG-001, name: Change-detection (new/updated/removed) with original-object links, wave: 1, status: planned, autonomy: A1, risk: medium}
+      - id: CAP-CHG-001
+        name: Change-detection (created/updated/deleted) with restart-safe cursors + original-object links
+        wave: 1
+        autonomy: A1
+        risk: medium
+        status: implemented
+        evidence: school_connector.sync/SyncPage; canvas_fake.sync (updated_since + tombstones); school_store content-hash re-verify + school_object_changes history
+        tests: test_school_connector_contract (create/update/delete + restart-safe), test_school_queries (what_changed)
   canvas_adapter:
     universe_primitive: 2
     capabilities:
-      - {id: CAP-CANVAS-001, name: Canvas read/sync (courses, due buckets, announcements, grades where authorized), wave: 1, status: planned, autonomy: A1, risk: medium, blocked_on: founder Canvas OAuth credentials}
-      - {id: CAP-Q-DUE, name: "'What do I have due?'", wave: 1, status: planned, autonomy: A1, risk: low, primitives: [canonical_academic_graph]}
-      - {id: CAP-Q-CHANGED, name: "'What changed at school?'", wave: 1, status: planned, autonomy: A1, risk: low, primitives: [change_detection_engine]}
-      - {id: CAP-Q-MISSING, name: "'What am I missing?'", wave: 1, status: planned, autonomy: A1, risk: low}
+      - id: CAP-CANVAS-001
+        name: Canvas read/sync (courses, due buckets, announcements, grades where authorized)
+        wave: 1
+        autonomy: A1
+        risk: medium
+        status: mock_only              # FAKE adapter over fixtures — NO real Canvas OAuth/network has run
+        blocked_on: founder Canvas OAuth credentials + an institution to read against
+        evidence: engine/bruce_engine/canvas_fake.py (in-memory fixtures normalized to canonical objects; no network)
+        tests: engine/tests/test_school_connector_contract.py
+        note: proves the contract end-to-end offline; a real adapter drops in behind the SAME Protocol
+      - {id: CAP-Q-DUE, name: "'What do I have due?'", wave: 1, status: implemented, autonomy: A1, risk: low, primitives: [canonical_academic_graph], evidence: school_queries.what_is_due, tests: test_school_queries}
+      - {id: CAP-Q-CHANGED, name: "'What changed at school?'", wave: 1, status: implemented, autonomy: A1, risk: low, primitives: [change_detection_engine], evidence: school_queries.what_changed, tests: test_school_queries}
+      - {id: CAP-Q-MISSING, name: "'What am I missing?'", wave: 1, status: implemented, autonomy: A1, risk: low, evidence: school_queries.what_am_i_missing, tests: test_school_queries}
+      - {id: CAP-Q-NEXT, name: "'What should I do next?'", wave: 1, status: implemented, autonomy: A1, risk: low, evidence: school_queries.what_should_i_do_next, tests: test_school_queries}
 
 # --- P2: work + communication (planned) --------------------------------------------------------
   grades_feedback:
