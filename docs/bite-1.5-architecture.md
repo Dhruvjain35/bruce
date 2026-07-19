@@ -30,6 +30,14 @@ manual code, no relay restart, no hand-made enrollment):
 
 On successful link Bruce sends (Voice OS, **no em dashes**): `ur connected ✅\ntext me anything u need`
 
+**Automatic entitlement (no operator, ever).** On successful signup + identity verification, D1 calls
+`activate_production_entitlement(user_id, ...)` to **create or activate** the user's
+`ProductionAccountEntitlement` automatically. No founder / operator / Claude session / CLI / DB edit /
+admin approval is involved. "Every user needs a grant" must **never** become "an operator grants every
+user." The keystone (C1) provides the entitlement store + the programmatic activation function + the
+access decision; the operator CLI's `grant-production` is a **recovery/interim admin tool only**, never
+the normal path.
+
 ### Linking-token security
 Auto-generated post-signup · short-lived · **single-use** · stored **hashed/HMAC** (raw token never
 persisted or logged) · **bound to the intended user + onboarding session** · guessing/replay resistant ·
@@ -61,14 +69,16 @@ expiration, immediate revoke, full audit. **Must never gate production usage.**
 ## Runtime enforcement — `enabled_for(user_id, capability)`
 
 Decided by **user_id in the DB**, never by fragile string comparison, and no model/relay process can
-bypass it:
+bypass it. Production access resolves from: **verified linked identity + active
+`ProductionAccountEntitlement` + account standing + plan/capability availability + global safety state.**
 
 1. **Global emergency kill** for the capability → **DENY** (emergency shutdown wins over everything).
 2. **Production:** `ProductionAccountEntitlement(user_id)` with `account_status = active` AND
-   `messaging_enabled` AND capability in `capability_availability` → **ALLOW** (persistent).
-3. **Staging:** a live (`revoked_at` null, not past `expires_at`) `StagingTestEnrollment(user_id,
-   capability)` → **ALLOW** (internal test).
-4. else **DENY**.
+   `messaging_enabled` AND `verified_identity` AND capability in `capability_availability` → **ALLOW**
+   (persistent — it does **not** expire because a test timer elapsed).
+3. **Staging:** a live (`revoked_at` null, not past `expires_at` when set) `StagingTestEnrollment(user_id,
+   capability)` → **ALLOW** (internal test). Staging never makes production access persistent.
+4. else **DENY**. (rollout_state never widens this — no one-call mass-enable.)
 
 The env `BRUCE_CONVERSATION_RUNTIME` is demoted to a **global rollout/kill switch only** (default OFF
 globally until rollout approval) — it is no longer a per-user allow-list. Per-user access comes from the
@@ -105,19 +115,56 @@ users.
 - Integration missing: say what Bruce understood + what capability is missing + one secure connection
   link + preserve the proposed action.
 
-## Build sequence (small, independently-mergeable, test-backed)
+## Build sequence — usable vertical slice before the dashboard
 
-1. **Keystone — access model + enforcement:** `ProductionAccountEntitlement` + `StagingTestEnrollment`
-   + global capability/kill state (RLS-isolated, migration), and `enabled_for(user_id, capability)`
-   rewired to consult them. Removes per-user Cloud-Run env editing.
-2. **Self-serve onboarding:** signup → phone verify → auto linking token → link → persistent entitlement,
-   with the token security + recovery cases + auto-continue. (Web pages + Messages copy.)
-3. **Relay supervisor + LaunchAgent + installer** (server/plist/scripts by Claude; one-time load on the
-   operator's Mac).
-4. **brucectl.**
-5. **Owner dashboard** (aggregate health).
-6. **Staging test mode** (E) over `StagingTestEnrollment` — the internal, no-redeploy test path.
-7. **UX failure states** (durable inbound + copy).
+Linear migration head; C1 lands first (it owns the runtime gate every other PR builds on).
+
+1. **C1** access keystone (this = the access model above + `async enabled_for(user_id)`).
+2. **A1** relay control-plane: enriched heartbeat + authoritative claim kill switch + directives.
+3. **A2** relay client enforcement (honor kill switch, fail-closed auth exit, heartbeat status).
+4. **A3** supervisor (two-tier watchdog, headless-testable).
+5. **A4** LaunchAgent + one-time installer (installer runs once on the operator's Mac).
+6. **B1** brucectl.
+7. **E1** minimal **zero-terminal staging test surface** (see acceptance flow below).
+8. **Focused live HEIC regression** through the new flow (no start-script, no env editing).
+9. **D1** fully self-serve production onboarding (auto-creates the persistent entitlement). Required
+   before any real external-user launch.
+10. **F1 + F2** recovery flows (durable deferred-inbound + onboarding-preserve + connect-links).
+11. **G** aggregate owner dashboard.
+
+## Bite 1.5 final acceptance — the zero-terminal staging test
+
+Bite 1.5 is NOT complete until the founder runs a staging test **without** asking Claude to enroll,
+opening Terminal, changing Cloud Run vars, restarting the relay, or editing the DB. The finished flow:
+
+1. founder opens the authenticated internal test surface (E1)
+2. relay, API, queue, model, and pinned commit all show healthy
+3. founder selects their own linked staging account
+4. founder taps **start test**
+5. a `StagingTestEnrollment` is **created automatically** with a chosen duration **or**
+   persistent-until-manually-ended (and immediate-revoke available)
+6. founder opens Messages and texts Bruce
+7. privacy-safe turn results appear (counts/latency/status/dup-detection)
+8. founder taps **end test**
+9. the enrollment is revoked and outbound-queue cleanliness is confirmed
+10. the relay stays running and healthy
+
+Staging enrollment durations: chosen duration · persistent-until-manually-ended · immediate revoke.
+**Production entitlements never expire from a test timer.**
+
+## Emergency global shutdown — auth (security clarification)
+
+The emergency stop must **not** rely on a long-lived static token in a URL or browser storage. It uses
+strongly-authenticated, audited admin access: short-lived credentials · replay resistance · rate limits ·
+explicit **environment display** · an explicit **confirmation** for global shutdown · immediate effect ·
+fail-closed. (Server-side, the authoritative enforcement already lives in the claim path: a killed
+capability / paused device yields nothing to send regardless of any client.)
+
+## End state
+- **New customer:** signs up, verifies, links Messages → Bruce works **indefinitely** (persistent
+  entitlement, auto-created).
+- **Founder testing staging:** open dashboard, tap start, text Bruce, tap end.
+- **Launching Bruce:** deploy once and watch the system — never manually bless each person.
 
 ### What Claude builds+tests vs the one-time operator Mac step
 Claude: all schema/migrations/enforcement, onboarding server + web + tests, supervisor logic + plist +
