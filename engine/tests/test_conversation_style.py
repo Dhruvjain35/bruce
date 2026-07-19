@@ -7,10 +7,11 @@ import pytest
 
 from bruce_engine.conversation_contract import RiskLevel
 from bruce_engine.conversation_style import (
-    ConversationStyleEngine, StyleViolation, VoiceProfile, assert_facts_preserved,
+    ConversationStyleEngine, StyleViolation, VoiceProfile, assert_facts_preserved, enforce_no_dashes,
 )
 
 eng = ConversationStyleEngine()
+EM, EN = "—", "–"
 
 
 def test_prohibited_phrases_stripped():
@@ -48,3 +49,38 @@ def test_event_template_never_claims_added_and_is_fact_locked():
 
 def test_could_not_read_template_asks_for_resend():
     assert "resend" in eng.template("could_not_read_attachment").lower()
+
+
+# --- em-dash enforcement (student-facing Bruce never uses em dashes) --------------------------------
+
+def test_render_strips_em_dash_the_live_cases():
+    for src in ("yeah — unit circle stuff is mostly memorizing", "hey, not much — what's up?"):
+        out = eng.render(src)
+        assert EM not in out
+    assert eng.render("yeah — unit circle stuff") == "yeah, unit circle stuff"
+
+
+def test_render_strips_en_dash_used_as_punctuation():
+    assert EN not in eng.render("the plan is simple – bring water and a pen")
+
+
+def test_numeric_range_en_dash_is_preserved_as_a_fact():
+    # a time/number range is a FACT, not sentence punctuation -> left intact, and facts survive
+    out = eng.render("study block is 9:00 – 10:00 tomorrow")
+    assert "9:00" in out and "10:00" in out and EN in out
+
+
+def test_enforce_no_dashes_is_idempotent():
+    once = enforce_no_dashes("a — b — c")
+    assert enforce_no_dashes(once) == once and EM not in once
+
+
+def test_template_output_never_has_em_dash():
+    out = eng.template("unsupported_capability", capability="calendar", alternative="save it for you")
+    assert EM not in out
+
+
+def test_repo_conversation_fixture_scan_no_em_dash_in_shipped_copy():
+    """Repository-wide conversation fixture scan: no shipped message template may contain an em dash."""
+    offenders = {k: v for k, v in ConversationStyleEngine().templates.items() if EM in str(v)}
+    assert not offenders, f"em dash in shipped copy: {sorted(offenders)}"

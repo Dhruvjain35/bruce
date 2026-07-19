@@ -29,6 +29,15 @@ from bruce_engine.messaging import Attachment, AttachmentKind, ChannelKind, Fake
 PHONE = "+15557654321"
 
 
+def _valid_png() -> bytes:
+    import io
+    from PIL import Image
+    b = io.BytesIO(); Image.new("RGB", (32, 32), "white").save(b, format="PNG"); return b.getvalue()
+
+
+_PNG = _valid_png()
+
+
 @pytest.fixture(autouse=True)
 def _pg(pg_test_db, monkeypatch):
     monkeypatch.setattr(db, "create_async_engine",
@@ -172,12 +181,25 @@ def test_casual_reply(clean_db):
 
 def test_model_failure_is_honest_fallback(clean_db):
     uid = uuid4(); _run(_ensure_user(uid))
-    img = Attachment(kind=AttachmentKind.image, media_type="image/png", data=b"\x89PNG")
+    img = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG)
     out = _run(conversation_runtime.handle(FakeChannel(), _msg("f1", text="?", attachments=[img]),
                                            user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(raises=True)))
     assert out.status == "model_error"
     ob = _run(_outbound(uid))
-    assert len(ob) == 1 and "resend" in ob[0].text.lower()      # honest, never a fabricated read
+    # A model/backend glitch OWNS it and asks to retry — it must NOT blame a healthy image.
+    assert len(ob) == 1 and "again" in ob[0].text.lower()
+    assert "couldn't read" not in ob[0].text.lower() and "couldn't open" not in ob[0].text.lower()
+
+
+def test_unreadable_attachment_only_asks_to_resend(clean_db):
+    """A genuinely-corrupt file with no text -> honest 'couldn't open', not a fabricated read."""
+    uid = uuid4(); _run(_ensure_user(uid))
+    bad = Attachment(kind=AttachmentKind.image, media_type="image/png", data=b"\x89PNG not real")
+    out = _run(conversation_runtime.handle(FakeChannel(), _msg("f2", text=None, attachments=[bad]),
+                                           user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(raises=True)))
+    assert out.status == "processed"        # handled without even calling the model
+    ob = _run(_outbound(uid))
+    assert len(ob) == 1 and "open" in ob[0].text.lower() and "resend" in ob[0].text.lower()
 
 
 def test_exactly_one_outbound_and_redelivery_idempotent(clean_db):

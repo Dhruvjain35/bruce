@@ -75,10 +75,29 @@ def assert_facts_preserved(src: str, styled: str) -> None:
 
 
 def _lower_lead(text: str) -> str:
-    """Lowercase only the first alpha of each line (casual register) — never touch mid-line words, so
+    """Lowercase only the first alpha of each line (casual register) - never touch mid-line words, so
     proper nouns / fact tokens are left intact (the guard covers the rest)."""
     return "\n".join(re.sub(r"^(\s*)([A-Z])", lambda m: m.group(1) + m.group(2).lower(), ln)
                      for ln in text.split("\n"))
+
+
+_EM_DASH = "—"
+_EN_DASH = "–"
+
+
+def enforce_no_dashes(text: str) -> str:
+    """Student-facing Bruce never uses em dashes, nor en dashes as sentence punctuation. Rewrite them
+    to a comma. A numeric range (digit-en dash-digit, e.g. "25–26" or "9:00 – 10:00") is a FACT
+    and is left untouched. Idempotent; safe to run after generation AND after styling."""
+    if _EM_DASH not in text and _EN_DASH not in text:
+        return text
+    out = re.sub(r"\s*—\s*", ", ", text)                         # em dash -> comma (always)
+    out = re.sub(r"(?<!\d)\s+–\s+(?!\d)", ", ", out)             # spaced en dash, NOT a numeric range
+    out = re.sub(r"(?<=[A-Za-z])–(?=[A-Za-z])", ", ", out)       # tight en dash between words
+    out = re.sub(r",\s*,", ",", out)                                  # tidy doubled commas
+    out = re.sub(r"\s+,", ",", out)
+    out = re.sub(r"^\s*,\s*", "", out)                                # drop a leading comma from a lead dash
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
 
 
 # AUTHORITATIVE defaults live in code — the safety-critical fact-locked copy must exist in every
@@ -86,14 +105,14 @@ def _lower_lead(text: str) -> str:
 # override (merged over these). Keeping the "never claims added" copy in code is deliberate.
 DEFAULT_TEMPLATES: dict[str, str] = {
     "event_saved_calendar_unavailable": (
-        "got it — saved this event:\n{title}\n{when}{where}\n"
+        "got it, saved this event:\n{title}\n{when}{where}\n"
         "heads up: i can't add it to your calendar yet (not connected). "
         "i've kept it so you don't have to resend."),
-    "could_not_read_attachment": "couldn't read that one 😕 can you resend it? (a clearer photo or the file works)",
-    "unsupported_capability": "can't do {capability} yet — that's not wired up on my end. i can still {alternative}.",
+    "could_not_read_attachment": "couldn't open that one 😕 can you resend it? (a clearer photo or the file works)",
+    "unsupported_capability": "can't do {capability} yet, that's not wired up on my end. i can still {alternative}.",
     "tutoring_offer": "looks like {topic}. want a hint, a full walkthrough, or should i just check your answers?",
     "needs_clarification_wrapper": "{question}",
-    "mission_started_no_push": "on it — {what}. i'll have it ready next time you check in.",
+    "mission_started_no_push": "on it: {what}. i'll have it ready next time you check in.",
 }
 DEFAULT_PROFILES: dict = {"base": {"register": "lowercase", "max_bubble_chars": 320, "result_first": True}}
 
@@ -117,7 +136,7 @@ class ConversationStyleEngine:
         raw = self.templates.get(name)
         if raw is None:
             raise KeyError(f"unknown message template {name!r}")
-        return raw.format(**slots).strip()
+        return enforce_no_dashes(raw.format(**slots).strip())    # never ship an em dash, even from copy
 
     def derive_profile(self, sample_texts: list[str]) -> VoiceProfile:
         """Best-effort mirror from a bounded recent window (NOT persisted in Bite 1)."""
@@ -146,5 +165,6 @@ class ConversationStyleEngine:
                 styled = _EMOJI.sub("", styled).strip()
             if profile.lowercase:
                 styled = _lower_lead(styled)
-        assert_facts_preserved(text, styled)             # HARD invariant — never ship altered facts
+        styled = enforce_no_dashes(styled)               # HARD: student-facing Bruce uses no em dashes
+        assert_facts_preserved(text, styled)             # HARD invariant: never ship altered facts
         return styled

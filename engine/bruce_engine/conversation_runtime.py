@@ -13,6 +13,7 @@ import os
 from uuid import UUID
 
 from . import conversation_store, messaging_outbound
+from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, IntentKind, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
 from .conversation_style import ConversationStyleEngine, VoiceProfile
@@ -32,13 +33,29 @@ def enabled_for(handle: str) -> bool:
     return handle in allow
 
 
-def _images(msg: InboundMessage) -> list[VisionInput]:
-    out = []
+def _prepare_images(msg: InboundMessage) -> tuple[list[VisionInput], int]:
+    """Normalize each image into a web-safe raster the vision model accepts (HEIC/HEIF -> JPEG, EXIF
+    orientation applied, oversized bounded) so a healthy photo is never rejected for its container.
+    PDFs pass through untouched. Returns (vision_inputs, n_unreadable) where n_unreadable counts
+    attachments whose bytes genuinely could not be decoded (corrupt/truncated) — distinct from a model
+    outage, so Bruce only says "i can't open that" when it truly can't."""
+    out: list[VisionInput] = []
+    unreadable = 0
     for a in msg.attachments:
         data = getattr(a, "data", None)
-        if data:
-            out.append(VisionInput(data=data, media_type=getattr(a, "media_type", None) or "image/png"))
-    return out
+        if not data:
+            continue
+        mt = (getattr(a, "media_type", None) or "").lower()
+        if mt == "application/pdf":
+            out.append(VisionInput(data=data, media_type="application/pdf"))
+            continue
+        try:
+            norm = normalize_image(data, mt)
+            out.append(VisionInput(data=norm.data, media_type=norm.media_type))
+        except UnreadableAttachment:
+            unreadable += 1
+            log.info("attachment_unreadable")     # content-free: no bytes, name, or path
+    return out, unreadable
 
 
 def _context(recent: list) -> str:
@@ -105,10 +122,11 @@ class _Runtime:
         await conversation_store.persist_user_turn(
             user_id, channel=ch, channel_identity=ident, provider_message_id=pmid, text=msg.text)
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
-        images = _images(msg)
+        images, unreadable = _prepare_images(msg)
 
-        # attachment the relay couldn't fetch, and nothing else to go on -> honest resend ask
-        if msg.attachment_unavailable and not (msg.text and msg.text.strip()) and not images:
+        # attachment the relay couldn't fetch OR bytes we genuinely can't open, and nothing else to go
+        # on -> honest resend ask. (A healthy HEIC no longer lands here — it's normalized to JPEG above.)
+        if (msg.attachment_unavailable or unreadable) and not (msg.text and msg.text.strip()) and not images:
             reply = self.style.template("could_not_read_attachment")
             await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
                                  decision=None, intent="image_understanding")
@@ -117,7 +135,9 @@ class _Runtime:
         try:
             rr = await self.reasoner.decide(text=msg.text, images=images, context=_context(recent))
         except Exception:
-            reply = self.style.template("could_not_read_attachment") if images else _FALLBACK
+            # A model/backend glitch is OUR fault, not the image's. Never say "couldn't read that" for
+            # a healthy photo (the exact false-negative we're fixing) — own it and ask for a retry.
+            reply = _FALLBACK
             await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
                                  decision=None, intent="unsupported")
             log.info("conv_model_error pmid=%s", pmid)
