@@ -464,7 +464,8 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
     msg = InboundMessage(
         provider_message_id=req.provider_message_id, channel=ChannelKind.self_hosted_imessage,
         channel_identity=req.channel_identity, text=req.text, attachments=atts, timestamp=ts,
-        reply_to_message_id=req.reply_to_message_id, thread_id=req.chat_guid)
+        reply_to_message_id=req.reply_to_message_id, thread_id=req.chat_guid,
+        is_group=req.is_group, attachment_unavailable=req.attachment_unavailable)
     outcome = await messaging_inbound.handle_inbound(messaging_outbound.QueueChannel(), msg)
     # Once the durable source has the bytes (processed), clear the staged upload copies.
     if outcome.status == "processed":

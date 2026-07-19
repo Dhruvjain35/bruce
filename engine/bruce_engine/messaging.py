@@ -81,6 +81,8 @@ class InboundMessage(BaseModel):
     timestamp: datetime.datetime
     reply_to_message_id: str | None = None
     thread_id: str | None = None
+    is_group: bool = False            # group thread — the conversation runtime refuses these in Bite 1
+    attachment_unavailable: bool = False  # relay gave up resolving a still-downloading attachment
 
 
 class OutboundMessage(BaseModel):
