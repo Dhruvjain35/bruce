@@ -23,7 +23,7 @@ from uuid import UUID
 from sqlalchemy import select
 
 from . import schema
-from .db import worker_session
+from .db import admin_session, worker_session
 
 log = logging.getLogger("bruce.access")  # content-free: ids/sources/statuses only, never message text
 
@@ -81,8 +81,8 @@ async def conversation_access(user_id: UUID, capability: str = "conversation") -
             ent = (await s.execute(select(schema.ProductionAccountEntitlement).where(
                 schema.ProductionAccountEntitlement.user_id == user_id))).scalar_one_or_none()
             if (ent is not None and ent.account_status == "active" and ent.messaging_enabled
-                    and _availability(ent, capability)):
-                return Decision(True, "production", "active production entitlement")
+                    and ent.verified_identity and _availability(ent, capability)):
+                return Decision(True, "production", "active verified production entitlement")
 
             # STAGING (temporary, internal): live means not revoked and not past expiry.
             now = datetime.datetime.now(datetime.timezone.utc)
@@ -99,3 +99,40 @@ async def conversation_access(user_id: UUID, capability: str = "conversation") -
     except Exception:
         log.warning("conversation_access_error env=%s", env)  # content-free; no user text
         return Decision(False, "error", "access check failed (fail-closed)")
+
+
+async def activate_production_entitlement(
+        user_id: UUID, *, reason: str | None = None, capability: str = "conversation",
+        plan: str = "alpha", actor: str = "system") -> bool:
+    """Create or (re)activate a user's PERSISTENT, VERIFIED production entitlement + append an audit row.
+    Idempotent by user_id. This is the AUTOMATIC path D1 calls on verified signup — never an operator
+    action ("every user needs a grant" must never mean "an operator grants every user"). The
+    ``grant-production`` CLI is only a recovery/interim wrapper over this. Returns True if a new row was
+    created. Runs in an ``admin_session`` (the entitlement tables are admin-write)."""
+    env = current_environment()
+    async with admin_session() as s:
+        ent = (await s.execute(select(schema.ProductionAccountEntitlement).where(
+            schema.ProductionAccountEntitlement.user_id == user_id))).scalar_one_or_none()
+        if ent is None:
+            s.add(schema.ProductionAccountEntitlement(
+                user_id=user_id, account_status="active", plan=plan, messaging_enabled=True,
+                verified_identity=True, entitlement_reason=reason, capability_availability=[capability]))
+            created = True
+        else:
+            avail = list(ent.capability_availability or [])
+            if capability not in avail:
+                avail.append(capability)
+            ent.capability_availability = avail
+            ent.account_status = "active"
+            ent.messaging_enabled = True
+            ent.verified_identity = True
+            ent.suspended_at = None
+            if reason:
+                ent.entitlement_reason = reason
+            created = False
+        await s.flush()   # surface a missing-user FK violation here, inside the audit'd transaction
+        s.add(schema.CapabilityAudit(
+            actor=actor, action="grant_production", capability=capability, environment=env,
+            target_user_id=user_id,
+            detail={k: v for k, v in {"reason": reason, "created": created}.items() if v is not None}))
+    return created

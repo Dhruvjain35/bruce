@@ -61,33 +61,11 @@ async def _write_audit(s, *, action: str, environment: str, target_user_id, deta
 
 async def grant_production(user_id: uuid.UUID, *, reason: str | None = None,
                            capability: str = CAPABILITY, actor: str | None = None) -> bool:
-    """Create or (re)activate a PERSISTENT production entitlement with messaging + the capability.
-    Returns True if a new entitlement row was created, False if an existing one was updated."""
-    actor = actor or _actor()
-    env = access_control.current_environment()
-    async with admin_session() as s:
-        ent = (await s.execute(select(schema.ProductionAccountEntitlement).where(
-            schema.ProductionAccountEntitlement.user_id == user_id))).scalar_one_or_none()
-        if ent is None:
-            s.add(schema.ProductionAccountEntitlement(
-                user_id=user_id, account_status="active", messaging_enabled=True, verified_identity=True,
-                entitlement_reason=reason, capability_availability=[capability]))
-            created = True
-        else:
-            avail = list(ent.capability_availability or [])
-            if capability not in avail:
-                avail.append(capability)
-            ent.capability_availability = avail
-            ent.account_status = "active"
-            ent.messaging_enabled = True
-            ent.suspended_at = None
-            if reason:
-                ent.entitlement_reason = reason
-            created = False
-        await s.flush()  # surfaces a missing-user FK violation here
-        await _write_audit(s, action="grant_production", environment=env, target_user_id=user_id,
-                           detail={"reason": reason, "created": created}, actor=actor, capability=capability)
-    return created
+    """RECOVERY / INTERIM admin tool only. The NORMAL path is D1 auto-calling
+    access_control.activate_production_entitlement() on verified signup (no operator). Thin wrapper over
+    the canonical function so there is ONE create/activate path. Returns True if a new row was created."""
+    return await access_control.activate_production_entitlement(
+        user_id, reason=reason, capability=capability, actor=actor or _actor())
 
 
 async def enroll_staging(user_id: uuid.UUID, *, hours: int | None = None, reason: str | None = None,
