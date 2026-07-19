@@ -14,13 +14,14 @@ from .backend import HttpBackend
 from .checkpoint import FileCheckpoint
 from .config import RelayConfig
 from .imsg import SubprocessImsg
+from .pending import PendingStore
 from .relay import Relay
 
 
 def build_relay(cfg: RelayConfig) -> Relay:
     """Construct the Relay from config (separated from main() so the wiring is unit-testable)."""
-    os.makedirs(os.path.dirname(cfg.checkpoint_path), exist_ok=True)
-    sent_ledger_path = os.path.join(os.path.dirname(cfg.checkpoint_path), "outbound_sent.json")
+    state = os.path.dirname(cfg.checkpoint_path)
+    os.makedirs(state, exist_ok=True)
     return Relay(
         imsg=SubprocessImsg(cfg.imsg_bin),
         backend=HttpBackend(cfg.base_url, cfg.secret),
@@ -28,7 +29,11 @@ def build_relay(cfg: RelayConfig) -> Relay:
         spool_dir=cfg.spool_dir,
         poll_interval=cfg.poll_interval,
         reconnect_delay=cfg.reconnect_delay,
-        sent_ledger=FileCheckpoint(sent_ledger_path),   # durable at-most-once outbound guard
+        sent_ledger=FileCheckpoint(os.path.join(state, "outbound_sent.json")),   # at-most-once outbound
+        pending=PendingStore(os.path.join(state, "pending_attachments.json")),   # restart-safe delayed attachments
+        attachment_max_wait_s=cfg.attachment_max_wait_s,
+        attachment_sweep_interval_s=cfg.attachment_sweep_interval_s,
+        attachment_max_events=cfg.attachment_max_events,
     )
 
 

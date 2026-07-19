@@ -34,7 +34,8 @@ class Imsg(Protocol):
     def watch(self) -> AsyncIterator[ImsgEvent]: ...
     async def send_text(self, to: str, text: str) -> str | None: ...        # -> provider message guid
     async def send_file(self, to: str, path: str) -> str | None: ...
-    async def get_message(self, guid: str) -> "ImsgEvent | None": ...        # re-resolve a message by id
+    # NOTE: no get_message — imsg 0.13.1 has no message.get. A still-downloading attachment is
+    # resolved by a SUBSEQUENT watch event (imsg re-emits the message when the file lands).
 
 
 def parse_event(raw: dict) -> ImsgEvent:
@@ -152,15 +153,3 @@ class SubprocessImsg:
 
     async def send_file(self, to: str, path: str) -> str | None:
         return await self._send({"to": to, "file": path})
-
-    async def get_message(self, guid: str) -> ImsgEvent | None:
-        """Re-resolve a single message (with attachments) by id, on a DEDICATED subprocess — used to
-        pick up an attachment that was still downloading (missing=true) on the first watch push. Never
-        touches the watch stream."""
-        resp = await self._oneshot_rpc("message.get", {"guid": guid, "attachments": True})
-        if "error" in resp:
-            return None
-        result = resp.get("result")
-        msg = result if isinstance(result, dict) and result.get("guid") else (
-            result.get("message") if isinstance(result, dict) else None)
-        return parse_event(msg) if isinstance(msg, dict) and msg.get("guid") else None

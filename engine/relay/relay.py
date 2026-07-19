@@ -17,10 +17,12 @@ import logging
 import os
 import shutil
 import stat
+import time
 
 from .backend import AuthError, Backend, BackendError
 from .checkpoint import FileCheckpoint
 from .imsg import Imsg, ImsgEvent, parse_event
+from .pending import PendingStore
 
 log = logging.getLogger("bruce.relay")
 
@@ -38,42 +40,74 @@ def _kind_for(mime: str) -> str | None:
     return None
 
 
+def _event_to_dict(e: ImsgEvent) -> dict:
+    """ImsgEvent -> raw dict that parse_event reconstructs exactly (for the restart-safe pending store)."""
+    return {"guid": e.guid, "chat_guid": e.chat_guid, "sender": e.sender, "is_from_me": e.is_from_me,
+            "is_group": e.is_group, "text": e.text, "created_at": e.created_at,
+            "attachments": e.attachments, "reply_to_guid": e.reply_to_guid}
+
+
 class Relay:
     def __init__(self, imsg: Imsg, backend: Backend, checkpoint: FileCheckpoint, *,
                  spool_dir: str, poll_interval: float = 2.0, reconnect_delay: float = 3.0,
-                 sent_ledger: FileCheckpoint | None = None,
-                 attachment_max_retries: int = 5, attachment_retry_delay: float = 2.0) -> None:
+                 sent_ledger: FileCheckpoint | None = None, pending: PendingStore | None = None,
+                 attachment_max_wait_s: float = 120.0, attachment_sweep_interval_s: float = 3.0,
+                 attachment_max_events: int = 8) -> None:
         self.imsg = imsg
         self.backend = backend
         self.checkpoint = checkpoint
         # Durable at-most-once ledger of outbound ids we've already attempted to send. Guarantees a
         # reclaimed row (ack lost, lease expired, relay crashed) is NEVER sent to a real person twice.
         self.sent_ledger = sent_ledger
+        # Restart-safe store of messages whose attachment is still downloading — resolved by a later
+        # imsg watch event (imsg 0.13.1 has no message.get) or timed out honestly.
+        self.pending = pending
         self.spool_dir = spool_dir
         self.poll_interval = poll_interval
         self.reconnect_delay = reconnect_delay
-        self.attachment_max_retries = attachment_max_retries
-        self.attachment_retry_delay = attachment_retry_delay
-        self._pending: set[asyncio.Task] = set()   # off-hot-path delayed-attachment resolvers
+        self.attachment_max_wait_s = attachment_max_wait_s
+        self.attachment_sweep_interval_s = attachment_sweep_interval_s
+        self.attachment_max_events = attachment_max_events
         self._stop = asyncio.Event()
+        # Serializes the check-checkpoint -> stage -> post -> mark-checkpoint critical section so the
+        # watch loop and the pending sweep can NEVER both resolve the same guid (which would double-post
+        # -> two conversation turns). Created lazily per running loop (tests drive many short loops).
+        self._lock_obj: asyncio.Lock | None = None
+        self._lock_loop: object | None = None
         os.makedirs(spool_dir, exist_ok=True)
         try:
             os.chmod(spool_dir, 0o700)             # private spool: owner-only
         except OSError:
             pass
 
+    @staticmethod
+    def _now() -> float:
+        return time.time()
+
+    def _inbound_lock(self) -> asyncio.Lock:
+        """One lock per running loop. In production there is a single persistent loop (run()), so this
+        is a real mutex serializing inbound posting; across the many short-lived loops the tests spin up
+        it just yields a fresh, uncontended lock — harmless, since a single loop has no concurrency."""
+        loop = asyncio.get_running_loop()
+        if self._lock_obj is None or self._lock_loop is not loop:
+            self._lock_obj = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock_obj
+
     def stop(self) -> None:
         self._stop.set()
 
     # ---- inbound -----------------------------------------------------------------------------
 
-    async def _stage_attachments(self, event: ImsgEvent) -> tuple[list[dict], bool]:
+    async def _stage_attachments(self, event: ImsgEvent, *, ignore_missing: bool = False) -> tuple[list[dict], bool]:
         """Upload the message's attachments. Returns (normalized_attachments, deferred). deferred=True
-        means a file is still downloading — resolved later off the hot path. Hardened: reject symlinks
-        and non-regular files, realpath the source, cap the count. Logs stay content-free (no paths)."""
+        means a file is still downloading. ignore_missing=True (sweep re-check) ignores the metadata
+        flag and re-stats the real path instead — so a file that landed after the first event resolves.
+        Hardened: reject symlinks and non-regular files, realpath the source, cap the count. Logs stay
+        content-free (no paths)."""
         out: list[dict] = []
         for a in event.attachments[:MAX_ATTACHMENTS_PER_MESSAGE]:
-            if a.get("missing"):
+            if a.get("missing") and not ignore_missing:
                 return [], True  # still downloading -> defer the WHOLE message
             path = a.get("original_path") or a.get("converted_path")
             mime = a.get("mime_type") or a.get("converted_mime_type") or ""
@@ -123,61 +157,93 @@ class Relay:
         log.info("inbound_ok guid=%s status=%s", event.guid, resp.get("status"))
         return resp.get("status", "processed")
 
+    def _timed_out(self, rec: dict, now: float) -> bool:
+        return (int(rec.get("events", 1)) >= self.attachment_max_events
+                or (now - float(rec.get("first_seen", now))) >= self.attachment_max_wait_s)
+
     async def process_inbound(self, event: ImsgEvent) -> str:
         if event.is_from_me:
             return "echo"                                   # Bruce's own message
-        if not event.guid or self.checkpoint.has(event.guid):
+        if not event.guid:
             return "duplicate"
-        try:
-            atts, deferred = await self._stage_attachments(event)
-            if deferred:
-                self._spawn_resolve(event)                  # resolve OFF the watch hot path
-                return "deferred"
-            return await self._post_and_checkpoint(event, atts)
-        except BackendError:
-            log.warning("inbound_retry guid=%s", event.guid)   # do NOT checkpoint -> retried
-            return "retry"
-
-    def _spawn_resolve(self, event: ImsgEvent) -> None:
-        if any(getattr(t, "_guid", None) == event.guid for t in self._pending):
-            return                                          # already resolving this guid
-        task = asyncio.create_task(self._resolve_and_post(event))
-        task._guid = event.guid  # type: ignore[attr-defined]
-        self._pending.add(task)
-        task.add_done_callback(self._pending.discard)
-
-    async def _resolve_and_post(self, event: ImsgEvent) -> None:
-        """Bounded, backed-off resolution of a still-downloading attachment via imsg.get_message (a
-        DEDICATED subprocess). On resolve -> post + checkpoint. On give-up -> post the message flagged
-        attachment_unavailable + checkpoint, so it is never lost NOR retried forever."""
-        for _ in range(self.attachment_max_retries):
+        async with self._inbound_lock():                    # atomic vs. the concurrent pending sweep
+            if self.checkpoint.has(event.guid):
+                return "duplicate"                          # terminal already -> suppress duplicate events
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self.attachment_retry_delay)
-                return                                      # relay stopping
+                atts, deferred = await self._stage_attachments(event)
+                if deferred:
+                    # attachment still downloading: DON'T post, DON'T checkpoint, DON'T lose the message.
+                    # Record it (restart-safe) and wait for a later watch event / the sweep. Bump the seen
+                    # count on a duplicate event for the same guid. Time out honestly if it never resolves.
+                    if self.pending is None:                # no store -> single-shot legacy behavior
+                        return "deferred"
+                    now = self._now()
+                    rec = self.pending.upsert(event.guid, _event_to_dict(event), now)
+                    if self._timed_out(rec, now):
+                        return await self._timeout_terminal(event.guid)
+                    log.info("inbound_pending guid=%s events=%s", event.guid, rec.get("events"))
+                    return "deferred"
+                # resolved (or no attachment): post exactly once + checkpoint, drop any pending record.
+                status = await self._post_and_checkpoint(event, atts)
+                if self.pending is not None:
+                    self.pending.remove(event.guid)
+                return status
+            except BackendError:
+                log.warning("inbound_retry guid=%s", event.guid)   # do NOT checkpoint -> retried
+                return "retry"
+
+    async def _timeout_terminal(self, guid: str) -> str:
+        """The attachment never resolved: post the ORIGINAL message once, flagged attachment_unavailable,
+        checkpoint (so the runtime sends exactly one honest 'resend?' reply), and drop the record."""
+        rec = self.pending.get(guid) if self.pending else None
+        event = parse_event(rec["event"]) if rec else parse_event({"guid": guid})
+        try:
+            await self._post_and_checkpoint(event, [], attachment_unavailable=True)
+        except BackendError:
+            log.warning("inbound_retry guid=%s (timeout post failed)", guid)
+            return "retry"                                  # keep the record; try again next sweep
+        if self.pending is not None:
+            self.pending.remove(guid)
+        log.info("inbound_attachment_unavailable guid=%s", guid)
+        return "attachment_unavailable"
+
+    async def sweep_pending(self, now: float | None = None) -> None:
+        """Re-check every pending record: if the file has now landed (re-stat), post it once; if it has
+        timed out, post attachment_unavailable once; otherwise leave it. Runs off the watch hot path."""
+        if self.pending is None:
+            return
+        now = self._now() if now is None else now
+        for guid, rec in self.pending.items():
+            async with self._inbound_lock():                # atomic vs. a concurrent second watch event
+                if self.checkpoint.has(guid):               # already resolved elsewhere -> drop
+                    self.pending.remove(guid)
+                    continue
+                event = parse_event(rec["event"])
+                try:
+                    atts, _ = await self._stage_attachments(event, ignore_missing=True)
+                except BackendError:
+                    continue                                # transient upload error -> retry next sweep
+                if atts:                                    # file landed -> resolve exactly once
+                    try:
+                        await self._post_and_checkpoint(event, atts)
+                        self.pending.remove(guid)
+                        log.info("inbound_resolved guid=%s", guid)
+                    except BackendError:
+                        continue
+                elif self._timed_out(rec, now):
+                    await self._timeout_terminal(guid)
+
+    async def run_pending_sweep(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.attachment_sweep_interval_s)
+                return                                      # stopping
             except asyncio.TimeoutError:
                 pass
             try:
-                ev2 = await self.imsg.get_message(event.guid)
-                if ev2 is not None:
-                    atts, deferred = await self._stage_attachments(ev2)
-                    if not deferred:
-                        await self._post_and_checkpoint(ev2, atts)
-                        log.info("inbound_resolved guid=%s", event.guid)
-                        return
-            except BackendError:
-                continue                                    # transient upload/post error; keep trying
+                await self.sweep_pending()
             except Exception:
-                continue
-        try:
-            await self._post_and_checkpoint(event, [], attachment_unavailable=True)
-            log.info("inbound_attachment_unavailable guid=%s", event.guid)
-        except BackendError:
-            log.warning("inbound_retry guid=%s (give-up post failed)", event.guid)
-
-    async def drain_pending(self) -> None:
-        """Await any in-flight delayed-attachment resolvers (used by tests + graceful stop)."""
-        while self._pending:
-            await asyncio.gather(*list(self._pending), return_exceptions=True)
+                log.warning("pending_sweep error")          # never crash the relay on a sweep hiccup
 
     async def process_inbound_dict(self, raw: dict) -> str:
         """Convenience wrapper: parse a raw imsg watch object then process it (used by the dry-run
@@ -245,4 +311,4 @@ class Relay:
                     pass
 
     async def run(self) -> None:
-        await asyncio.gather(self.run_inbound(), self.run_outbound())
+        await asyncio.gather(self.run_inbound(), self.run_outbound(), self.run_pending_sweep())

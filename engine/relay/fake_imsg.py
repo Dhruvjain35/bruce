@@ -32,21 +32,9 @@ class InProcessImsg:
         self._send_fails = send_fails      # first N send_text calls raise (transient) then succeed
         self._send_raises = send_raises    # every send_text raises (permanent transport failure)
         self._guid = 0
-        self._resolvable: dict[str, dict] = {}   # guid -> what get_message() returns (delayed resolve)
-        self.get_message_calls = 0
 
     def feed(self, event: dict) -> None:
         self._events.append(event)
-
-    def resolve_to(self, guid: str, raw: dict) -> None:
-        """Register what get_message(guid) resolves to — e.g. the same event with missing removed
-        (delayed download completes), or one that STAYS missing (metadata-but-missing-bytes)."""
-        self._resolvable[guid] = raw
-
-    async def get_message(self, guid: str) -> ImsgEvent | None:
-        self.get_message_calls += 1
-        raw = self._resolvable.get(guid)
-        return parse_event(raw) if raw else None
 
     async def watch(self) -> AsyncIterator[ImsgEvent]:
         # Drain whatever is queued, then end the stream (the Relay treats this as a dropped watch and
@@ -124,17 +112,6 @@ def main() -> None:
             guid = f"fake-out-{guid_seq}"
             _record_sent({"to": params.get("to"), "text": params.get("text"), "file": params.get("file"), "guid": guid})
             print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"guid": guid}}), flush=True)
-        elif method == "message.get":
-            # Dry-run: resolve a message by guid from BRUCE_FAKE_IMSG_RESOLVE (a {guid: event} JSON file).
-            resolved = {}
-            rp = os.environ.get("BRUCE_FAKE_IMSG_RESOLVE")
-            if rp and os.path.exists(rp):
-                try:
-                    with open(rp) as f:
-                        resolved = json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    resolved = {}
-            print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": resolved.get(params.get("guid"))}), flush=True)
         else:
             print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {}}), flush=True)
     if not subscribed:
