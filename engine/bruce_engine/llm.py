@@ -35,6 +35,12 @@ MODEL_VISION = "gpt-5.4-mini"        # vision transcription (image/scanned-PDF -
 MODEL_EXTRACTION = "gpt-5.4-mini"    # structured task/date extraction
 MODEL_DRAFTING = "gpt-5.4-mini"      # grounded drafting
 MODEL_VERIFICATION = "gpt-5.4-mini"  # safety-critical entailment gate
+MODEL_CONVERSATION = "gpt-5.4-mini"  # vision-capable conversation brain (multimodal + structured out)
+
+# Conversation-brain latency/cost bounds (env-overridable) — protect the "replies in a few seconds"
+# promise. Timeout + one retry cap the tail; a timeout still yields exactly one honest fallback reply.
+CONVERSATION_TIMEOUT_S = float(os.environ.get("BRUCE_CONVERSATION_TIMEOUT_S", "22"))
+CONVERSATION_MAX_RETRIES = int(os.environ.get("BRUCE_CONVERSATION_MAX_RETRIES", "1"))
 
 # --- OFFLINE ONLY (Featherless open-weight Qwen) — flag-gated, never on a production path.
 MODEL_FEATHERLESS_EXTRACTION = "Qwen/Qwen3-32B"
@@ -99,6 +105,11 @@ def drafting_model() -> OpenAIChatModel:
 
 def verification_model() -> OpenAIChatModel:
     return openai_model(MODEL_VERIFICATION)
+
+
+def conversation_model() -> OpenAIChatModel:
+    """Vision-capable conversation brain — OpenAI gpt-5.4-mini. Declares vision support to callers."""
+    return openai_model(MODEL_CONVERSATION)
 
 
 # Role-based accessors — OFFLINE ONLY (Featherless). Each raises unless the flag is set, so a
