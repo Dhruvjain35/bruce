@@ -44,7 +44,11 @@ _USER_TABLES = (
     # doesn't leak between tests). Listed with school_sources so CASCADE clears the source_spans/objects.
     "school_sync_cursors school_sources school_source_spans school_institutions school_terms "
     "school_instructors school_courses school_assignments school_materials school_announcements "
-    "school_submissions school_schedule_events school_object_changes"
+    "school_submissions school_schedule_events school_object_changes "
+    # added 0013 — capability access model. Truncate so an entitlement / enrollment / kill state / audit
+    # row never leaks between tests (the migration-seeded global-state row is re-created per test as
+    # needed). capability_audit has a BEFORE UPDATE/DELETE append-only trigger, but TRUNCATE is exempt.
+    "production_account_entitlements staging_test_enrollments capability_global_state capability_audit"
 ).split()
 
 

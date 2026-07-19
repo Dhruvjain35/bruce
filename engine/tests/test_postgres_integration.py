@@ -78,6 +78,11 @@ _RLS_TABLES = [
     "school_sync_cursors", "school_sources", "school_source_spans", "school_institutions", "school_terms",
     "school_instructors", "school_courses", "school_assignments", "school_materials", "school_announcements",
     "school_submissions", "school_schedule_events", "school_object_changes",
+    # Added 0013. The capability access model — entitlements/enrollments/kill state/audit. These are the
+    # admin-write / worker-read class (NOT tenant_isolation) but carry the same FORCE-RLS guarantee, so a
+    # silently-missed policy would be default-ALLOW for the app role. test_capability_access proves the
+    # per-command denial; here they ride the all-tables FORCE-RLS assertion.
+    "production_account_entitlements", "staging_test_enrollments", "capability_global_state", "capability_audit",
 ]
 
 
