@@ -47,6 +47,8 @@ class RelayConfig:
     imsg_bin: str
     poll_interval: float
     reconnect_delay: float
+    attachment_max_retries: int = 5
+    attachment_retry_delay: float = 2.0
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -64,4 +66,6 @@ class RelayConfig:
             imsg_bin=os.environ.get("BRUCE_IMSG_BIN", "imsg"),
             poll_interval=float(os.environ.get("BRUCE_RELAY_POLL_INTERVAL", "2.0")),
             reconnect_delay=float(os.environ.get("BRUCE_RELAY_RECONNECT_DELAY", "3.0")),
+            attachment_max_retries=int(os.environ.get("BRUCE_RELAY_ATTACHMENT_MAX_RETRIES", "5")),
+            attachment_retry_delay=float(os.environ.get("BRUCE_RELAY_ATTACHMENT_RETRY_DELAY", "2.0")),
         )

@@ -34,6 +34,7 @@ class Imsg(Protocol):
     def watch(self) -> AsyncIterator[ImsgEvent]: ...
     async def send_text(self, to: str, text: str) -> str | None: ...        # -> provider message guid
     async def send_file(self, to: str, path: str) -> str | None: ...
+    async def get_message(self, guid: str) -> "ImsgEvent | None": ...        # re-resolve a message by id
 
 
 def parse_event(raw: dict) -> ImsgEvent:
@@ -96,7 +97,9 @@ class SubprocessImsg:
     async def watch(self) -> AsyncIterator[ImsgEvent]:
         self._proc = await asyncio.create_subprocess_exec(
             self.binary, "rpc", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
-        await self._rpc("watch.subscribe", {})
+        # attachments:True == imsg's --attachments: watch pushes then carry the attachments array
+        # (mime_type/original_path/missing/…). Without it the array never populates and images are lost.
+        await self._rpc("watch.subscribe", {"attachments": True})
         assert self._proc.stdout
         while True:
             line = await self._proc.stdout.readline()
@@ -110,22 +113,22 @@ class SubprocessImsg:
             if ev is not None:
                 yield ev
 
-    async def _send(self, params: dict, *, timeout: float = 60.0) -> str | None:
-        """Send via a DEDICATED, short-lived `imsg rpc` process.
+    async def _oneshot_rpc(self, method: str, params: dict, *, timeout: float = 60.0) -> dict:
+        """Run ONE rpc call on a DEDICATED, short-lived `imsg rpc` process, returning the parsed
+        response object.
 
-        Outbound MUST NOT reuse the watch subprocess: watch() is continuously awaiting
-        ``stdout.readline()`` on that process, and a second concurrent readline on the same stream
-        raises ``RuntimeError`` in asyncio. Previously send shared it, so every send that overlapped
-        the watch loop raised AFTER the request had already reached imsg — the message was delivered
-        but recorded as failed, and the durable queue resent it every retry-backoff. A separate
-        process per send removes that shared reader entirely."""
+        Anything other than the watch stream (send, message.get, …) MUST NOT reuse the watch
+        subprocess: watch() is continuously awaiting ``stdout.readline()`` on it, and a second
+        concurrent readline on the same asyncio stream raises ``RuntimeError``. A fresh process per
+        call removes the shared reader entirely (this is the fix that stopped the outbound resend
+        loop; get_message reuses it for exactly the same reason)."""
         proc = await asyncio.create_subprocess_exec(
             self.binary, "rpc",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL)
         try:
             assert proc.stdin and proc.stdout
-            req = {"jsonrpc": "2.0", "id": 1, "method": "send", "params": params}
+            req = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
             proc.stdin.write((json.dumps(req) + "\n").encode())
             await proc.stdin.drain()
             line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
@@ -136,9 +139,10 @@ class SubprocessImsg:
                 except ProcessLookupError:
                     pass
             await proc.wait()
-        if not line:
-            return None
-        resp = json.loads(line.decode())
+        return json.loads(line.decode()) if line else {}
+
+    async def _send(self, params: dict, *, timeout: float = 60.0) -> str | None:
+        resp = await self._oneshot_rpc("send", params, timeout=timeout)
         if "error" in resp:
             raise RuntimeError(f"imsg send error: {resp['error']}")   # a real send failure -> retry
         return (resp.get("result") or {}).get("guid")
@@ -148,3 +152,15 @@ class SubprocessImsg:
 
     async def send_file(self, to: str, path: str) -> str | None:
         return await self._send({"to": to, "file": path})
+
+    async def get_message(self, guid: str) -> ImsgEvent | None:
+        """Re-resolve a single message (with attachments) by id, on a DEDICATED subprocess — used to
+        pick up an attachment that was still downloading (missing=true) on the first watch push. Never
+        touches the watch stream."""
+        resp = await self._oneshot_rpc("message.get", {"guid": guid, "attachments": True})
+        if "error" in resp:
+            return None
+        result = resp.get("result")
+        msg = result if isinstance(result, dict) and result.get("guid") else (
+            result.get("message") if isinstance(result, dict) else None)
+        return parse_event(msg) if isinstance(msg, dict) and msg.get("guid") else None
