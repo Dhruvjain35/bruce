@@ -47,8 +47,9 @@ class RelayConfig:
     imsg_bin: str
     poll_interval: float
     reconnect_delay: float
-    attachment_max_retries: int = 5
-    attachment_retry_delay: float = 2.0
+    attachment_max_wait_s: float = 120.0     # give up on a still-downloading attachment after this
+    attachment_sweep_interval_s: float = 3.0  # how often the pending sweep re-checks / times out
+    attachment_max_events: int = 8           # cap watch events observed for one pending guid
 
     @classmethod
     def from_env(cls) -> "RelayConfig":
@@ -66,6 +67,7 @@ class RelayConfig:
             imsg_bin=os.environ.get("BRUCE_IMSG_BIN", "imsg"),
             poll_interval=float(os.environ.get("BRUCE_RELAY_POLL_INTERVAL", "2.0")),
             reconnect_delay=float(os.environ.get("BRUCE_RELAY_RECONNECT_DELAY", "3.0")),
-            attachment_max_retries=int(os.environ.get("BRUCE_RELAY_ATTACHMENT_MAX_RETRIES", "5")),
-            attachment_retry_delay=float(os.environ.get("BRUCE_RELAY_ATTACHMENT_RETRY_DELAY", "2.0")),
+            attachment_max_wait_s=float(os.environ.get("BRUCE_RELAY_ATTACHMENT_MAX_WAIT_S", "120")),
+            attachment_sweep_interval_s=float(os.environ.get("BRUCE_RELAY_ATTACHMENT_SWEEP_INTERVAL_S", "3")),
+            attachment_max_events=int(os.environ.get("BRUCE_RELAY_ATTACHMENT_MAX_EVENTS", "8")),
         )
