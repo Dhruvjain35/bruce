@@ -840,6 +840,96 @@ class SchoolObjectChange(Base):
     __table_args__ = (Index("ix_school_change_lookup", "user_id", "object_type", "provider_id"),)
 
 
+# ================================================================================================
+# CAPABILITY ACCESS MODEL (Bite 1.5 keystone). The DB-backed replacement for per-user Cloud Run env
+# editing as the conversation-capability access gate. These are the ADMIN-WRITE / WORKER-READ class:
+# readable in a worker_session (the runtime gate reads them ACROSS users, filtered by user_id in the
+# query) and an admin_session (operator management), and writable ONLY in an admin_session — a tenant
+# must NEVER see or write who is entitled, who is enrolled, or the global kill state. Policies + FORCE
+# RLS + the append-only audit trigger live in migration 0013 (never tenant_isolation).
+#
+# Two distinct concepts that must NOT be conflated: a ProductionAccountEntitlement is PERSISTENT
+# production access (no expiry), while a StagingTestEnrollment is TEMPORARY, internal-only, and must
+# NEVER gate production.
+# ================================================================================================
+
+
+class ProductionAccountEntitlement(Base, TSV):
+    """PERSISTENT production access for an onboarded user. There is deliberately NO temporary/expiry
+    field — access persists until exactly one explicit event: the user unlinks their messaging identity,
+    deletes the account, the account is suspended, the subscription/entitlement ends, security/abuse
+    enforcement blocks the account, or a global emergency shutdown fires. One row per user."""
+
+    __tablename__ = "production_account_entitlements"
+    id = _pk()
+    user_id = _owner()
+    account_status: Mapped[str] = mapped_column(String(24), nullable=False, server_default="active")  # active|suspended|closed
+    plan: Mapped[str] = mapped_column(String(32), nullable=False, server_default="alpha")
+    messaging_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    verified_identity: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    suspended_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    entitlement_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Which capabilities this account may use through messaging (e.g. ["conversation"]). JSONB so a new
+    # capability is added without a migration; the access gate checks membership, never rollout_state.
+    capability_availability: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    __table_args__ = (UniqueConstraint("user_id", name="uq_prod_entitlement_user"),)
+
+
+class StagingTestEnrollment(Base, TSV):
+    """TEMPORARY, internal-only enrollment for a staging / canary / unreleased capability. Optional
+    expiry (expires_at), immediate revoke (revoked_at), full audit. MUST NEVER gate production usage:
+    a production entitlement is never expired by this TTL, and a live enrollment never makes production
+    access persistent. Multiple rows over time are allowed (re-enroll after revoke keeps the history)."""
+
+    __tablename__ = "staging_test_enrollments"
+    id = _pk()
+    user_id = _owner()
+    capability: Mapped[str] = mapped_column(String(48), nullable=False)
+    environment: Mapped[str] = mapped_column(String(24), nullable=False)
+    enabled_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enabled_by: Mapped[str | None] = mapped_column(String(200), nullable=True)  # server-derived operator actor
+    audit_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    revoked_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (Index("ix_staging_enrollment_lookup", "user_id", "capability", "environment"),)
+
+
+class CapabilityGlobalState(Base):
+    """Singleton per (capability, environment): the global rollout + emergency-kill switch, UPSERT-seeded
+    by migration 0013. ``killed`` wins over everything in the access gate. ``rollout_state`` is
+    informational in this bite — ``rolled_out`` must NEVER mass-enable; per-user access always comes from
+    an entitlement or an enrollment, never from the rollout state."""
+
+    __tablename__ = "capability_global_state"
+    id = _pk()
+    capability: Mapped[str] = mapped_column(String(48), nullable=False)
+    environment: Mapped[str] = mapped_column(String(24), nullable=False)
+    rollout_state: Mapped[str] = mapped_column(String(16), nullable=False, server_default="default_off")  # default_off|enrolling|rolled_out
+    killed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    __table_args__ = (UniqueConstraint("capability", "environment", name="uq_capability_global_state"),)
+
+
+class CapabilityAudit(Base):
+    """Append-only audit of every capability-access mutation (grant / enroll / revoke / kill). Enforced
+    append-only by migration 0013: admin INSERT+SELECT policies with NO UPDATE/DELETE policy, plus a
+    BEFORE UPDATE/DELETE trigger that raises (so it holds even for a BYPASSRLS/owner role). ``actor`` is
+    SERVER-DERIVED (the operating shell user@host), never a client-supplied string; ``detail`` is
+    redacted and never carries a secret."""
+
+    __tablename__ = "capability_audit"
+    id = _pk()
+    actor: Mapped[str] = mapped_column(String(200), nullable=False)
+    action: Mapped[str] = mapped_column(String(48), nullable=False)  # grant_production|enroll_staging|revoke_staging|kill_on|kill_off
+    capability: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    environment: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    target_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))  # redacted
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 # user-owned tables that get row-level security (users handled separately: a user sees only self)
 RLS_TABLES: tuple[str, ...] = (
     "sources",
@@ -869,4 +959,11 @@ RLS_TABLES: tuple[str, ...] = (
     "school_submissions",
     "school_schedule_events",
     "school_object_changes",
+    # added 0013 — capability access model (Bite 1.5 keystone). NOT tenant_isolation: these carry FORCE
+    # RLS with the admin-write / worker-read class (+ append-only audit), so a tenant can never read or
+    # write them. Listed here so the all-tables FORCE-RLS guarantee covers them too.
+    "production_account_entitlements",
+    "staging_test_enrollments",
+    "capability_global_state",
+    "capability_audit",
 )
