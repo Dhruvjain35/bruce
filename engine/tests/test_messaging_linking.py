@@ -71,6 +71,18 @@ def test_link_code_is_hashed_at_rest(clean_db):
     assert row.code_hash == hmac.new(pepper, code.upper().encode(), hashlib.sha256).hexdigest()
 
 
+def test_pepper_is_whitespace_insensitive(monkeypatch):
+    """Regression: a CLI-minted code (pepper stripped by shell $()) must redeem under the Cloud-Run-
+    injected pepper (trailing newline preserved). _hash MUST normalize so both keys are identical."""
+    from bruce_engine import messaging_store as ms
+    monkeypatch.setenv("BRUCE_LINK_CODE_PEPPER", "s0me-pepper-value")
+    clean = ms._hash("ABC123")
+    monkeypatch.setenv("BRUCE_LINK_CODE_PEPPER", "s0me-pepper-value\n")   # as Cloud Run injects it
+    assert ms._hash("ABC123") == clean
+    monkeypatch.setenv("BRUCE_LINK_CODE_PEPPER", "  s0me-pepper-value  ")  # any stray whitespace
+    assert ms._hash("ABC123") == clean
+
+
 def test_redeem_binds_identity_to_the_code_owner(clean_db):
     uid = uuid4()
     asyncio.run(_ensure_user(uid))

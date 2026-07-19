@@ -36,11 +36,16 @@ LINK_ATTEMPT_LOCKOUT = datetime.timedelta(minutes=15)     # how long a handle st
 
 def _pepper() -> bytes:
     """The server-side link-code pepper — held ONLY in Secret Manager / env, NEVER in the database.
-    Required: we fail closed rather than fall back to an unpeppered digest."""
+    Required: we fail closed rather than fall back to an unpeppered digest.
+
+    .strip() is essential: the same secret is delivered with DIFFERENT trailing bytes depending on the
+    path — Cloud Run injects the secret payload verbatim (a trailing newline survives), while a local
+    `export X="$(gcloud secrets access …)"` drops it. Without normalization, a CLI-minted code hashes
+    under a different key than the API redeems with, and every such code reads as invalid."""
     p = os.environ.get("BRUCE_LINK_CODE_PEPPER")
-    if not p:
+    if not p or not p.strip():
         raise RuntimeError("BRUCE_LINK_CODE_PEPPER is not set — required to hash link codes")
-    return p.encode()
+    return p.strip().encode()
 
 
 def _hash(code: str) -> str:
