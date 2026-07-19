@@ -39,7 +39,12 @@ _USER_TABLES = (
     "relay_devices delivery_attempts "  # added 0007 — self-hosted iMessage relay
     "relay_uploads "  # added 0009 — staged attachment bytes
     "messaging_link_attempts "  # added 0010 — per-handle link brute-force guard
-    "conversation_turns event_candidates"  # added 0011 — conversation brain
+    "conversation_turns event_candidates "  # added 0011 — conversation brain
+    # added 0012 — SchoolConnector canonical academic graph (must be truncated so synced school data
+    # doesn't leak between tests). Listed with school_sources so CASCADE clears the source_spans/objects.
+    "school_sync_cursors school_sources school_source_spans school_institutions school_terms "
+    "school_instructors school_courses school_assignments school_materials school_announcements "
+    "school_submissions school_schedule_events school_object_changes"
 ).split()
 
 
