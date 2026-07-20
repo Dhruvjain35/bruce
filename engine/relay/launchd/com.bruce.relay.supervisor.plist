@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the Bruce relay SUPERVISOR (Bite 1.5 A3). The supervisor is a FOREGROUND process
+  (RunAtLoad + KeepAlive) that owns exactly one relay child; the supervisor does its OWN bounded restart
+  backoff, so KeepAlive here only relaunches the supervisor itself if the whole process dies. launchd is
+  the outer tier; the supervisor is the inner tier.
+
+  A4 (the Mac installer) substitutes @PYTHON@ / @ENGINE_DIR@ / @STATE_DIR@ and installs this to
+  ~/Library/LaunchAgents/. Secrets live in the Keychain (config.py) — NEVER in this plist or in argv.
+  Update/rollback of the pinned commit is reserved for B1.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bruce.relay.supervisor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@PYTHON@</string>
+        <string>-m</string>
+        <string>relay.supervisor</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@ENGINE_DIR@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>@ENGINE_DIR@</string>
+        <key>BRUCE_RELAY_STATE_DIR</key>
+        <string>@STATE_DIR@</string>
+        <!-- BRUCE_API_BASE_URL / BRUCE_RELAY_PINNED_COMMIT and friends are written by the A4 installer.
+             The device secret is read from the Keychain by config.py — it is never placed here. -->
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Relaunch the SUPERVISOR itself if it exits abnormally. The supervisor parks (and stays parked)
+         on a stop directive or a revoked credential, so this does not fight the in-supervisor policy. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Give launchd's own relaunch a floor so a hard crash loop can't spin (the supervisor has its own
+         finer-grained exponential backoff for the relay child). -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Supervisor logs are content-free + rotated by the supervisor itself; these capture only stray
+         stdout/stderr (startup banners), never message content. -->
+    <key>StandardOutPath</key>
+    <string>@STATE_DIR@/supervisor.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>@STATE_DIR@/supervisor.err.log</string>
+</dict>
+</plist>
