@@ -14,6 +14,7 @@ from .backend import HttpBackend
 from .checkpoint import FileCheckpoint
 from .config import RelayConfig
 from .imsg import SubprocessImsg
+from .outbound_ledger import OutboundLedger
 from .pending import PendingStore
 from .relay import Relay
 
@@ -29,7 +30,7 @@ def build_relay(cfg: RelayConfig) -> Relay:
         spool_dir=cfg.spool_dir,
         poll_interval=cfg.poll_interval,
         reconnect_delay=cfg.reconnect_delay,
-        sent_ledger=FileCheckpoint(os.path.join(state, "outbound_sent.json")),   # at-most-once outbound
+        sent_ledger=OutboundLedger(os.path.join(state, "outbound_sent.json")),   # phase-tracked outbound (migrates the legacy format)
         pending=PendingStore(os.path.join(state, "pending_attachments.json")),   # restart-safe delayed attachments
         attachment_max_wait_s=cfg.attachment_max_wait_s,
         attachment_sweep_interval_s=cfg.attachment_sweep_interval_s,

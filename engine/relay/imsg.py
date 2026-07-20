@@ -16,6 +16,12 @@ import json
 from typing import AsyncIterator, Protocol
 
 
+class ImsgSendRejected(Exception):
+    """imsg DEFINITELY declined the send BEFORE accepting any bytes (an explicit error response, or the
+    child was gone before the request was dispatched). No bytes left the machine -> safely retryable.
+    Any OTHER exception from a send is AMBIGUOUS (a transport crash may have straddled the handoff)."""
+
+
 @dataclasses.dataclass
 class ImsgEvent:
     """A normalized inbound event (subset of imsg's watch schema we consume)."""
@@ -145,8 +151,14 @@ class SubprocessImsg:
     async def _send(self, params: dict, *, timeout: float = 60.0) -> str | None:
         resp = await self._oneshot_rpc("send", params, timeout=timeout)
         if "error" in resp:
-            raise RuntimeError(f"imsg send error: {resp['error']}")   # a real send failure -> retry
-        return (resp.get("result") or {}).get("guid")
+            # imsg processed the request and DECLINED it -> definitely no bytes handed off -> retryable.
+            raise ImsgSendRejected(f"imsg declined: {resp['error']}")
+        guid = (resp.get("result") or {}).get("guid")
+        if not guid:
+            # No confirmation guid (e.g. the child exited before responding) -> AMBIGUOUS handoff, never
+            # a silent success. The relay classifies this as handoff_outcome_unknown, not a resend.
+            raise RuntimeError("imsg send: no confirmation guid (ambiguous handoff)")
+        return guid
 
     async def send_text(self, to: str, text: str) -> str | None:
         return await self._send({"to": to, "text": text})
