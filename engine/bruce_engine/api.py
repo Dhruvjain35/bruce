@@ -32,6 +32,7 @@ from . import auth
 from . import calendar_build
 from . import extraction
 from . import intake_store
+from . import internal_test
 from . import messaging_inbound
 from . import messaging_outbound
 from . import messaging_store
@@ -84,6 +85,11 @@ async def _lifespan(_app: "FastAPI"):
 
 
 app = FastAPI(title="Bruce Engine API", version="0.2.0", lifespan=_lifespan)
+
+# E1 — the minimal, secure, INTERNAL zero-terminal staging test surface (server-rendered HTML + JSON,
+# mounted under /internal/test). Gated on the existing auth PLUS a server-side internal allowlist; it
+# can only ever create/revoke a temporary StagingTestEnrollment, never a ProductionAccountEntitlement.
+internal_test.register(app)
 
 # Swappable for tests (monkeypatch to in-memory implementations). Production is Postgres-only.
 _mission_repo = PostgresMissionRepository()
