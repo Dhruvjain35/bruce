@@ -37,13 +37,19 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import getpass
 import json
 import os
+import pwd
 import socket
 import sys
 import time
 from typing import Callable
+
+
+def _login_name() -> str:
+    """The real login user of THIS process, from the password DB by uid — NOT getpass.getuser(), which
+    trusts $LOGNAME/$USER first and so lets `LOGNAME=ceo brucectl pause-outbound` forge the audit actor."""
+    return pwd.getpwuid(os.getuid()).pw_name
 
 # --------------------------------------------------------------------------- structured exit codes
 
@@ -272,7 +278,7 @@ class Deps:
     python: str | None
     now: Callable[[], float] = time.time
     read_status: Callable[[str], "dict | None"] = read_status
-    whoami: Callable[[], str] = getpass.getuser
+    whoami: Callable[[], str] = _login_name    # pwd-by-uid, not env-spoofable (audit-actor integrity)
     hostname: Callable[[], str] = socket.gethostname
     run_cmd: Callable[[list[str]], int] = _default_run_launchctl
     probe_api: Callable[["str | None"], "bool | None"] = _default_probe_api

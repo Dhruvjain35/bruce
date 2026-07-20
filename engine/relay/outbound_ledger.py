@@ -35,6 +35,8 @@ import os
 import time
 from collections import OrderedDict
 
+from .durable import write_json_durable
+
 # Durable delivery phases.
 SEND_INTENT_RECORDED = "send_intent_recorded"
 HANDED_TO_IMSG = "handed_to_imsg"
@@ -101,7 +103,6 @@ class OutboundLedger:
         self._save()
 
     def _save(self) -> None:
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"version": 2, "entries": self._e}, f)
-        os.replace(tmp, self.path)                                     # atomic -> restart-safe
+        # fsync file + dir: a durable phase must survive hard power-loss, else a reverted phase double-
+        # sends an iMessage to a real person (a plain os.replace can be lost from the page cache).
+        write_json_durable(self.path, {"version": 2, "entries": self._e})

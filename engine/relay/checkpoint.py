@@ -11,6 +11,8 @@ import json
 import os
 from collections import deque
 
+from .durable import write_json_durable
+
 
 class FileCheckpoint:
     def __init__(self, path: str, keep: int = 5000) -> None:
@@ -42,7 +44,4 @@ class FileCheckpoint:
         self._save()
 
     def _save(self) -> None:
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"processed": list(self._order)}, f)
-        os.replace(tmp, self.path)  # atomic
+        write_json_durable(self.path, {"processed": list(self._order)})  # fsync file+dir: crash-durable
