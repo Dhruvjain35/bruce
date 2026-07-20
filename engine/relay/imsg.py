@@ -153,3 +153,20 @@ class SubprocessImsg:
 
     async def send_file(self, to: str, path: str) -> str | None:
         return await self._send({"to": to, "file": path})
+
+    async def aclose(self) -> None:
+        """Reap the watch subprocess (called on relay stop / a `stop` directive). Send uses one-shot
+        processes that are already reaped per call; this terminates the long-lived watch child so a
+        parked relay leaves no orphaned imsg process."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
