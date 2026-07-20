@@ -48,7 +48,10 @@ _USER_TABLES = (
     # added 0013 — capability access model. Truncate so an entitlement / enrollment / kill state / audit
     # row never leaks between tests (the migration-seeded global-state row is re-created per test as
     # needed). capability_audit has a BEFORE UPDATE/DELETE append-only trigger, but TRUNCATE is exempt.
-    "production_account_entitlements staging_test_enrollments capability_global_state capability_audit"
+    "production_account_entitlements staging_test_enrollments capability_global_state capability_audit "
+    # added 0014 — relay control plane. Truncate so a pause/kill state never leaks between tests (the
+    # migration-seeded singleton is re-created per test as needed; pause_all UPSERTs with no prior row).
+    "relay_control"
 ).split()
 
 
