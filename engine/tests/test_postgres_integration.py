@@ -83,10 +83,12 @@ _RLS_TABLES = [
     # silently-missed policy would be default-ALLOW for the app role. test_capability_access proves the
     # per-command denial; here they ride the all-tables FORCE-RLS assertion.
     "production_account_entitlements", "staging_test_enrollments", "capability_global_state", "capability_audit",
-    # Added 0014. relay_control is the authoritative outbound kill switch (worker-only, like relay_devices)
-    # — a silently-missed policy would be default-ALLOW for the app role, letting a tenant flip the kill.
-    # test_relay_control_rls_default_deny proves the denial; here it rides the all-tables FORCE-RLS check.
+    # Added 0014. relay_control gates outbound claims (worker-only, like relay_devices) — a silently-missed
+    # policy would be default-ALLOW for the app role, letting a tenant flip the pause. test_relay_control_
+    # rls_default_deny proves the denial; here it rides the all-tables FORCE-RLS check.
     "relay_control",
+    # Added 0015. relay_control_audit — append-only control-plane audit (worker-only, same guarantee).
+    "relay_control_audit",
 ]
 
 
