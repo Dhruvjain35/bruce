@@ -49,6 +49,12 @@ STOP = "stop"
 _SEND, _HOLD, _STOP = "send", "hold", "stop"
 DEFAULT_PAUSED_BACKOFF_S = 30.0   # bounded backoff after a pause/hold (client-side Retry-After analog)
 
+# Process exit codes the entrypoint reports to the A3 supervisor. The supervisor PARKS (stays alive,
+# polls the control plane, resumes when un-stopped) on these two, and RESTARTS on anything else — an
+# ACCIDENTAL clean exit (0) must restart, never park; only an AUTHENTICATED stop parks.
+STOP_DIRECTIVE_EXIT = 75          # an authenticated `stop` directive -> park (remotely resumable)
+REVOKED_CREDENTIAL_EXIT = 78      # EX_CONFIG: revoked/invalid credential -> park (resumes if re-registered)
+
 
 def _kind_for(mime: str) -> str | None:
     if mime.startswith("image/"):
@@ -288,7 +294,7 @@ class Relay:
                     await self.process_inbound(event)
             except AuthError:
                 log.error("relay credential rejected — stopping")
-                self.exit_code = 78                            # revoked -> supervisor parks (no restart)
+                self.exit_code = REVOKED_CREDENTIAL_EXIT       # revoked -> supervisor parks
                 self.stop()
                 return
             except Exception:
@@ -312,6 +318,7 @@ class Relay:
             d = await self.backend.directive()
         except AuthError:
             log.error("relay credential rejected during directive check — stopping")
+            self.exit_code = REVOKED_CREDENTIAL_EXIT       # revoked -> supervisor parks
             return _STOP
         except Exception:
             log.warning("directive_check_failed_closed")   # network/TLS/timeout/malformed -> do not send
@@ -319,6 +326,7 @@ class Relay:
         if d == RUN:
             return _SEND
         if d == STOP:
+            self.exit_code = STOP_DIRECTIVE_EXIT           # AUTHENTICATED stop -> supervisor parks (resumable)
             return _STOP
         if d == PAUSE_OUTBOUND:
             return _HOLD
@@ -399,7 +407,7 @@ class Relay:
             job = await self.backend.claim()
         except AuthError:
             log.error("relay credential rejected on claim — stopping")   # revoked -> stop claiming
-            self.exit_code = 78                                # revoked -> supervisor parks (no restart)
+            self.exit_code = REVOKED_CREDENTIAL_EXIT            # revoked -> supervisor parks
             self.stop()
             return False
         except BackendError:
