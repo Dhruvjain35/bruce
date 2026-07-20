@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
+import sys
 
 from .backend import HttpBackend
 from .checkpoint import FileCheckpoint
@@ -38,6 +40,19 @@ def build_relay(cfg: RelayConfig) -> Relay:
     )
 
 
+async def _run_with_signals(relay: Relay) -> int:
+    """Run the relay, translating SIGTERM/SIGINT into a graceful stop (park), and returning the process
+    exit code the SUPERVISOR reads: 0 = clean park (stop directive / signal), 78 = revoked credential."""
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, relay.stop)      # graceful: set the stop event, let run() unwind
+        except (NotImplementedError, ValueError):
+            pass
+    await relay.run()
+    return relay.exit_code
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -48,9 +63,10 @@ def main() -> None:
     relay = build_relay(cfg)
     logging.getLogger("bruce.relay").info("relay_start base=%s", cfg.base_url)
     try:
-        asyncio.run(relay.run())
+        code = asyncio.run(_run_with_signals(relay))
     except KeyboardInterrupt:
-        pass
+        code = 0
+    sys.exit(code)
 
 
 if __name__ == "__main__":
