@@ -35,6 +35,7 @@ from . import messaging_inbound
 from . import messaging_outbound
 from . import messaging_store
 from . import relay_auth
+from . import relay_control
 from . import relay_uploads
 from . import schema
 from . import task_dispatch
@@ -477,7 +478,14 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
 @app.post("/v1/relay/outbound/claim")
 async def relay_claim_outbound(device: schema.RelayDevice = Depends(current_relay_device)):
     """Claim the next outbound message to send (204 when idle). The relay PULLS — the cloud never
-    calls the Mac. Idempotent + lease-guarded: two pollers never claim the same row."""
+    calls the Mac. Idempotent + lease-guarded: two pollers never claim the same row.
+
+    AUTHORITATIVE outbound kill: BEFORE the lease/claim, if the effective directive is pause_outbound
+    or stop (the whole env is globally paused OR this device is paused/stopped), return 204 WITHOUT
+    claiming — so a paused device can NEVER be handed a message to send. Enforced server-side here,
+    independent of any relay client (the client honoring the directive is belt-and-suspenders in A2)."""
+    if await relay_control.get_directive(device) in relay_control.BLOCKED:
+        return Response(status_code=204)
     c = await messaging_outbound.claim(device.id)
     if c is None:
         return Response(status_code=204)
@@ -504,10 +512,26 @@ async def relay_ack_outbound(outbound_id: UUID, req: RelayOutboundAck,
     return {"ok": True}
 
 
+class RelayHeartbeat(BaseModel):
+    """CONTENT-FREE relay/supervisor status. agent_commit is the pinned relay commit the supervisor
+    reports; uptime_s / restart_count are liveness telemetry. This body MUST NEVER carry message
+    content, handles, chat ids, or file paths — extra fields are ignored, only agent_commit is stored."""
+
+    agent_commit: str | None = None
+    uptime_s: float | None = None
+    restart_count: int | None = None
+
+
 @app.post("/v1/relay/heartbeat")
-async def relay_heartbeat(device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
-    """Device health — authenticating already stamped last_seen_at. Reports whether it's still active."""
-    return {"device_id": str(device.id), "active": device.revoked_at is None}
+async def relay_heartbeat(req: RelayHeartbeat | None = None,
+                          device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
+    """Device/supervisor health. Accepts a content-free status (agent_commit, uptime, restart_count),
+    stamps liveness + supervisor telemetry, and returns the AUTHORITATIVE directive
+    (run|pause_outbound|stop) so the relay/supervisor learns whether to keep sending, pause outbound, or
+    stop. Authenticating already validated (and stamped) the device; a revoked device is rejected upstream."""
+    status = req.model_dump(exclude_none=True) if req is not None else {}
+    directive = await relay_control.record_heartbeat(device, status=status)
+    return {"device_id": str(device.id), "active": device.revoked_at is None, "directive": directive}
 
 
 class RelayUploadRequest(BaseModel):
