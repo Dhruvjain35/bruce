@@ -15,7 +15,6 @@ The core (``bootstrap_device``) is dependency-injected for tests; ``run`` wires 
 
 from __future__ import annotations
 
-import os
 import sys
 
 SERVICE = "com.bruce.relay.device-secret"
@@ -100,11 +99,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--device", required=True)
     p.add_argument("--account", default="default")
     args = p.parse_args(argv)
-    token = os.environ.get("BRUCE_RELAY_BOOTSTRAP_TOKEN")        # short-lived single-use material (not the credential)
+    # The short-lived, single-use bootstrap token is read ONCE from STDIN — never from argv or an
+    # environment variable (which could leak via shell history, `ps`, or a copied command). It is not
+    # printed or persisted, and the local reference is cleared right after registration.
+    token = sys.stdin.readline().strip()
     if not token:
-        print("error: BRUCE_RELAY_BOOTSTRAP_TOKEN not set (mint one with scripts.relay_bootstrap)", file=sys.stderr)
+        print("error: no bootstrap token on stdin (pipe the token minted by scripts.relay_bootstrap)",
+              file=sys.stderr)
         return 64
-    device_id = run(base_url=args.base_url, bootstrap_token=token, device_name=args.device, account=args.account)
+    try:
+        device_id = run(base_url=args.base_url, bootstrap_token=token, device_name=args.device,
+                        account=args.account)
+    except Exception as exc:
+        # generic failure — never echo the token or a credential
+        print(f"error: bootstrap failed ({type(exc).__name__})", file=sys.stderr)
+        return 1
+    finally:
+        token = None                                            # drop the local reference asap
     print(f"device registered + credential stored in Keychain (device_id={device_id}); credential never shown")
     return 0
 

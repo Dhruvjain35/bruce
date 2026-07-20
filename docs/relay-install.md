@@ -13,13 +13,18 @@ then runs the installer once:
 # operator, DB side (mints the temporary bootstrap material — NOT the permanent credential):
 BRUCE_ENV=<env> BRUCE_APP_DATABASE_URL=... python -m scripts.relay_bootstrap mint --device mac-alpha --ttl 600
 
-# on the Mac, once:
-BRUCE_RELAY_BOOTSTRAP_TOKEN=<minted token> \
-  ./install_relay.sh --commit <exact_sha> --api-base-url https://<bruce-api-host> --device mac-alpha
+# on the Mac, once — the installer prompts for the token with input hidden (or pipe it):
+./install_relay.sh --commit <exact_sha> --api-base-url https://<bruce-api-host> --device mac-alpha
+#   (or, to pipe it non-interactively:)
+printf '%s' "<token>" | ./install_relay.sh --bootstrap-token-stdin --commit <exact_sha> --api-base-url <url> --device mac-alpha
 ```
 
-The installer OWNS the credential bootstrap — the operator never sees or pastes the permanent credential.
-Then, to test, just **open Messages on that Mac and text Bruce**.
+The installer OWNS the credential bootstrap and **securely requests the temporary authorization itself**:
+the short-lived, single-use bootstrap token is read from a **hidden prompt** (echo disabled) or from
+**stdin** (`--bootstrap-token-stdin`) and handed to the bootstrap over stdin — **never through argv or an
+environment variable**, never printed, never persisted (the in-memory copy is unset after registration).
+The operator never sees or pastes the permanent credential. Then, to test, just **open Messages on that
+Mac and text Bruce**.
 
 ## Installer flow (`install_relay.sh` → `relay.installer` / `relay.bootstrap`)
 
@@ -84,9 +89,10 @@ fails, **automatically restores the prior version + durable state**.
   `relay/config.py`. The permanent credential is written by `relay.keychain` via **Security.framework**
   (`SecItemAdd`/`SecItemUpdate`), so it exists only in process memory before the Keychain call.
 - The permanent credential never appears in the plist, in argv, in the environment, on disk, or in any
-  log. Only the **short-lived single-use bootstrap token** is passed to the install step (via
-  `BRUCE_RELAY_BOOTSTRAP_TOKEN`), and it is consumed on first use. The relay/​supervisor read the
-  credential only through the Keychain; the API derives device identity from it.
+  log. The **short-lived single-use bootstrap token** is read from a **hidden prompt** or **stdin**
+  (`--bootstrap-token-stdin`) and handed to the bootstrap over stdin — never in argv or an env var — and
+  is consumed on first use. The relay/​supervisor read the credential only through the Keychain; the API
+  derives device identity from it.
 
 ## Directory permissions
 
