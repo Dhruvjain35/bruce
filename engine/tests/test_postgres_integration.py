@@ -89,6 +89,8 @@ _RLS_TABLES = [
     "relay_control",
     # Added 0015. relay_control_audit — append-only control-plane audit (worker-only, same guarantee).
     "relay_control_audit",
+    # Added 0016. relay device bootstrap tokens + append-only registration audit (worker-only).
+    "relay_bootstrap_tokens", "relay_registration_audit",
 ]
 
 
