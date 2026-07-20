@@ -71,7 +71,12 @@ class FakeBackend:
         self.acks.append({"id": outbound_id, "status": status, "guid": provider_message_id, "error": error})
 
     async def heartbeat(self) -> dict:
-        return {"ok": True}
+        return {"ok": True, "directive": "run"}
+
+    async def directive(self) -> str:
+        # default: normal operation (the A2 fail-closed enforcement is exercised in
+        # test_relay_send_enforcement.py with a directive-controllable backend)
+        return "run"
 
 
 def _relay(tmp_path, imsg, backend):
