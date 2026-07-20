@@ -5,7 +5,12 @@
 # Run ONCE, under the dedicated `bruce-relay` GRAPHICAL account (a real login session — NOT ssh, NOT
 # sudo/root), from a checkout of this repo:
 #
-#     ./install_relay.sh --commit <approved_sha> --api-base-url https://api.bruce... [--account default]
+#     ./install_relay.sh --commit <exact_sha> --api-base-url https://api.bruce... --device <name>
+#
+# The installer securely requests the temporary authorization itself: it reads the SHORT-LIVED,
+# SINGLE-USE bootstrap token from a HIDDEN prompt (echo disabled), or from stdin with
+# --bootstrap-token-stdin, and hands it to the bootstrap over stdin — never through argv or an env var.
+# Mint the token first (operator, DB side): `python -m scripts.relay_bootstrap mint --device <name>`.
 #
 # After that: the supervisor + relay start automatically at login (LaunchAgent RunAtLoad), stay healthy,
 # and stop/resume remotely via the control plane. Re-run with a different --commit to UPGRADE, or with a
@@ -14,9 +19,10 @@
 # What it does NOT do (by design):
 #   * NO `git pull` / no fetch of an arbitrary ref — it exports the EXACT approved commit only.
 #   * NO wiping of durable state (checkpoint / outbound ledger / pending attachments survive every path).
-#   * NO permanent credential in the plist, argv, env, disk, or logs — the installer registers over a
+#   * NO permanent credential in the plist, argv, env, disk, or logs — the installer registers over the
 #     short-lived single-use bootstrap token and moves the returned credential straight into the login
 #     Keychain via Security.framework (config.py reads it there). The operator never sees/pastes it.
+#   * NO bootstrap token in argv or env either — it is read from a hidden prompt / stdin and unset after.
 #
 set -euo pipefail
 
@@ -25,6 +31,7 @@ API_BASE_URL="${BRUCE_API_BASE_URL:-}"
 ACCOUNT="default"
 DEVICE=""
 DRY_RUN=0
+BOOTSTRAP_STDIN=0
 INSTALL_DIR="${BRUCE_RELAY_INSTALL_DIR:-$HOME/.bruce-relay-app}"    # versioned code checkouts + `current`
 STATE_DIR="${BRUCE_RELAY_STATE_DIR:-$HOME/.bruce-relay}"            # durable runtime state (never wiped)
 SERVICE="com.bruce.relay.device-secret"
@@ -35,6 +42,7 @@ while [ $# -gt 0 ]; do
     --api-base-url) API_BASE_URL="$2"; shift 2 ;;
     --account) ACCOUNT="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
+    --bootstrap-token-stdin) BOOTSTRAP_STDIN=1; shift ;;
     --install-dir) INSTALL_DIR="$2"; shift 2 ;;
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -94,23 +102,38 @@ else
 fi
 
 # ---- 2. secure device bootstrap: register + store the credential in the Keychain (never shown) ------
-# The installer OWNS the credential bootstrap. Using the SHORT-LIVED, SINGLE-USE bootstrap token
-# (BRUCE_RELAY_BOOTSTRAP_TOKEN, minted by `python -m scripts.relay_bootstrap mint`), it registers the
-# device over TLS, moves the returned PERMANENT credential straight into the login Keychain via
-# Security.framework, verifies it authenticates, and self-revokes on any failure. The permanent
-# credential is never displayed, pasted, written to disk, placed in argv/env, or logged.
+# The installer OWNS the credential bootstrap. The SHORT-LIVED, SINGLE-USE bootstrap token (minted by
+# `python -m scripts.relay_bootstrap mint`) is read SECURELY — a hidden prompt (echo disabled) by
+# default, or piped once via --bootstrap-token-stdin — and handed to the bootstrap over its STDIN. The
+# token is NEVER placed in argv or an environment variable, never printed, and never persisted; the
+# in-memory copy is unset right after. The bootstrap registers over TLS, moves the returned PERMANENT
+# credential straight into the login Keychain via Security.framework, verifies it, and self-revokes on
+# any failure. The permanent credential is never displayed, pasted, written to disk, in argv/env, or logged.
 DEVICE="${DEVICE:-$ACCOUNT}"
 if security find-generic-password -s "$SERVICE" -a "$ACCOUNT" >/dev/null 2>&1; then
   echo "  keychain: device credential already present for account=$ACCOUNT (leaving as-is)"
-elif [ -n "${BRUCE_RELAY_BOOTSTRAP_TOKEN:-}" ]; then
-  echo "  bootstrap: registering device=$DEVICE and storing the credential in the Keychain (never shown)"
-  run env BRUCE_RELAY_BOOTSTRAP_TOKEN="$BRUCE_RELAY_BOOTSTRAP_TOKEN" \
-      PYTHONPATH="$ENGINE_DIR:$REPO_ROOT/engine" "$PYTHON" -m relay.bootstrap \
-      --base-url "$API_BASE_URL" --device "$DEVICE" --account "$ACCOUNT"
+elif [ "$DRY_RUN" = 1 ]; then
+  echo "[dry-run] would securely read the bootstrap token (hidden prompt / stdin) and run relay.bootstrap"
 else
-  echo "error: no device credential in the Keychain and no BRUCE_RELAY_BOOTSTRAP_TOKEN to bootstrap one." >&2
-  echo "  mint one first:  BRUCE_ENV=<env> ... python -m scripts.relay_bootstrap mint --device $DEVICE" >&2
-  exit 64
+  # read the token WITHOUT echo (or from stdin), into a shell variable only — never argv/env.
+  if [ "$BOOTSTRAP_STDIN" = 1 ]; then
+    IFS= read -r BOOTSTRAP_TOKEN || true
+  else
+    printf 'Paste the single-use bootstrap token (input hidden): ' >&2
+    IFS= read -rs BOOTSTRAP_TOKEN || true
+    printf '\n' >&2
+  fi
+  if [ -z "${BOOTSTRAP_TOKEN:-}" ]; then
+    echo "error: no bootstrap token provided. Mint one:" >&2
+    echo "  BRUCE_ENV=<env> ... python -m scripts.relay_bootstrap mint --device $DEVICE" >&2
+    exit 64
+  fi
+  echo "  bootstrap: registering device=$DEVICE and storing the credential in the Keychain (never shown)"
+  # hand the token to the bootstrap over STDIN (not argv, not env).
+  printf '%s\n' "$BOOTSTRAP_TOKEN" | \
+    env PYTHONPATH="$ENGINE_DIR:$REPO_ROOT/engine" "$PYTHON" -m relay.bootstrap \
+        --base-url "$API_BASE_URL" --device "$DEVICE" --account "$ACCOUNT"
+  unset BOOTSTRAP_TOKEN                                        # clear the in-memory value after registration
 fi
 
 # ---- 3. state dir + version symlink + plist + (re)load — all the testable file work in Python -------

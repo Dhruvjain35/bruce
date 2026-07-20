@@ -7,6 +7,7 @@ just-created credential so no active orphan is left. Plus Keychain-helper input 
 
 from __future__ import annotations
 
+import io
 import sys
 
 import pytest
@@ -70,3 +71,36 @@ def test_keychain_rejects_empty_or_null_inputs():
 def test_keychain_unavailable_off_macos():
     with pytest.raises(keychain.KeychainUnavailable):
         keychain.set_password("acct", "secret")
+
+
+# --------------------------------------------------------------------------- bootstrap token via STDIN (A4 patch)
+
+
+def test_main_reads_token_from_stdin_not_env(monkeypatch, capsys):
+    seen = {}
+
+    def _fake_run(*, base_url, bootstrap_token, device_name, account, **kw):
+        seen.update(token=bootstrap_token, device=device_name)
+        return "dev-9"
+    monkeypatch.setattr(bootstrap, "run", _fake_run)
+    monkeypatch.delenv("BRUCE_RELAY_BOOTSTRAP_TOKEN", raising=False)   # never from the environment
+    monkeypatch.setattr(sys, "stdin", io.StringIO("tok-abc-123\n"))   # token arrives on stdin
+    rc = bootstrap.main(["--base-url", "https://x", "--device", "mac-alpha"])
+    assert rc == 0 and seen["token"] == "tok-abc-123" and seen["device"] == "mac-alpha"
+    out = capsys.readouterr().out
+    assert "tok-abc-123" not in out                                    # the token is never printed
+
+
+def test_main_empty_stdin_is_rejected(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))                 # no token piped
+    assert bootstrap.main(["--base-url", "https://x", "--device", "mac-alpha"]) == 64
+
+
+def test_main_failure_is_generic_no_token_echo(monkeypatch, capsys):
+    def _boom(**kw):
+        raise RuntimeError("bootstrap denied: tok-secret-should-not-appear")
+    monkeypatch.setattr(bootstrap, "run", _boom)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("tok-secret-should-not-appear\n"))
+    rc = bootstrap.main(["--base-url", "https://x", "--device", "mac-alpha"])
+    err = capsys.readouterr().err
+    assert rc == 1 and "tok-secret-should-not-appear" not in err        # generic error, no token/secret echo
