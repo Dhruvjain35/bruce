@@ -83,8 +83,11 @@ The relay client implements `process_one_outbound` as:
 1. job = claim()                      # A1 server gate already blocks NEW claims while paused
    on AuthError -> stop the relay (revoked); on BackendError -> back off, return
    if job is None: honor Retry-After from the paused 204, back off, return
-2. if ledger.has(job.id):             # durable at-most-once ledger
-      ack(job.id, "sent"); return     # never re-send a previously-attempted id
+2. recover from the durable delivery PHASE of job.id (see below) — never a blind resend:
+      handed_to_imsg / server_acknowledged -> re-ack "sent" (at-most-once invocation), return
+      send_intent_recorded / handoff_outcome_unknown -> ambiguous: ack "terminal_failed:handoff_unknown"
+          (surface for reconciliation), return
+      none / blocked_before_send / send_failed_before_handoff -> safe to send, fall through
 3. gate = _send_gate()                # authenticated directive check (heartbeat -> directive)
       SEND only if the authenticated directive is exactly `run`
       STOP on a `stop` directive OR a rejected/revoked credential
@@ -97,25 +100,57 @@ The relay client implements `process_one_outbound` as:
    if gate != SEND: release (step 6)
 5. gate = _send_gate()                # FINAL check immediately before the send
    if gate != SEND: release (step 6)
-   ledger.mark(job.id)                # mark BEFORE the send (at-most-once)
-   guid = imsg.send_text(...)         # <-- irreducible: bytes handed off, unrecallable
-   ack(job.id, "sent", guid)          # ack only AFTER the durable send result
+   record(job.id, SEND_INTENT_RECORDED)   # DURABLE before the call (a crash from here is ambiguous)
+   guid = imsg.send_text(...)             # <-- irreducible: bytes handed off, unrecallable
+     on ImsgSendRejected (definite pre-handoff): record SEND_FAILED_BEFORE_HANDOFF; ack retryable; return
+     on any other exception / no guid (ambiguous): record HANDOFF_OUTCOME_UNKNOWN;
+        ack "terminal_failed:handoff_unknown" (surface, never resend, never false-sent); return
+   record(job.id, HANDED_TO_IMSG, guid)   # DURABLE before the ack (lost ack recovers as sent)
+   if ack(job.id, "sent", guid) landed: record(job.id, SERVER_ACKNOWLEDGED)
 6. blocked / not sent:
-   - DO NOT ack "sent" and DO NOT mark the ledger (so it re-sends exactly once on resume)
+   - record BLOCKED_BEFORE_SEND (no handed_to_imsg state) — safely retryable, never marked sent
    - release the lease: ack "retryable_failed" (server re-queues with a backoff)
    - on STOP: also stop claiming and park the relay (reap the imsg child)
    - bounded backoff (Retry-After) so a paused relay never hot-loops
 ```
 
-Invariants A2 must preserve:
+## Durable delivery phases (A2 hardening — `relay/outbound_ledger.py`)
 
-- Check the authoritative directive **immediately before every** imsg send, and **again after** slow
-  attachment/download preparation.
-- **Fail closed** when the directive/heartbeat lookup cannot be authenticated; a network error is never
-  permission to send.
-- Never mark a blocked message as successfully sent; preserve the durable ledger and the pending row.
-- Release or safely expire the lease so the message recovers without duplication on resume.
-- Back off (honor `Retry-After`) while paused to avoid a hot retry/poll loop.
+A single pre-send boolean "marked" state is unsafe: mark → crash before imsg → reclaim treats it as
+attempted → the message is **silently lost**; or an ambiguous send exception is retried → **double-text**.
+The relay instead records the explicit **delivery phase** of each outbound id and derives restart
+recovery from it:
+
+| Phase | Meaning | Restart / reclaim action |
+| --- | --- | --- |
+| *(none)* / `blocked_before_send` | never reached the send; gate blocked | **safe to (re)send** |
+| `send_intent_recorded` | persisted immediately before the imsg call | **ambiguous** → surface `terminal_failed:handoff_unknown`, never resend |
+| `send_failed_before_handoff` | imsg **definitely** declined before accepting bytes (`ImsgSendRejected`) | **safe to retry** (not suppressed forever) |
+| `handoff_outcome_unknown` | a transport crash straddled the handoff | **ambiguous** → surface, never resend, never false-sent |
+| `handed_to_imsg` | imsg returned a guid; persisted **before** the server ack | re-ack **sent**, never re-invoke imsg |
+| `server_acknowledged` | server-row transition confirmed | terminal; re-ack sent if reclaimed |
+
+Accurate terminology (do **not** overstate): **at-most-once imsg invocation**; **exactly-once server-row
+state transition** where enforceable; an **ambiguous delivery state** whenever a crash occurs across the
+external handoff boundary. This is **not** end-to-end exactly-once delivery — iMessage provides no
+transactional handoff-plus-acknowledgement, so a crash in the ~0.3 ms between `send_intent_recorded` and a
+durable outcome is surfaced for bounded reconciliation, not blindly resent. The legacy A2 boolean ledger
+(`{"processed": [...]}`) is migrated to `handed_to_imsg` so an existing relay never suddenly resends.
+
+Proven by `tests/test_relay_delivery_phases.py` (crash-after-intent, imsg reject, subprocess exit, crash
+during invocation, ack-fail-after-send, per-phase restart recovery, no-blind-resend, safe-retry,
+no-false-sent, pause-before-gate, irreducible-window classification, legacy migration).
+
+Invariants A2 preserves:
+
+- Directive re-checked **after claim**, **after slow preparation**, and **immediately before every** send.
+- **Fail closed** on any directive/heartbeat lookup that cannot be authenticated; a network error is
+  never permission to send.
+- Never report a blocked or ambiguous message as confirmed **sent**; at-most-once imsg invocation.
+- Restart behavior is **derived from the durable phase**: before-handoff → retry; handed/unknown → never
+  blind-retry; acknowledged → terminal.
+- Release/expire the lease so a definitely-unsent message recovers exactly once; back off (`Retry-After`)
+  while paused.
 
 ## Is it an "emergency outbound kill switch" now? (A1 + A2)
 

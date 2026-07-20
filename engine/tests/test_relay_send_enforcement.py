@@ -24,6 +24,7 @@ from relay.backend import AuthError, BackendError
 from relay.checkpoint import FileCheckpoint
 from relay.fake_imsg import InProcessImsg
 from relay.imsg import SubprocessImsg
+from relay.outbound_ledger import OutboundLedger
 from relay.pending import PendingStore
 from relay.relay import PAUSE_OUTBOUND, RUN, STOP, Relay
 
@@ -103,7 +104,7 @@ class GateBackend:
 def _relay(tmp_path, imsg, be, *, ledger=True, paused_backoff=30.0):
     r = Relay(imsg=imsg, backend=be, checkpoint=FileCheckpoint(str(tmp_path / "cp.json")),
               spool_dir=str(tmp_path / "spool"), poll_interval=0.005,
-              sent_ledger=FileCheckpoint(str(tmp_path / "sent.json")) if ledger else None)
+              sent_ledger=OutboundLedger(str(tmp_path / "sent.json")) if ledger else None)
     r._paused_backoff_s = paused_backoff
     return r
 
@@ -234,13 +235,13 @@ def test_12_process_restart_while_blocked_recovers_once(tmp_path):
     be = GateBackend(); be.enqueue({"id": "j12", "to": "+1555", "text": "hi"}); be.flip_after_claim = PAUSE_OUTBOUND
     imsg = InProcessImsg()
     r1 = _relay(tmp_path, imsg, be)
-    _run(r1.process_one_outbound())                           # blocked -> released, ledger NOT marked
-    assert r1.sent_ledger is not None and not r1.sent_ledger.has("j12")
+    _run(r1.process_one_outbound())                           # blocked -> released, no handed_to_imsg phase
+    assert r1.sent_ledger is not None and r1.sent_ledger.is_retryable("j12")
     # full restart: brand-new relay objects, SAME ledger/checkpoint files on disk
     be.directive_value = RUN
     r2 = _relay(tmp_path, imsg, be)
     assert _run(r2.process_one_outbound()) is True
-    assert imsg.calls == 1 and r2.sent_ledger.has("j12")
+    assert imsg.calls == 1 and r2.sent_ledger.phase("j12") == "server_acknowledged"
 
 
 def test_13_durable_ledger_survives_restart(tmp_path):
