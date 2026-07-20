@@ -48,7 +48,7 @@ from uuid import UUID
 
 import jwt
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, select
 
 from . import auth, relay_control, schema
@@ -173,6 +173,47 @@ def _require_csrf(request: Request) -> None:
     expected = _csrf_for_session(token)
     if not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=403, detail="invalid or missing CSRF token")
+
+
+# --------------------------------------------------------------------------- magic-link browser sign-in
+# The founder must never paste a JWT, use curl, open dev tools, or run Terminal. An authorized operator
+# mints a SHORT-LIVED magic link (scripts/internal_magic_link.py); the founder just opens it in the
+# browser. The magic token is a limited, short-TTL, e1_magic-scoped JWT that is EXCHANGED for a fresh
+# HttpOnly session cookie — it is never usable as a general API session, and the URL-borne token expires
+# quickly. Access still requires membership of the internal allowlist.
+
+MAGIC_DEFAULT_TTL = 600   # seconds
+
+
+def mint_magic_link_token(user_id: UUID, *, ttl_seconds: int = MAGIC_DEFAULT_TTL) -> str:
+    """Mint the short-lived magic token (operator side — needs BRUCE_JWT_SECRET). e1_magic-scoped so it
+    can only establish an internal-test session, never act as a general bearer."""
+    secret = os.environ.get("BRUCE_JWT_SECRET")
+    if not secret:
+        raise RuntimeError("BRUCE_JWT_SECRET is not set")
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    payload = {"sub": str(user_id), "iat": now, "exp": now + int(ttl_seconds), "e1_magic": True}
+    aud = os.environ.get("BRUCE_JWT_AUDIENCE")
+    if aud:
+        payload["aud"] = aud
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+
+def _verify_magic_token(token: str) -> UUID | None:
+    """Verify a magic token (signature + exp + the e1_magic scope). Returns the user id or None (generic
+    failure — no distinction between bad/expired/wrong-scope, so nothing is enumerable)."""
+    if not token:
+        return None
+    secret = os.environ.get("BRUCE_JWT_SECRET") or ""
+    aud = os.environ.get("BRUCE_JWT_AUDIENCE") or None
+    try:
+        claims = jwt.decode(token, secret, algorithms=["HS256"], audience=aud,
+                            options={"require": ["exp"]})
+        if not claims.get("e1_magic"):
+            return None
+        return UUID(str(claims["sub"]))
+    except (jwt.InvalidTokenError, KeyError, ValueError):
+        return None
 
 
 # --------------------------------------------------------------------------- privacy-safe helpers
@@ -457,6 +498,21 @@ async def login(request: Request) -> JSONResponse:
     return resp
 
 
+async def magic_auth(request: Request) -> HTMLResponse:
+    """Browser sign-in via an operator-minted magic link: verify the short-lived e1_magic token, confirm
+    the user is internal, then EXCHANGE it for a fresh HttpOnly/Secure/SameSite session cookie and
+    redirect into the app. The founder never pastes a token / uses Terminal. Invalid/expired/non-internal
+    -> a GENERIC denied page (no enumeration; identical regardless of why)."""
+    uid = _verify_magic_token(request.query_params.get("t", ""))
+    if uid is None or not is_internal_user(uid):
+        return HTMLResponse(_denied_html(), status_code=403)
+    session = auth.mint_bruce_jwt(uid, ttl_seconds=_session_ttl())   # fresh, normal session cookie
+    resp = RedirectResponse(COOKIE_PATH, status_code=303)
+    _set_session_cookie(resp, session)
+    log.info("internal_test_magic_auth user=%s env=%s", uid, _safe_env())   # content-free
+    return resp
+
+
 async def logout(request: Request) -> JSONResponse:
     """Clear the internal-test session cookie."""
     resp = JSONResponse({"ok": True})
@@ -534,6 +590,7 @@ def register(app) -> None:
     """Attach the E1 internal-test routes to ``app``. Uses ``add_api_route`` directly (see the PREFIX
     note above — include_router of a prefixed APIRouter is unreliable on the pinned FastAPI/Starlette)."""
     app.add_api_route(f"{PREFIX}/login", login, methods=["POST"], include_in_schema=False)
+    app.add_api_route(f"{PREFIX}/auth", magic_auth, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
     app.add_api_route(f"{PREFIX}/logout", logout, methods=["POST"], include_in_schema=False)
     app.add_api_route(f"{PREFIX}/readiness", readiness, methods=["GET"], include_in_schema=False)
     app.add_api_route(f"{PREFIX}/results", results, methods=["GET"], include_in_schema=False)
@@ -561,6 +618,8 @@ background:var(--bg);color:var(--fg)}
 h1{font-size:18px;margin:0 0 2px}.sub{color:var(--mut);margin:0 0 18px}
 .env{display:inline-block;padding:2px 10px;border:1px solid var(--acc);border-radius:12px;color:var(--acc);
 font-weight:700;text-transform:uppercase;letter-spacing:.05em;font-size:12px}
+.envbanner{margin:-24px -24px 18px;padding:8px 24px;background:var(--warn);color:#0d1117;font-weight:700;
+text-transform:uppercase;letter-spacing:.05em;font-size:12px}.envbanner b{text-transform:uppercase}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;margin:14px 0}
 .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
@@ -583,26 +642,37 @@ th{color:var(--mut);text-transform:uppercase;font-size:10px}
 """
 
 
+def _env_banner() -> str:
+    env = html.escape(_safe_env())
+    return f'<div class="envbanner">environment: <b>{env}</b></div>'
+
+
 def _login_html() -> str:
+    """The founder-facing landing: NO raw-token paste. Sign-in is via the secure single-use link an
+    operator generates; the founder just opens it. (The JWT `POST /login` still exists as an internal
+    implementation detail, but the browser experience never asks the founder to paste a token.)"""
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bruce — Internal Test (sign in)</title><style>{_STYLE}</style></head><body><div class="wrap">
+{_env_banner()}
 <h1>Bruce · Internal Test Surface</h1><p class="sub">Authorized internal users only.</p>
 <div class="card"><h2>Sign in</h2>
-<p class="note">Paste your Bruce session token. It is verified server-side; access also requires
-membership of the internal allowlist.</p>
-<div class="row"><input id="tok" type="password" placeholder="Bruce session JWT" style="flex:1;min-width:240px">
-<button class="pri" onclick="signin()">Sign in</button></div>
-<p id="msg" class="bad"></p></div>
-<script>
-async function signin(){{
-  const t=document.getElementById('tok').value.trim();
-  const m=document.getElementById('msg');m.textContent='';
-  const r=await fetch('{COOKIE_PATH}/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    credentials:'same-origin',body:JSON.stringify({{token:t}})}});
-  if(r.ok){{location.href='{COOKIE_PATH}';}}else{{m.textContent='Sign-in failed ('+r.status+').';}}
-}}
-</script></div></body></html>"""
+<p class="note">Open the secure sign-in link your operator generated for you (it expires shortly). No
+token to copy, no Terminal — just open the link in this browser and you'll land here signed in.</p>
+</div></div></body></html>"""
+
+
+def _denied_html() -> str:
+    """Generic not-authorized page (no enumeration — identical for an invalid/expired link and a
+    non-internal user)."""
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bruce — Internal Test</title><style>{_STYLE}</style></head><body><div class="wrap">
+{_env_banner()}
+<h1>Bruce · Internal Test Surface</h1>
+<div class="card"><h2>Not authorized</h2>
+<p class="note">This sign-in link is invalid or has expired. Ask your operator for a fresh link.</p>
+</div></div></body></html>"""
 
 
 def _page_html(user_id: UUID, csrf: str) -> str:
