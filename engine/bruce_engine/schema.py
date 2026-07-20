@@ -478,6 +478,32 @@ class RelayDevice(Base, TSV):
     last_seen_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rotated_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Bite 1.5 A1 — per-device control plane (added by migration 0014). directive is the intended state
+    # (run|pause_outbound|stop); outbound_paused/paused_* are the resolved pause. supervisor_seen_at +
+    # agent_commit are CONTENT-FREE supervisor telemetry (a pinned relay commit, a liveness stamp).
+    directive: Mapped[str] = mapped_column(String(16), nullable=False, server_default="run")  # run|pause_outbound|stop
+    outbound_paused: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    paused_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    paused_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    supervisor_seen_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    agent_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)  # pinned relay commit (content-free)
+
+
+class RelayControl(Base):
+    """Singleton-per-environment AUTHORITATIVE server-side outbound kill switch for the self-hosted
+    iMessage relay (Bite 1.5 A1). When ``outbound_paused`` is true for the running ``BRUCE_ENV``,
+    ``/v1/relay/outbound/claim`` hands out NOTHING — a paused fleet can never be given a message to send,
+    enforced in the claim path server-side and independent of any relay client. INFRASTRUCTURE, not
+    user-owned: worker-only RLS (like relay_devices), UPSERT-seeded per environment by migration 0014."""
+
+    __tablename__ = "relay_control"
+    id = _pk()
+    environment: Mapped[str] = mapped_column(String(24), nullable=False)
+    outbound_paused: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    __table_args__ = (UniqueConstraint("environment", name="uq_relay_control_environment"),)
 
 
 class RelayUpload(Base, TSV):
@@ -966,4 +992,9 @@ RLS_TABLES: tuple[str, ...] = (
     "staging_test_enrollments",
     "capability_global_state",
     "capability_audit",
+    # added 0014 — relay control plane (Bite 1.5 A1). relay_control is the authoritative outbound kill
+    # switch: worker-only (NOT tenant_isolation, like relay_devices), but it carries the same all-tables
+    # FORCE-RLS guarantee so a silently-missed policy could never make it default-ALLOW for the app role
+    # (a tenant reading or flipping the kill switch). test_relay_control_rls_default_deny proves denial.
+    "relay_control",
 )
