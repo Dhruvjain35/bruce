@@ -71,7 +71,12 @@ class FakeBackend:
         self.acks.append({"id": outbound_id, "status": status, "guid": provider_message_id, "error": error})
 
     async def heartbeat(self) -> dict:
-        return {"ok": True}
+        return {"ok": True, "directive": "run"}
+
+    async def directive(self) -> str:
+        # default: normal operation (the A2 fail-closed enforcement is exercised in
+        # test_relay_send_enforcement.py with a directive-controllable backend)
+        return "run"
 
 
 def _relay(tmp_path, imsg, backend):
@@ -318,25 +323,28 @@ def test_outbound_ack_only_after_send(tmp_path):
     assert be.acks == [{"id": "job1", "status": "sent", "guid": "fake-out-1", "error": None}]
 
 
-def test_outbound_send_failure_acks_retryable(tmp_path):
+def test_outbound_definite_pre_handoff_decline_is_retryable(tmp_path):
+    """imsg DEFINITELY declined before accepting bytes (ImsgSendRejected) -> safely retryable, never
+    suppressed forever by the ledger."""
     be = FakeBackend()
     be.claims = [{"id": "job2", "to": "+1555", "text": "hi"}]
-    imsg = InProcessImsg(send_fails=1)       # transient send failure
+    imsg = InProcessImsg(send_rejects=1)     # explicit pre-handoff rejection
     r = _relay(tmp_path, imsg, be)
     _run(r.process_one_outbound())
     assert imsg.sent == []                    # nothing delivered
-    assert be.acks[0]["status"] == "retryable_failed"   # server re-queues; NOT marked sent
+    assert be.acks[0]["status"] == "retryable_failed" and be.acks[0]["error"] == "rejected_pre_handoff"
 
 
-def test_outbound_permanent_send_failure_reported(tmp_path):
+def test_outbound_ambiguous_transport_crash_is_surfaced(tmp_path):
+    """A transport crash (generic exception) is AMBIGUOUS — bytes may or may not have gone. It is never
+    reported confirmed-sent and never blindly resent; it is surfaced as terminal_failed:handoff_unknown."""
     be = FakeBackend()
     be.claims = [{"id": "job3", "to": "+1555", "text": "hi"}]
-    imsg = InProcessImsg(send_raises=True)
+    imsg = InProcessImsg(crash_unknown=True)
     r = _relay(tmp_path, imsg, be)
     _run(r.process_one_outbound())
-    # Relay reports the failure; the SERVER caps attempts -> terminal_failed (see test_relay_io.py).
-    assert be.acks[0]["status"] == "retryable_failed"
-    assert be.acks[0]["guid"] is None
+    assert be.acks[0]["status"] == "terminal_failed"
+    assert be.acks[0]["error"] == "handoff_unknown" and be.acks[0]["guid"] is None
 
 
 def test_outbound_empty_claim_is_noop(tmp_path):
@@ -397,10 +405,11 @@ def _fake_imsg_shim(tmp_path) -> str:
 
 
 def _relay_with_ledger(tmp_path, imsg, be):
+    from relay.outbound_ledger import OutboundLedger
     return Relay(imsg=imsg, backend=be,
                  checkpoint=FileCheckpoint(str(tmp_path / "cp.json")),
                  spool_dir=str(tmp_path / "spool"), poll_interval=0.01,
-                 sent_ledger=FileCheckpoint(str(tmp_path / "sent.json")))
+                 sent_ledger=OutboundLedger(str(tmp_path / "sent.json")))
 
 
 def test_outbound_reclaim_sends_exactly_once(tmp_path):
@@ -432,17 +441,19 @@ def test_outbound_reclaim_idempotent_across_relay_restart(tmp_path):
 
 
 def test_outbound_send_exception_never_resends(tmp_path):
-    """Even the incident's exact condition (send raises) must not cause repeated real sends."""
+    """The incident's exact condition (send raises = ambiguous) must not cause repeated real sends. It is
+    surfaced as handoff_unknown once, and a reclaim NEVER re-invokes imsg (at-most-once invocation)."""
     be = FakeBackend()
     job = {"id": "ob-2", "to": "+15551230000", "text": "x"}
     be.claims = [dict(job), dict(job)]
-    imsg = InProcessImsg(send_raises=True)       # every send raises (like the old RuntimeError)
+    imsg = InProcessImsg(crash_unknown=True)     # ambiguous transport crash (like the old RuntimeError)
     r = _relay_with_ledger(tmp_path, imsg, be)
     assert _run(r.process_one_outbound()) is True
     assert _run(r.process_one_outbound()) is True
-    assert imsg.sent == []                            # never delivered
-    assert be.acks[0]["status"] == "retryable_failed"
-    assert be.acks[1]["status"] == "sent"             # reclaim short-circuits — no further send attempt
+    assert imsg.calls == 1                            # invoked at most once; reclaim does NOT re-invoke
+    assert imsg.sent == []                            # never confirmed delivered
+    assert [a["status"] for a in be.acks] == ["terminal_failed", "terminal_failed"]
+    assert all(a["error"] == "handoff_unknown" for a in be.acks)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shim")

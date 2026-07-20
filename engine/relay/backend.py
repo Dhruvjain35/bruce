@@ -27,12 +27,14 @@ class Backend(Protocol):
     async def claim(self) -> dict | None: ...
     async def ack(self, outbound_id: str, status: str, provider_message_id: str | None, error: str | None) -> None: ...
     async def heartbeat(self) -> dict: ...
+    async def directive(self) -> str: ...
 
 
 class HttpBackend:
     def __init__(self, base_url: str, secret: str) -> None:
         self.base_url = base_url.rstrip("/")
         self.secret = secret
+        self.last_retry_after: float | None = None   # Retry-After from the most recent paused 204 (backoff hint)
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -68,7 +70,12 @@ class HttpBackend:
 
     async def claim(self) -> dict | None:
         r = await self._post("/v1/relay/outbound/claim", {})
-        return None if r.status_code == 204 else r.json()
+        if r.status_code == 204:
+            ra = r.headers.get("Retry-After")   # the server sets this on a PAUSED 204 (widen backoff)
+            self.last_retry_after = float(ra) if ra and ra.isdigit() else None
+            return None
+        self.last_retry_after = None
+        return r.json()
 
     async def ack(self, outbound_id: str, status: str, provider_message_id: str | None, error: str | None) -> None:
         await self._post(f"/v1/relay/outbound/{outbound_id}/ack",
@@ -76,3 +83,21 @@ class HttpBackend:
 
     async def heartbeat(self) -> dict:
         return (await self._post("/v1/relay/heartbeat", {})).json()
+
+    async def directive(self) -> str:
+        """Authenticated read of THIS device's current directive (run|pause_outbound|stop), via the
+        content-free heartbeat endpoint. Device identity comes only from the Bearer credential — never a
+        caller-supplied id. FAIL-CLOSED contract: a 401 (revoked/expired) raises AuthError; a network /
+        TLS / timeout error raises BackendError (both handled upstream as "do not send"); a malformed body
+        (bad JSON, missing/non-string 'directive') raises BackendError. The raw string is returned as-is —
+        an UNKNOWN value is classified as blocked by the caller, never treated as permission to send. The
+        full API response is never logged."""
+        r = await self._post("/v1/relay/heartbeat", {})   # 401 -> AuthError, 5xx/429/network -> BackendError
+        try:
+            data = r.json()
+        except Exception as exc:
+            raise BackendError("malformed directive response") from exc
+        directive = data.get("directive") if isinstance(data, dict) else None
+        if not isinstance(directive, str) or not directive:
+            raise BackendError("malformed directive response")
+        return directive
