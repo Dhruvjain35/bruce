@@ -95,6 +95,9 @@ class Relay:
         self.attachment_sweep_interval_s = attachment_sweep_interval_s
         self.attachment_max_events = attachment_max_events
         self._stop = asyncio.Event()
+        # Process exit code the entrypoint reports to the SUPERVISOR (A3): 0 = clean park (stop directive
+        # / SIGTERM), 78 = revoked/invalid credential (EX_CONFIG — supervisor must NOT restart-loop).
+        self.exit_code = 0
         # Serializes the check-checkpoint -> stage -> post -> mark-checkpoint critical section so the
         # watch loop and the pending sweep can NEVER both resolve the same guid (which would double-post
         # -> two conversation turns). Created lazily per running loop (tests drive many short loops).
@@ -285,6 +288,7 @@ class Relay:
                     await self.process_inbound(event)
             except AuthError:
                 log.error("relay credential rejected — stopping")
+                self.exit_code = 78                            # revoked -> supervisor parks (no restart)
                 self.stop()
                 return
             except Exception:
@@ -395,6 +399,7 @@ class Relay:
             job = await self.backend.claim()
         except AuthError:
             log.error("relay credential rejected on claim — stopping")   # revoked -> stop claiming
+            self.exit_code = 78                                # revoked -> supervisor parks (no restart)
             self.stop()
             return False
         except BackendError:
