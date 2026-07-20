@@ -53,31 +53,58 @@ duplication**:
 
 This is proven by `test_already_claimed_message_recovers_without_duplication`.
 
-## Required A2 fail-closed send algorithm
+## Measured in-flight windows (A2)
 
-A2 (the relay client, a separate PR — not implemented here) MUST implement `process_one_outbound` as:
+Measured by `test_inflight_window_measurement` with in-process fakes, so these are the pure **code-path**
+costs; in production each directive check adds one authenticated heartbeat round-trip (network-dominated).
+
+| Segment | Fake-measured (code path) | Production |
+| --- | --- | --- |
+| claim → first directive check | ~0.2 ms | + one heartbeat RTT |
+| attachment-preparation duration | as injected (0 for text) | download/spool time, ≤ prep budget |
+| final directive check → imsg invocation (**irreducible**) | **~0.3 ms** | ~unchanged (local: one ledger append + the call) |
+| imsg invocation duration | ~µs (fake) | the real Messages hand-off |
+| total maximum *preventable* window | claim → final check | dominated by prep + 2–3 directive RTTs |
+| **irreducible handoff window** | **~0.3 ms** | ~0.3 ms local + the imsg hand-off itself |
+
+**We do not claim zero risk after the imsg invocation.** Once `imsg.send_text` is entered the bytes are
+committed to Messages/Apple and cannot be recalled. The final directive check is the last gate; the code
+between it and the send is only the at-most-once ledger append (required — it must precede the send) plus
+the call itself. `test_adversarial_pause_in_the_irreducible_window_still_sends` injects a pause into
+exactly this window (via a barrier that runs only there) and shows the send still completes — the
+irreducible local race — while `test_1_claimed_then_global_pause_before_send` (pause *before* the final
+check) shows no send. Together they pin the exact boundary.
+
+## A2 fail-closed send algorithm (IMPLEMENTED — `relay.Relay.process_one_outbound`)
+
+The relay client implements `process_one_outbound` as:
 
 ```
-1. job = claim()                      # server gate already blocks NEW claims while paused
-   if job is None: back off (honor Retry-After on the 204), return
+1. job = claim()                      # A1 server gate already blocks NEW claims while paused
+   on AuthError -> stop the relay (revoked); on BackendError -> back off, return
+   if job is None: honor Retry-After from the paused 204, back off, return
 2. if ledger.has(job.id):             # durable at-most-once ledger
       ack(job.id, "sent"); return     # never re-send a previously-attempted id
-3. directive = authenticated_directive_check()   # e.g. heartbeat -> directive
-      - fail CLOSED: if this cannot be AUTHENTICATED (auth error, bad/expired
-        credential, unexpected shape) → DO NOT SEND. Do not treat a network
-        error as permission to send.
-      - if directive in {pause_outbound, stop} → DO NOT SEND (go to step 6)
-4. prepare attachments / slow work (if any)
-   re-run step 3 AFTER preparation (a pause may have arrived during the slow work)
-5. ledger.mark(job.id)                # mark BEFORE the send (at-most-once)
-   guid = imsg.send_text(...)         # <-- the only irreducible in-flight point
-   ack(job.id, "sent", guid)
+3. gate = _send_gate()                # authenticated directive check (heartbeat -> directive)
+      SEND only if the authenticated directive is exactly `run`
+      STOP on a `stop` directive OR a rejected/revoked credential
+      HOLD on pause_outbound, an UNKNOWN directive, OR any failure to get a clean
+           authenticated answer (network / TLS / timeout / malformed / invalid env)
+      -- a network/backend error is NEVER permission to send --
+   if gate != SEND: release (step 6)
+4. payload = prepare()                # text today; attachment download/spool is future (slow)
+   gate = _send_gate()                # RE-CHECK after slow preparation
+   if gate != SEND: release (step 6)
+5. gate = _send_gate()                # FINAL check immediately before the send
+   if gate != SEND: release (step 6)
+   ledger.mark(job.id)                # mark BEFORE the send (at-most-once)
+   guid = imsg.send_text(...)         # <-- irreducible: bytes handed off, unrecallable
+   ack(job.id, "sent", guid)          # ack only AFTER the durable send result
 6. blocked / not sent:
-   - DO NOT ack "sent" (never mark a blocked message delivered)
-   - release the lease (ack "retryable_failed") OR let it expire — the server keeps
-     the durable row pending; on resume it is reclaimed exactly once
-   - stop accepting new outbound work immediately; idle-poll with backoff (Retry-After)
-     so a paused relay never hot-loops
+   - DO NOT ack "sent" and DO NOT mark the ledger (so it re-sends exactly once on resume)
+   - release the lease: ack "retryable_failed" (server re-queues with a backoff)
+   - on STOP: also stop claiming and park the relay (reap the imsg child)
+   - bounded backoff (Retry-After) so a paused relay never hot-loops
 ```
 
 Invariants A2 must preserve:
@@ -89,3 +116,15 @@ Invariants A2 must preserve:
 - Never mark a blocked message as successfully sent; preserve the durable ledger and the pending row.
 - Release or safely expire the lease so the message recovers without duplication on resume.
 - Back off (honor `Retry-After`) while paused to avoid a hot retry/poll loop.
+
+## Is it an "emergency outbound kill switch" now? (A1 + A2)
+
+With **A1** (authoritative server-side claim gate + audited operator control) **and A2** (fail-closed
+client-side send enforcement — directive re-checked after claim, after preparation, and immediately
+before every imsg send; fail-closed on any auth/network/malformed/unknown/invalid-env condition; blocked
+messages released and recovered exactly once; paused relays back off; `stop` parks and reaps the child),
+the combined system can honestly be called an **emergency outbound kill switch** — with one stated
+caveat: it cannot recall bytes already handed to iMessage. The irreducible window is ~0.3 ms of local
+code (one ledger append) plus the physical Messages hand-off; everything before that is prevented,
+fail-closed. Full end-to-end liveness (keeping the relay running so a `run` fleet actually drains) is
+**A3** (the supervisor), which is out of scope here.
