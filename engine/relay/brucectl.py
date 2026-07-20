@@ -32,7 +32,8 @@ def read_status(path: str | None = None) -> dict | None:
 
 
 # fields we surface — an explicit allowlist so a status file can never leak an unexpected field.
-_FIELDS = ("state", "pinned_commit", "uptime_s", "restart_count", "relay_pid", "updated_at")
+_FIELDS = ("state", "park_reason", "pinned_commit", "uptime_s", "restart_count", "relay_pid",
+           "relay_pgid", "updated_at")
 
 # a status older than this (server clock skew aside) is treated as STALE (supervisor not writing).
 STALE_AFTER_S = 60.0
