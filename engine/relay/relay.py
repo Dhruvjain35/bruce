@@ -21,7 +21,15 @@ import time
 
 from .backend import AuthError, Backend, BackendError
 from .checkpoint import FileCheckpoint
-from .imsg import Imsg, ImsgEvent, parse_event
+from .imsg import Imsg, ImsgEvent, ImsgSendRejected, parse_event
+from .outbound_ledger import (
+    BLOCKED_BEFORE_SEND,
+    HANDED_TO_IMSG,
+    HANDOFF_OUTCOME_UNKNOWN,
+    SEND_FAILED_BEFORE_HANDOFF,
+    SEND_INTENT_RECORDED,
+    SERVER_ACKNOWLEDGED,
+)
 from .pending import PendingStore
 
 log = logging.getLogger("bruce.relay")
@@ -321,20 +329,29 @@ class Relay:
             await self._prepare_hook(job)
         return {"text": job.get("text", "")}
 
-    async def _safe_ack(self, oid: str, status: str, guid: str | None, error: str | None) -> None:
-        """Ack, swallowing a transient ack failure: the durable server row then recovers via lease expiry
-        (and the at-most-once ledger prevents any resend), so a failed ack never crashes the loop."""
+    async def _safe_ack(self, oid: str, status: str, guid: str | None, error: str | None) -> bool:
+        """Ack, swallowing a transient ack failure (returns True iff it landed). A failed ack never
+        crashes the loop: the durable phase stays at handed_to_imsg, so a reclaim re-acks 'sent' without a
+        duplicate imsg invocation."""
         try:
             await self.backend.ack(oid, status, guid, error)
+            return True
         except (BackendError, AuthError):
             log.warning("ack_failed id=%s status=%s (row recovers via lease)", oid, status)
+            return False
+
+    def _record(self, oid: str, phase: str, *, guid: str | None = None) -> None:
+        """Persist a durable delivery phase (no-op when no ledger is wired)."""
+        if self.sent_ledger is not None:
+            self.sent_ledger.record(oid, phase, guid=guid)
 
     async def _handle_blocked(self, job: dict, gate: str, *, stage: str) -> bool:
-        """A claimed message must NOT be sent (pause / stop / fail-closed lookup). Release the lease so the
-        durable row recovers WITHOUT duplication: ack retryable_failed (server re-queues with a backoff),
-        leaving the at-most-once ledger UNMARKED so it is re-sendable exactly once on resume. Never mark it
-        sent, never create a second row. On _STOP (stop directive or revoked credential), also stop
-        claiming and park the relay (reap the imsg child). Bounded backoff prevents a hot reclaim loop."""
+        """A claimed message must NOT be sent (pause / stop / fail-closed lookup). It never reached the
+        send-intent phase, so it is safely retryable: record BLOCKED_BEFORE_SEND and release the lease
+        (ack retryable_failed) — never marked sent, never a handed_to_imsg state, reclaimable exactly once
+        on resume. On _STOP (stop directive or revoked credential), also stop claiming and park the relay
+        (reap the imsg child). Bounded backoff prevents a hot reclaim loop."""
+        self._record(str(job["id"]), BLOCKED_BEFORE_SEND)
         await self._safe_ack(job["id"], "retryable_failed", None, f"blocked:{gate}")
         log.info("outbound_blocked id=%s gate=%s stage=%s", job["id"], gate, stage)  # content-free
         self._backoff_s = self._paused_backoff_s
@@ -343,9 +360,37 @@ class Relay:
             await self.aclose()
         return False
 
+    async def _reclaim_by_phase(self, job: dict, oid: str) -> bool | None:
+        """Restart/reclaim recovery DERIVED FROM the durable delivery phase — never a blind resend, never
+        a false 'sent'. Returns True/False when handled here, or None to fall through to a fresh send.
+
+          handed_to_imsg / server_acknowledged -> bytes were already handed to imsg (at-most-once
+              invocation): converge the server row to 'sent', do NOT resend.
+          send_intent_recorded / handoff_outcome_unknown -> a crash straddled the external handoff
+              boundary: AMBIGUOUS. Surface as terminal_failed:handoff_unknown for bounded reconciliation;
+              do NOT resend, do NOT report confirmed sent.
+          None / blocked_before_send / send_failed_before_handoff -> the bytes definitely did not go:
+              safe to (re)send -> fall through."""
+        phase = self.sent_ledger.phase(oid)
+        if phase in (HANDED_TO_IMSG, SERVER_ACKNOWLEDGED):
+            g = self.sent_ledger.guid(oid)
+            if await self._safe_ack(job["id"], "sent", g, None):
+                self._record(oid, SERVER_ACKNOWLEDGED, guid=g)
+            log.info("outbound_reack_after_handoff id=%s", job["id"])   # lost ack recovered as sent
+            return True
+        if phase in (SEND_INTENT_RECORDED, HANDOFF_OUTCOME_UNKNOWN):
+            self._record(oid, HANDOFF_OUTCOME_UNKNOWN)
+            await self._safe_ack(job["id"], "terminal_failed", None, "handoff_unknown")
+            log.warning("outbound_handoff_unknown id=%s (reclaim; surfaced)", job["id"])
+            return True
+        return None                                                    # safe to (re)send
+
     async def process_one_outbound(self) -> bool:
-        """Claim + fail-closed send one outbound message. Returns True only when a message was actually
-        sent or re-acked (so the loop keeps draining); False on idle/blocked (so the loop backs off)."""
+        """Claim + fail-closed, PHASE-tracked send of one outbound message. Returns True only when a
+        message was actually sent, re-acked, or surfaced (so the loop keeps draining); False on
+        idle/blocked (so the loop backs off). Guarantees: at-most-once imsg INVOCATION; exactly-once
+        server-row transition where enforceable; an AMBIGUOUS state (never a false 'sent', never a blind
+        resend) whenever a crash straddles the external imsg handoff. See relay/outbound_ledger.py."""
         try:
             job = await self.backend.claim()
         except AuthError:
@@ -362,12 +407,11 @@ class Relay:
             return False
         oid = str(job["id"])
 
-        # At-most-once: an id we already ATTEMPTED is never re-sent — just re-ack (a reclaimed row from a
-        # lost ack / expired lease / crash). Checked before the gate; it does not send.
-        if self.sent_ledger is not None and self.sent_ledger.has(oid):
-            await self._safe_ack(job["id"], "sent", None, None)
-            log.info("outbound_skip_resend id=%s (already attempted)", job["id"])
-            return True
+        # Restart/reclaim recovery derived from the durable phase (never a blind resend).
+        if self.sent_ledger is not None:
+            recovered = await self._reclaim_by_phase(job, oid)
+            if recovered is not None:
+                return recovered
 
         # (2) FAIL-CLOSED directive check after claim, BEFORE any preparation.
         gate = await self._send_gate()
@@ -387,25 +431,45 @@ class Relay:
         if gate != _SEND:
             return await self._handle_blocked(job, gate, stage="pre_send")
 
-        # At-most-once: mark BEFORE the send. A held message never reaches here, so a paused/blocked row
-        # is always re-sendable exactly once on resume.
-        if self.sent_ledger is not None:
-            self.sent_ledger.mark(oid)
+        # Persist SEND_INTENT_RECORDED DURABLY before the imsg call. A crash from here until a terminal
+        # phase is AMBIGUOUS (we cannot know whether imsg was invoked/accepted) — on reclaim it is
+        # surfaced as handoff_unknown, never blindly resent, never falsely reported sent.
+        self._record(oid, SEND_INTENT_RECORDED)
 
-        # --- IRREDUCIBLE HANDOFF WINDOW (docs/relay-emergency-stop.md): only the ledger append above and
+        # --- IRREDUCIBLE HANDOFF WINDOW (docs/relay-emergency-stop.md): only the intent record above and
         #     the send call itself run after the final gate. A pause landing here CANNOT be honored — the
         #     bytes are handed to imsg and cannot be recalled. Keep this region minimal. ---
         if self._send_barrier is not None:          # test-only deterministic race injection (no-op in prod)
             await self._send_barrier()
         try:
             guid = await self.imsg.send_text(job["to"], payload["text"])   # attachments outbound: future
+        except ImsgSendRejected:
+            # DEFINITE pre-handoff decline: no bytes left the machine -> safely retryable, NOT suppressed
+            # forever by the ledger and NOT a duplicate risk.
+            self._record(oid, SEND_FAILED_BEFORE_HANDOFF)
+            await self._safe_ack(job["id"], "retryable_failed", None, "rejected_pre_handoff")
+            log.info("outbound_rejected_pre_handoff id=%s", job["id"])
+            return True
         except Exception:
-            # Ledger already blocks a resend; report failure so the server moves it out of pending.
-            await self._safe_ack(job["id"], "retryable_failed", None, "send_error")
+            # AMBIGUOUS: a transport crash across the boundary — the bytes may or may not have gone.
+            # Never resend blindly, never report confirmed sent; surface for bounded reconciliation.
+            self._record(oid, HANDOFF_OUTCOME_UNKNOWN)
+            await self._safe_ack(job["id"], "terminal_failed", None, "handoff_unknown")
+            log.warning("outbound_handoff_unknown id=%s", job["id"])
+            return True
+        if not guid:
+            # A send with no confirmation guid is treated as ambiguous, never a silent success.
+            self._record(oid, HANDOFF_OUTCOME_UNKNOWN)
+            await self._safe_ack(job["id"], "terminal_failed", None, "handoff_unknown")
+            log.warning("outbound_handoff_unknown id=%s (no guid)", job["id"])
             return True
 
-        # (7,8) durable send result recorded, THEN ack (only after the result is durable).
-        await self._safe_ack(job["id"], "sent", guid, None)
+        # HANDED_TO_IMSG recorded DURABLY BEFORE the server ack, so a lost/failed ack recovers as 'sent'
+        # (re-acked on reclaim) without a duplicate imsg invocation. Only advance to SERVER_ACKNOWLEDGED
+        # if the ack actually landed — otherwise leave the phase at handed_to_imsg for reclaim recovery.
+        self._record(oid, HANDED_TO_IMSG, guid=guid)
+        if await self._safe_ack(job["id"], "sent", guid, None):
+            self._record(oid, SERVER_ACKNOWLEDGED, guid=guid)
         log.info("outbound_sent id=%s", job["id"])
         return True
 
