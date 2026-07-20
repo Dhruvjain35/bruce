@@ -458,3 +458,60 @@ def test_page_dashboard_embeds_csrf_when_internal(clean_db, monkeypatch):
     assert r.status_code == 200
     assert "Test controls" in r.text
     assert internal_test._csrf_for_session(_token(uid)) in r.text
+
+
+# --------------------------------------------------------------------------- magic-link browser sign-in (A4/E1 UX)
+
+
+def test_magic_link_signs_in_internal_user(clean_db, monkeypatch):
+    """An operator-minted magic link exchanges for a fresh Secure/HttpOnly/SameSite session cookie and
+    lands the founder in the authenticated view — no token paste."""
+    uid = uuid4(); _make_internal(monkeypatch, uid)
+    c = _client()
+    tok = internal_test.mint_magic_link_token(uid, ttl_seconds=600)
+    r = c.get(f"/internal/test/auth?t={tok}", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == internal_test.COOKIE_PATH
+    setc = r.headers.get("set-cookie", "").lower()
+    assert "httponly" in setc and "secure" in setc and "samesite=strict" in setc
+    # the cookie now authenticates the page (authenticated view, not the sign-in landing)
+    page = c.get("/internal/test")
+    assert page.status_code == 200 and "sign-in link" not in page.text.lower()
+
+
+def test_magic_link_non_internal_is_generic_denied(clean_db, monkeypatch):
+    """A magic token for a NON-internal user is refused with a generic denied page (no enumeration)."""
+    internal, outsider = uuid4(), uuid4()
+    _make_internal(monkeypatch, internal)                      # allowlist has ONLY `internal`
+    c = _client()
+    r = c.get(f"/internal/test/auth?t={internal_test.mint_magic_link_token(outsider)}", follow_redirects=False)
+    assert r.status_code == 403 and "not authorized" in r.text.lower()
+    assert internal_test.SESSION_COOKIE not in r.headers.get("set-cookie", "")
+
+
+def test_magic_link_invalid_or_expired_is_denied(clean_db, monkeypatch):
+    uid = uuid4(); _make_internal(monkeypatch, uid)
+    c = _client()
+    assert c.get("/internal/test/auth?t=not-a-token", follow_redirects=False).status_code == 403
+    expired = internal_test.mint_magic_link_token(uid, ttl_seconds=-5)
+    assert c.get(f"/internal/test/auth?t={expired}", follow_redirects=False).status_code == 403
+
+
+def test_a_plain_session_jwt_is_not_accepted_as_a_magic_token(clean_db, monkeypatch):
+    """The magic endpoint requires the e1_magic scope — a normal session JWT cannot sign in via /auth
+    (it is not a general bearer channel)."""
+    uid = uuid4(); _make_internal(monkeypatch, uid)
+    assert internal_test._verify_magic_token(_token(uid)) is None   # no e1_magic claim -> rejected
+
+
+def test_login_landing_has_no_token_paste_and_shows_env_banner(clean_db, monkeypatch):
+    uid = uuid4(); _make_internal(monkeypatch, uid)
+    c = _client()
+    body = c.get("/internal/test").text.lower()               # unauthenticated -> the sign-in landing
+    assert "envbanner" in body and "environment" in body       # visible staging environment banner
+    assert 'type="password"' not in body and "paste your bruce session token" not in body
+
+
+def test_mint_magic_requires_signing_secret(monkeypatch):
+    monkeypatch.delenv("BRUCE_JWT_SECRET", raising=False)
+    with pytest.raises(RuntimeError):
+        internal_test.mint_magic_link_token(uuid4())
