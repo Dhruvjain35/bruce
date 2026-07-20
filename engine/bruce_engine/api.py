@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import logging
 import os
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -475,17 +476,39 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
     return {"status": outcome.status, "mission_id": str(outcome.mission_id) if outcome.mission_id else None}
 
 
+# Backoff hint the server sends on a paused 204 so a polling relay widens its interval while stopped
+# instead of hot-looping. A2 honors Retry-After; the current relay also already backs off poll_interval
+# on any empty poll, so a paused 204 never becomes a tight loop.
+PAUSED_RETRY_AFTER_S = 30
+
+
+def _paused_204() -> Response:
+    return Response(status_code=204, headers={"Retry-After": str(PAUSED_RETRY_AFTER_S)})
+
+
 @app.post("/v1/relay/outbound/claim")
 async def relay_claim_outbound(device: schema.RelayDevice = Depends(current_relay_device)):
     """Claim the next outbound message to send (204 when idle). The relay PULLS — the cloud never
     calls the Mac. Idempotent + lease-guarded: two pollers never claim the same row.
 
-    AUTHORITATIVE outbound kill: BEFORE the lease/claim, if the effective directive is pause_outbound
-    or stop (the whole env is globally paused OR this device is paused/stopped), return 204 WITHOUT
-    claiming — so a paused device can NEVER be handed a message to send. Enforced server-side here,
-    independent of any relay client (the client honoring the directive is belt-and-suspenders in A2)."""
-    if await relay_control.get_directive(device) in relay_control.BLOCKED:
-        return Response(status_code=204)
+    AUTHORITATIVE gate on NEW CLAIMS: BEFORE the lease/claim, if the effective directive is
+    pause_outbound or stop (the whole env is globally paused OR this device is paused/stopped), return
+    204 WITHOUT claiming — so no new or reclaimed message is ever leased to a paused device. Enforced
+    server-side here, independent of any relay client. FAIL-CLOSED: if the directive cannot be resolved
+    (e.g. a misconfigured BRUCE_ENV), treat it as paused and hand out nothing rather than risk a send.
+
+    This gates the CLAIM only; it does not retract a message already claimed before the pause. That
+    in-flight non-send is A2's pre-send directive re-check (see docs/relay-emergency-stop.md). An
+    already-claimed-but-unsent message is never re-handed out while paused and is reclaimable exactly
+    once on resume (no duplication)."""
+    try:
+        blocked = await relay_control.get_directive(device) in relay_control.BLOCKED
+    except Exception:
+        # Content-free: never log ids/handles/content — only that the gate failed closed.
+        logging.getLogger("bruce.relay").warning("claim_gate_failed_closed device_present=%s", device is not None)
+        blocked = True
+    if blocked:
+        return _paused_204()
     c = await messaging_outbound.claim(device.id)
     if c is None:
         return Response(status_code=204)
@@ -526,9 +549,11 @@ class RelayHeartbeat(BaseModel):
 async def relay_heartbeat(req: RelayHeartbeat | None = None,
                           device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
     """Device/supervisor health. Accepts a content-free status (agent_commit, uptime, restart_count),
-    stamps liveness + supervisor telemetry, and returns the AUTHORITATIVE directive
+    stamps liveness + supervisor telemetry, and returns the authoritative directive
     (run|pause_outbound|stop) so the relay/supervisor learns whether to keep sending, pause outbound, or
-    stop. Authenticating already validated (and stamped) the device; a revoked device is rejected upstream."""
+    stop. Device identity comes ONLY from the authenticated credential (current_relay_device) — never a
+    caller-supplied device_id; a revoked device is rejected upstream (401) and can neither heartbeat nor
+    claim."""
     status = req.model_dump(exclude_none=True) if req is not None else {}
     directive = await relay_control.record_heartbeat(device, status=status)
     return {"device_id": str(device.id), "active": device.revoked_at is None, "directive": directive}
