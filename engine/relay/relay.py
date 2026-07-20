@@ -31,6 +31,16 @@ MAX_ATTACHMENTS_PER_MESSAGE = 10
 ALLOWED_MIME = {"image/png", "image/jpeg", "image/heic", "image/heif", "image/webp", "application/pdf", "text/plain"}
 _EXE_MAGIC = (b"\x7fELF", b"MZ", b"\xca\xfe\xba\xbe", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"#!", b"PK\x03\x04")
 
+# Authoritative relay directives (mirror the server's relay_control vocabulary). The relay client SENDS
+# only when an authenticated check returns exactly RUN; everything else fails closed (no send).
+RUN = "run"
+PAUSE_OUTBOUND = "pause_outbound"
+STOP = "stop"
+# Gate outcomes (internal): SEND only on an authenticated run; HOLD = don't send + preserve + back off;
+# STOP = don't send + stop claiming + park.
+_SEND, _HOLD, _STOP = "send", "hold", "stop"
+DEFAULT_PAUSED_BACKOFF_S = 30.0   # bounded backoff after a pause/hold (client-side Retry-After analog)
+
 
 def _kind_for(mime: str) -> str | None:
     if mime.startswith("image/"):
@@ -48,6 +58,14 @@ def _event_to_dict(e: ImsgEvent) -> dict:
 
 
 class Relay:
+    # Outbound emergency-stop hooks/state (class defaults; tests set instance attrs). Prod values are
+    # None/no-op — the hooks exist ONLY so tests can drive slow-prep and the irreducible race window
+    # deterministically.
+    _prepare_hook = None       # optional async(job) simulating slow attachment preparation
+    _send_barrier = None       # optional async() run in the irreducible window (final gate -> imsg send)
+    _backoff_s: float | None = None   # set per cycle; run_outbound honors it (bounded paused backoff)
+    _paused_backoff_s: float = DEFAULT_PAUSED_BACKOFF_S
+
     def __init__(self, imsg: Imsg, backend: Backend, checkpoint: FileCheckpoint, *,
                  spool_dir: str, poll_interval: float = 2.0, reconnect_delay: float = 3.0,
                  sent_ledger: FileCheckpoint | None = None, pending: PendingStore | None = None,
@@ -266,49 +284,158 @@ class Relay:
             if not self._stop.is_set():
                 await asyncio.sleep(self.reconnect_delay)     # reconnect
 
-    # ---- outbound ----------------------------------------------------------------------------
+    # ---- outbound (FAIL-CLOSED send enforcement — A2) ----------------------------------------
+    # The relay SENDS only when an authenticated directive check returns exactly `run`. The check runs
+    # (2) after claim, (4) after any slow preparation, and (5) immediately before the imsg send. A pause/
+    # stop/failed-lookup at any of those points releases the claimed row WITHOUT sending; the durable
+    # server row recovers exactly once on resume. See docs/relay-emergency-stop.md.
+
+    async def _send_gate(self) -> str:
+        """Authenticated, FAIL-CLOSED directive check. Returns _SEND only when the authenticated directive
+        is exactly RUN; _STOP on a `stop` directive OR a rejected/revoked credential; _HOLD on
+        pause_outbound, an UNKNOWN directive value, OR any inability to get a clean authenticated answer
+        (network / TLS / timeout / malformed / invalid env -> the server 204s or errors). A network or
+        backend error is NEVER treated as permission to send. Logs stay content-free (no response body)."""
+        try:
+            d = await self.backend.directive()
+        except AuthError:
+            log.error("relay credential rejected during directive check — stopping")
+            return _STOP
+        except Exception:
+            log.warning("directive_check_failed_closed")   # network/TLS/timeout/malformed -> do not send
+            return _HOLD
+        if d == RUN:
+            return _SEND
+        if d == STOP:
+            return _STOP
+        if d == PAUSE_OUTBOUND:
+            return _HOLD
+        log.warning("directive_unknown_fail_closed")        # unknown value -> fail closed
+        return _HOLD
+
+    async def _prepare_outbound(self, job: dict) -> dict:
+        """Prepare the outbound payload (text today; outbound attachment download/spool is future). A slow
+        step runs HERE, before the post-preparation re-check. `_prepare_hook` lets a test simulate slow
+        preparation and a directive change landing during it."""
+        if self._prepare_hook is not None:
+            await self._prepare_hook(job)
+        return {"text": job.get("text", "")}
+
+    async def _safe_ack(self, oid: str, status: str, guid: str | None, error: str | None) -> None:
+        """Ack, swallowing a transient ack failure: the durable server row then recovers via lease expiry
+        (and the at-most-once ledger prevents any resend), so a failed ack never crashes the loop."""
+        try:
+            await self.backend.ack(oid, status, guid, error)
+        except (BackendError, AuthError):
+            log.warning("ack_failed id=%s status=%s (row recovers via lease)", oid, status)
+
+    async def _handle_blocked(self, job: dict, gate: str, *, stage: str) -> bool:
+        """A claimed message must NOT be sent (pause / stop / fail-closed lookup). Release the lease so the
+        durable row recovers WITHOUT duplication: ack retryable_failed (server re-queues with a backoff),
+        leaving the at-most-once ledger UNMARKED so it is re-sendable exactly once on resume. Never mark it
+        sent, never create a second row. On _STOP (stop directive or revoked credential), also stop
+        claiming and park the relay (reap the imsg child). Bounded backoff prevents a hot reclaim loop."""
+        await self._safe_ack(job["id"], "retryable_failed", None, f"blocked:{gate}")
+        log.info("outbound_blocked id=%s gate=%s stage=%s", job["id"], gate, stage)  # content-free
+        self._backoff_s = self._paused_backoff_s
+        if gate == _STOP:
+            self.stop()
+            await self.aclose()
+        return False
 
     async def process_one_outbound(self) -> bool:
+        """Claim + fail-closed send one outbound message. Returns True only when a message was actually
+        sent or re-acked (so the loop keeps draining); False on idle/blocked (so the loop backs off)."""
         try:
             job = await self.backend.claim()
-        except (BackendError, AuthError):
+        except AuthError:
+            log.error("relay credential rejected on claim — stopping")   # revoked -> stop claiming
+            self.stop()
+            return False
+        except BackendError:
             return False
         if job is None:
+            # Honor a server Retry-After (sent on a PAUSED 204) so a stopped fleet backs off, not hot-polls.
+            ra = getattr(self.backend, "last_retry_after", None)
+            if ra:
+                self._backoff_s = float(ra)
             return False
         oid = str(job["id"])
-        # At-most-once: if we've already attempted this id, DO NOT send it again — just re-ack. This
-        # is what stops a reclaimed row (lost ack / expired lease / crash) from double-texting a human.
+
+        # At-most-once: an id we already ATTEMPTED is never re-sent — just re-ack (a reclaimed row from a
+        # lost ack / expired lease / crash). Checked before the gate; it does not send.
         if self.sent_ledger is not None and self.sent_ledger.has(oid):
-            await self.backend.ack(job["id"], "sent", None, None)
+            await self._safe_ack(job["id"], "sent", None, None)
             log.info("outbound_skip_resend id=%s (already attempted)", job["id"])
             return True
-        # Mark BEFORE sending: if anything after the send throws (ack, response read), the row is never
-        # resent. The trade-off is at-most-once (a genuinely failed first attempt isn't retried) — the
-        # correct bias for real messaging, where a duplicate text is worse than a missed reply.
+
+        # (2) FAIL-CLOSED directive check after claim, BEFORE any preparation.
+        gate = await self._send_gate()
+        if gate != _SEND:
+            return await self._handle_blocked(job, gate, stage="post_claim")
+
+        # (3) prepare text + attachments (may be slow).
+        payload = await self._prepare_outbound(job)
+
+        # (4) RE-CHECK after slow preparation — a pause may have arrived during prep.
+        gate = await self._send_gate()
+        if gate != _SEND:
+            return await self._handle_blocked(job, gate, stage="post_prepare")
+
+        # (5) FINAL authoritative check immediately before the send.
+        gate = await self._send_gate()
+        if gate != _SEND:
+            return await self._handle_blocked(job, gate, stage="pre_send")
+
+        # At-most-once: mark BEFORE the send. A held message never reaches here, so a paused/blocked row
+        # is always re-sendable exactly once on resume.
         if self.sent_ledger is not None:
             self.sent_ledger.mark(oid)
+
+        # --- IRREDUCIBLE HANDOFF WINDOW (docs/relay-emergency-stop.md): only the ledger append above and
+        #     the send call itself run after the final gate. A pause landing here CANNOT be honored — the
+        #     bytes are handed to imsg and cannot be recalled. Keep this region minimal. ---
+        if self._send_barrier is not None:          # test-only deterministic race injection (no-op in prod)
+            await self._send_barrier()
         try:
-            guid = await self.imsg.send_text(job["to"], job["text"])   # attachments in outbound: future
-        except Exception as exc:
-            # Ledger already blocks a resend; report failure so the server can move it out of pending.
-            await self.backend.ack(job["id"], "retryable_failed", None, f"{type(exc).__name__}")
+            guid = await self.imsg.send_text(job["to"], payload["text"])   # attachments outbound: future
+        except Exception:
+            # Ledger already blocks a resend; report failure so the server moves it out of pending.
+            await self._safe_ack(job["id"], "retryable_failed", None, "send_error")
             return True
-        # Ack ONLY after the send command succeeded.
-        await self.backend.ack(job["id"], "sent", guid, None)
+
+        # (7,8) durable send result recorded, THEN ack (only after the result is durable).
+        await self._safe_ack(job["id"], "sent", guid, None)
         log.info("outbound_sent id=%s", job["id"])
         return True
 
+    async def aclose(self) -> None:
+        """Reap the imsg child (called on relay stop / a stop directive), if the imsg supports it."""
+        closer = getattr(self.imsg, "aclose", None)
+        if closer is None:
+            return
+        try:
+            await closer()
+        except Exception:
+            log.warning("imsg_aclose_error")
+
     async def run_outbound(self) -> None:
         while not self._stop.is_set():
+            self._backoff_s = None
             try:
-                handled = await self.process_one_outbound()
+                sent = await self.process_one_outbound()
             except Exception:
-                handled = False
-            if not handled:
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=self.poll_interval)
-                except asyncio.TimeoutError:
-                    pass
+                sent = False
+            if sent:
+                continue                                # sent -> immediately drain the next queued message
+            backoff = self._backoff_s if self._backoff_s is not None else self.poll_interval
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=backoff)   # bounded; never a tight loop
+            except asyncio.TimeoutError:
+                pass
 
     async def run(self) -> None:
-        await asyncio.gather(self.run_inbound(), self.run_outbound(), self.run_pending_sweep())
+        try:
+            await asyncio.gather(self.run_inbound(), self.run_outbound(), self.run_pending_sweep())
+        finally:
+            await self.aclose()                         # park cleanly: reap the imsg child

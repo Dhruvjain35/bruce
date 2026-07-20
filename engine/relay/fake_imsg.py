@@ -29,6 +29,8 @@ class InProcessImsg:
                  send_raises: bool = False) -> None:
         self._events = list(events or [])
         self.sent: list[dict] = []
+        self.calls = 0                     # TOTAL send_text invocations (incl. failures) — for "sent exactly once"
+        self.closed = False                # set by aclose() — for the reap-on-stop test
         self._send_fails = send_fails      # first N send_text calls raise (transient) then succeed
         self._send_raises = send_raises    # every send_text raises (permanent transport failure)
         self._guid = 0
@@ -43,6 +45,7 @@ class InProcessImsg:
             yield parse_event(self._events.pop(0))
 
     async def send_text(self, to: str, text: str) -> str | None:
+        self.calls += 1                    # count EVERY invocation, so a double-send is detectable
         if self._send_raises:
             raise RuntimeError("imsg send failed")
         if self._send_fails > 0:
@@ -52,6 +55,9 @@ class InProcessImsg:
         guid = f"fake-out-{self._guid}"
         self.sent.append({"to": to, "text": text, "guid": guid})
         return guid
+
+    async def aclose(self) -> None:
+        self.closed = True
 
     async def send_file(self, to: str, path: str) -> str | None:
         self._guid += 1
