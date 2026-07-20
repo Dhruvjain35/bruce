@@ -33,7 +33,7 @@ import os
 import socket
 import uuid
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from bruce_engine import access_control, schema
@@ -70,37 +70,21 @@ async def grant_production(user_id: uuid.UUID, *, reason: str | None = None,
 
 async def enroll_staging(user_id: uuid.UUID, *, hours: int | None = None, reason: str | None = None,
                          capability: str = CAPABILITY, actor: str | None = None) -> datetime.datetime | None:
-    """Add a TEMPORARY staging enrollment (internal only). Returns the expiry (None => no expiry)."""
-    actor = actor or _actor()
-    env = access_control.current_environment()
-    now = datetime.datetime.now(datetime.timezone.utc)
-    expires_at = now + datetime.timedelta(hours=hours) if hours else None
-    async with admin_session() as s:
-        s.add(schema.StagingTestEnrollment(
-            user_id=user_id, capability=capability, environment=env, enabled_at=now,
-            expires_at=expires_at, enabled_by=actor, audit_reason=reason))
-        await s.flush()
-        await _write_audit(s, action="enroll_staging", environment=env, target_user_id=user_id,
-                           detail={"reason": reason, "expires_at": expires_at.isoformat() if expires_at else None},
-                           actor=actor, capability=capability)
-    return expires_at
+    """Add a TEMPORARY staging enrollment (internal only). Returns the expiry (None => no expiry).
+
+    Thin CLI wrapper over the canonical ``access_control.enroll_staging_test`` so the operator tool and
+    the E1 internal test surface share ONE audited enroll path (no divergence)."""
+    duration = datetime.timedelta(hours=hours) if hours else None
+    return await access_control.enroll_staging_test(
+        user_id, duration=duration, reason=reason, capability=capability, actor=actor or _actor())
 
 
 async def revoke(user_id: uuid.UUID, *, capability: str = CAPABILITY, actor: str | None = None) -> int:
     """Immediately revoke every live staging enrollment for the user (production is untouched — it is
-    persistent). Returns the number of enrollments revoked."""
-    actor = actor or _actor()
-    env = access_control.current_environment()
-    now = datetime.datetime.now(datetime.timezone.utc)
-    async with admin_session() as s:
-        res = await s.execute(update(schema.StagingTestEnrollment).where(
-            schema.StagingTestEnrollment.user_id == user_id,
-            schema.StagingTestEnrollment.capability == capability,
-            schema.StagingTestEnrollment.environment == env,
-            schema.StagingTestEnrollment.revoked_at.is_(None)).values(revoked_at=now))
-        await _write_audit(s, action="revoke_staging", environment=env, target_user_id=user_id,
-                           detail={"revoked_count": res.rowcount}, actor=actor, capability=capability)
-    return res.rowcount
+    persistent). Returns the number of enrollments revoked. Thin wrapper over the canonical
+    ``access_control.revoke_staging_test`` (single audited revoke path)."""
+    return await access_control.revoke_staging_test(
+        user_id, capability=capability, actor=actor or _actor())
 
 
 async def set_kill(on: bool, *, capability: str = CAPABILITY, actor: str | None = None) -> None:

@@ -20,7 +20,7 @@ import logging
 import os
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from . import schema
 from .db import admin_session, worker_session
@@ -158,3 +158,55 @@ async def activate_production_entitlement(
             target_user_id=user_id,
             detail={k: v for k, v in {"reason": reason, "created": created}.items() if v is not None}))
     return created
+
+
+async def enroll_staging_test(
+        user_id: UUID, *, duration: datetime.timedelta | None = None, reason: str | None = None,
+        capability: str = "conversation", actor: str) -> datetime.datetime | None:
+    """Create a TEMPORARY, internal-only StagingTestEnrollment + append one content-free CapabilityAudit
+    row. This is the ONE reusable enroll path: the operator CLI (scripts/capability_admin) and the E1
+    internal test surface (bruce_engine.internal_test) BOTH call it, so there is a single audited code
+    path and no divergence.
+
+    It NEVER touches ProductionAccountEntitlement — staging enrollment is temporary and internal and
+    can never confer, extend, or make persistent any production access (the E1 production-separation
+    guarantee is enforced HERE, in the only place the internal surface can create a grant).
+
+    ``duration`` is the TTL as a timedelta (None => no expiry / persistent-until-ended). ``actor`` is
+    REQUIRED and SERVER-DERIVED (the operator shell user@host, or ``internal_web:<user_id>`` for E1) —
+    never a client-supplied string. Returns the resolved expiry (None when there is no expiry)."""
+    env = current_environment()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expires_at = now + duration if duration else None
+    async with admin_session() as s:
+        s.add(schema.StagingTestEnrollment(
+            user_id=user_id, capability=capability, environment=env, enabled_at=now,
+            expires_at=expires_at, enabled_by=actor, audit_reason=reason))
+        await s.flush()   # surface a missing-user FK violation inside the audited transaction
+        s.add(schema.CapabilityAudit(
+            actor=actor, action="enroll_staging", capability=capability, environment=env,
+            target_user_id=user_id,
+            detail={k: v for k, v in {
+                "reason": reason,
+                "expires_at": expires_at.isoformat() if expires_at else None,
+            }.items() if v is not None}))
+    return expires_at
+
+
+async def revoke_staging_test(
+        user_id: UUID, *, capability: str = "conversation", actor: str) -> int:
+    """Immediately revoke (revoked_at=now) EVERY live staging enrollment for (user, capability, env) and
+    append one content-free CapabilityAudit row. Production access, if any, is persistent and untouched.
+    The ONE reusable revoke path shared by the operator CLI and E1. Returns the number revoked."""
+    env = current_environment()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    async with admin_session() as s:
+        res = await s.execute(update(schema.StagingTestEnrollment).where(
+            schema.StagingTestEnrollment.user_id == user_id,
+            schema.StagingTestEnrollment.capability == capability,
+            schema.StagingTestEnrollment.environment == env,
+            schema.StagingTestEnrollment.revoked_at.is_(None)).values(revoked_at=now))
+        s.add(schema.CapabilityAudit(
+            actor=actor, action="revoke_staging", capability=capability, environment=env,
+            target_user_id=user_id, detail={"revoked_count": res.rowcount}))
+    return res.rowcount
