@@ -490,11 +490,19 @@ class RelayDevice(Base, TSV):
 
 
 class RelayControl(Base):
-    """Singleton-per-environment AUTHORITATIVE server-side outbound kill switch for the self-hosted
-    iMessage relay (Bite 1.5 A1). When ``outbound_paused`` is true for the running ``BRUCE_ENV``,
-    ``/v1/relay/outbound/claim`` hands out NOTHING — a paused fleet can never be given a message to send,
-    enforced in the claim path server-side and independent of any relay client. INFRASTRUCTURE, not
-    user-owned: worker-only RLS (like relay_devices), UPSERT-seeded per environment by migration 0014."""
+    """Singleton-per-environment server-side switch that AUTHORITATIVELY gates NEW outbound CLAIMS for
+    the self-hosted iMessage relay (Bite 1.5 A1). When ``outbound_paused`` is true for the running
+    ``BRUCE_ENV``, ``/v1/relay/outbound/claim`` hands out NOTHING — no new or reclaimed message is ever
+    leased to a device, enforced in the claim path server-side and independent of any relay client.
+
+    SCOPE (see docs/relay-emergency-stop.md): this gates the CLAIM. It does NOT retract a message that a
+    device already claimed before the pause — a distributed system cannot recall bytes already handed to
+    iMessage. Preventing the in-flight send is A2's pre-send directive re-check (fail-closed). An
+    already-claimed message that is not sent recovers WITHOUT duplication: while paused it is never
+    re-handed out, and on resume it is reclaimable exactly once.
+
+    INFRASTRUCTURE, not user-owned: worker-only RLS (like relay_devices), UPSERT-seeded per environment
+    by migration 0014."""
 
     __tablename__ = "relay_control"
     id = _pk()
@@ -504,6 +512,28 @@ class RelayControl(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     __table_args__ = (UniqueConstraint("environment", name="uq_relay_control_environment"),)
+
+
+class RelayControlAudit(Base):
+    """Append-only audit of every relay control-plane CHANGE (pause/resume/stop, global or per-device),
+    added by migration 0015. Records the actor (server-derived operator, never client-supplied), the
+    action, the environment, the optional device, an optional reason, and the previous/new state — so a
+    kill or a device pause is always attributable. Enforced append-only by 0015 (worker SELECT+INSERT
+    policies, NO update/delete policy, plus a BEFORE UPDATE/DELETE trigger that raises). CONTENT-FREE:
+    previous_state/new_state carry only directive/pause booleans — never message content, handles, or
+    paths; ``reason`` is operator-supplied free text and must likewise never carry payload content."""
+
+    __tablename__ = "relay_control_audit"
+    id = _pk()
+    actor: Mapped[str | None] = mapped_column(String(200), nullable=True)  # server-derived operator@host
+    action: Mapped[str] = mapped_column(String(32), nullable=False)  # pause_all|resume_all|pause_device|resume_device|stop_device
+    environment: Mapped[str] = mapped_column(String(24), nullable=False)
+    device_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("relay_devices.id", ondelete="SET NULL"), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    previous_state: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    new_state: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class RelayUpload(Base, TSV):
@@ -992,9 +1022,11 @@ RLS_TABLES: tuple[str, ...] = (
     "staging_test_enrollments",
     "capability_global_state",
     "capability_audit",
-    # added 0014 — relay control plane (Bite 1.5 A1). relay_control is the authoritative outbound kill
-    # switch: worker-only (NOT tenant_isolation, like relay_devices), but it carries the same all-tables
-    # FORCE-RLS guarantee so a silently-missed policy could never make it default-ALLOW for the app role
-    # (a tenant reading or flipping the kill switch). test_relay_control_rls_default_deny proves denial.
+    # added 0014 — relay control plane (Bite 1.5 A1). relay_control gates new outbound claims: worker-only
+    # (NOT tenant_isolation, like relay_devices), but it carries the same all-tables FORCE-RLS guarantee so
+    # a silently-missed policy could never make it default-ALLOW for the app role (a tenant reading or
+    # flipping the switch). test_relay_control_rls_default_deny proves denial.
     "relay_control",
+    # added 0015 — append-only audit of relay control-plane changes (worker-only, same FORCE-RLS guarantee).
+    "relay_control_audit",
 )

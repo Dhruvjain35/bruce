@@ -51,7 +51,10 @@ _USER_TABLES = (
     "production_account_entitlements staging_test_enrollments capability_global_state capability_audit "
     # added 0014 — relay control plane. Truncate so a pause/kill state never leaks between tests (the
     # migration-seeded singleton is re-created per test as needed; pause_all UPSERTs with no prior row).
-    "relay_control"
+    "relay_control "
+    # added 0015 — relay control-plane audit. Append-only via a BEFORE UPDATE/DELETE trigger, but TRUNCATE
+    # is exempt, so it is cleared between tests like capability_audit.
+    "relay_control_audit"
 ).split()
 
 

@@ -28,15 +28,36 @@ from .db import admin_session, worker_session
 log = logging.getLogger("bruce.access")  # content-free: ids/sources/statuses only, never message text
 
 DEFAULT_ENV = "local"
+# The STRICT set of valid deployment environments. BRUCE_ENV must be one of these (or unset -> local).
+# A value outside the enum is a fail-CLOSED error, never a silent fallback: an unrecognized env would
+# otherwise resolve the WRONG (capability_global_state / relay_control) singleton than the one the
+# migration seeded and the operator flipped — divergence that could silently defeat a kill switch.
+ENVIRONMENTS = ("local", "staging", "production")
 # BRUCE_CONVERSATION_RUNTIME is demoted to a global HARD-OFF only: an explicit off value forces DENY for
 # everyone (an extra emergency switch alongside the DB kill). Unset or any other value defers entirely to
 # the DB — per-user access comes from an entitlement/enrollment, NOT from this env.
 _HARD_OFF = {"0", "false", "no", "off"}
 
 
+class InvalidEnvironment(ValueError):
+    """BRUCE_ENV is set to a value outside the strict ENVIRONMENTS enum (fail closed — no fallback)."""
+
+
 def current_environment() -> str:
-    """The SINGLE environment source, resolved identically here and by the kill CLI / migration seed."""
-    return (os.environ.get("BRUCE_ENV", DEFAULT_ENV) or DEFAULT_ENV).strip() or DEFAULT_ENV
+    """The SINGLE environment source, resolved identically here and by the kill CLI / migration seed.
+
+    Unset (or empty) -> ``local`` (the documented default). Any other value is validated against the
+    strict ``ENVIRONMENTS`` enum and, if unrecognized, raises ``InvalidEnvironment`` — it NEVER silently
+    falls back to ``local`` (a typo'd env must not resolve a different kill-switch singleton than the one
+    the operator flipped). Callers in fail-closed paths (``conversation_access``, the relay claim gate)
+    turn the raise into a DENY / no-hand-out."""
+    raw = os.environ.get("BRUCE_ENV")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_ENV
+    env = raw.strip()
+    if env not in ENVIRONMENTS:
+        raise InvalidEnvironment(f"BRUCE_ENV={env!r} is not one of {ENVIRONMENTS} (no silent fallback)")
+    return env
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,8 +85,9 @@ async def conversation_access(user_id: UUID, capability: str = "conversation") -
        an active ProductionAccountEntitlement -> ALLOW(production); else a live StagingTestEnrollment ->
        ALLOW(staging); else DENY.
     """
-    env = current_environment()
+    env = "?"
     try:
+        env = current_environment()  # inside the try: an invalid BRUCE_ENV fails CLOSED (DENY), never a crash
         raw = os.environ.get("BRUCE_CONVERSATION_RUNTIME")
         if raw is not None and raw.strip().lower() in _HARD_OFF:
             return Decision(False, "env_off", "BRUCE_CONVERSATION_RUNTIME is explicitly off (global hard-off)")
