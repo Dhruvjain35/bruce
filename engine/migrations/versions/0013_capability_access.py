@@ -179,11 +179,19 @@ def upgrade() -> None:
                f"FOR EACH ROW EXECUTE FUNCTION capability_audit_no_mutate()")
 
     # UPSERT-seed the global-state singleton for (conversation, <env>) without clobbering a live state.
-    op.get_bind().execute(
+    # The seed INSERT is subject to FORCE RLS. On a DB where the migration role is NOT a superuser (e.g.
+    # Cloud SQL's `postgres`, which lacks BYPASSRLS), FORCE RLS applies to the owner too, so the
+    # state_insert WITH CHECK (app_is_admin()) would reject the seed. Set app.admin='on' transaction-
+    # locally around the seed to satisfy it, then reset. (On a superuser migration role — local/CI — RLS
+    # is bypassed entirely, so this is a harmless no-op.)
+    bind = op.get_bind()
+    bind.execute(sa.text("SELECT set_config('app.admin', 'on', true)"))
+    bind.execute(
         sa.text("INSERT INTO capability_global_state (capability, environment, rollout_state, killed) "
                 "VALUES ('conversation', :env, 'default_off', false) "
                 "ON CONFLICT (capability, environment) DO NOTHING"),
         {"env": _env()})
+    bind.execute(sa.text("SELECT set_config('app.admin', '', true)"))
 
 
 def downgrade() -> None:
