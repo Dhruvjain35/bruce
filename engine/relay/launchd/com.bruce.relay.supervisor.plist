@@ -31,8 +31,12 @@
         <string>@ENGINE_DIR@</string>
         <key>BRUCE_RELAY_STATE_DIR</key>
         <string>@STATE_DIR@</string>
-        <!-- BRUCE_API_BASE_URL / BRUCE_RELAY_PINNED_COMMIT and friends are written by the A4 installer.
-             The device secret is read from the Keychain by config.py — it is never placed here. -->
+        <key>BRUCE_API_BASE_URL</key>
+        <string>@API_BASE_URL@</string>
+        <key>BRUCE_RELAY_PINNED_COMMIT</key>
+        <string>@PINNED_COMMIT@</string>
+        <!-- These are NON-secret (a URL + a commit hash). The device SECRET is read from the Keychain by
+             config.py — it is NEVER placed in this plist, in argv, or in the environment. -->
     </dict>
 
     <key>RunAtLoad</key>

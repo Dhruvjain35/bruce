@@ -54,7 +54,9 @@ _USER_TABLES = (
     "relay_control "
     # added 0015 — relay control-plane audit. Append-only via a BEFORE UPDATE/DELETE trigger, but TRUNCATE
     # is exempt, so it is cleared between tests like capability_audit.
-    "relay_control_audit"
+    "relay_control_audit "
+    # added 0016 — relay device bootstrap tokens + append-only registration audit.
+    "relay_bootstrap_tokens relay_registration_audit"
 ).split()
 
 

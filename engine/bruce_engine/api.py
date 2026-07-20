@@ -35,6 +35,7 @@ from . import intake_store
 from . import messaging_inbound
 from . import messaging_outbound
 from . import messaging_store
+from . import access_control
 from . import relay_auth
 from . import relay_control
 from . import relay_uploads
@@ -419,6 +420,38 @@ async def current_relay_device(
         return await relay_auth.authenticate(authorization[7:], timestamp=x_bruce_timestamp)
     except relay_auth.RelayAuthError as exc:
         raise HTTPException(status_code=401, detail={"error": "relay_auth_failed", "reason": str(exc)})
+
+
+class RelayRegisterRequest(BaseModel):
+    device_name: str = Field(min_length=1, max_length=120)   # bound to the bootstrap token; NO secret in the body
+
+
+@app.post("/v1/relay/register")
+async def relay_register(req: RelayRegisterRequest,
+                         authorization: str | None = Header(default=None)) -> dict:
+    """Bootstrap device registration (A4). Authenticated by a SHORT-LIVED, SINGLE-USE bootstrap token
+    (Authorization: Bearer <bootstrap token>, operator-minted) bound to the running environment + this
+    device name. Returns the PERMANENT device credential ONCE over TLS — the installer moves it straight
+    into the Keychain and never displays/writes/logs it. Fail-closed + rate-limited + audited; a replay
+    (reused/expired token, env/device mismatch) is denied with a generic reason and NO secret."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail={"error": "missing_bootstrap_token"})
+    env = access_control.current_environment()
+    try:
+        device_id, secret = await relay_auth.register_with_bootstrap(
+            authorization[7:], device_name=req.device_name, environment=env)
+    except relay_auth.BootstrapError as exc:
+        # generic reason; never echo the token or any secret
+        raise HTTPException(status_code=403, detail={"error": "bootstrap_denied", "reason": str(exc)})
+    return {"device_id": str(device_id), "secret": secret}   # consumed in-memory by the installer -> Keychain
+
+
+@app.post("/v1/relay/self-revoke")
+async def relay_self_revoke(device: schema.RelayDevice = Depends(current_relay_device)) -> dict:
+    """A device revokes ITS OWN credential, authenticated by that credential. The installer calls this if
+    bootstrap fails after registration, so a failed install never leaves an active orphan credential."""
+    await relay_auth.revoke_device(device.id)
+    return {"revoked": True}
 
 
 class RelayAttachment(BaseModel):

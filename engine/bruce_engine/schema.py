@@ -536,6 +536,44 @@ class RelayControlAudit(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class RelayBootstrapToken(Base):
+    """Short-lived, SINGLE-USE device-registration token (Bite 1.5 A4). Only the sha256 HASH is stored;
+    the token is bound to (environment, device_name), expires quickly, and is consumed on first successful
+    use so a replay fails. Worker-only RLS (infra); added by migration 0016."""
+
+    __tablename__ = "relay_bootstrap_tokens"
+    id = _pk()
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)   # sha256(bootstrap token)
+    environment: Mapped[str] = mapped_column(String(24), nullable=False)
+    device_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    max_uses: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    used_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    used_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    created_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_relay_bootstrap_token_hash"),)
+
+
+class RelayRegistrationAudit(Base):
+    """Append-only audit of relay device registration (mint / register / rotate / revoke / deny /
+    rate_limited / replay) with actor / environment / device / result / time — NEVER a secret. Enforced
+    append-only by migration 0016. Worker-only RLS."""
+
+    __tablename__ = "relay_registration_audit"
+    id = _pk()
+    actor: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    environment: Mapped[str] = mapped_column(String(24), nullable=False)
+    device_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    device_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("relay_devices.id", ondelete="SET NULL"), nullable=True)
+    result: Mapped[str] = mapped_column(String(24), nullable=False)   # ok | denied
+    reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class RelayUpload(Base, TSV):
     """A file the relay uploaded from an inbound message, staged until the intake source is created.
     Bytes live here transiently (cleared on consume); infra, so worker-only RLS. content_hash lets
@@ -1029,4 +1067,8 @@ RLS_TABLES: tuple[str, ...] = (
     "relay_control",
     # added 0015 — append-only audit of relay control-plane changes (worker-only, same FORCE-RLS guarantee).
     "relay_control_audit",
+    # added 0016 — relay device bootstrap: short-lived single-use registration tokens + append-only
+    # registration audit (worker-only, same FORCE-RLS guarantee).
+    "relay_bootstrap_tokens",
+    "relay_registration_audit",
 )
