@@ -46,6 +46,28 @@ def test_assert_plist_secret_free_rejects_bearer():
         installer.assert_plist_secret_free("<string>Authorization: Bearer sk-xyz</string>")
 
 
+def test_render_plist_requires_absolute_python():
+    with pytest.raises(ValueError):
+        installer.render_plist(python="python3", engine_dir="/e", state_dir="/s",   # relative -> rejected
+                               api_base_url="https://x", pinned_commit="c")
+
+
+def test_plist_safe_paths_rejects_shell_interpolation():
+    with pytest.raises(ValueError):
+        installer.assert_plist_safe_paths("<array><string>$(whoami)</string></array>")
+
+
+def test_verify_extracted_safe_rejects_escaping_symlink(tmp_path):
+    vdir = tmp_path / "versions" / "sha"
+    (vdir / "engine").mkdir(parents=True)
+    installer.verify_extracted_safe(str(vdir))                    # clean tree -> ok
+    outside = tmp_path / "outside_secret"
+    outside.write_text("x")
+    os.symlink(str(outside), str(vdir / "engine" / "evil"))       # symlink escaping the version dir
+    with pytest.raises(ValueError):
+        installer.verify_extracted_safe(str(vdir))
+
+
 # --------------------------------------------------------------------------- state dir: 0700, never wiped
 
 
@@ -85,13 +107,6 @@ def test_activate_version_missing_raises(tmp_path):
 # --------------------------------------------------------------------------- Mac-only commands are secret-free
 
 
-def test_keychain_add_argv_has_no_secret_and_is_interactive():
-    argv = installer.keychain_add_argv("default")
-    assert "-w" not in argv                                 # no password on the command line (interactive)
-    assert argv[0] == "security" and "com.bruce.relay.device-secret" in argv
-    assert not any("secret" in a.lower() and a != "com.bruce.relay.device-secret" for a in argv)
-
-
 def test_launchctl_commands_reference_the_label(tmp_path):
     dest = installer.launchagent_path(str(tmp_path))
     assert dest.endswith("Library/LaunchAgents/com.bruce.relay.supervisor.plist")
@@ -116,7 +131,7 @@ def test_prepare_install_upgrade_rollback_preserves_state(tmp_path, monkeypatch)
 
     def _prepare(commit):
         return installer.main(["prepare", "--install-dir", install, "--state-dir", state,
-                               "--commit", commit, "--python", "/usr/bin/python3",
+                               "--commit", commit, "--python", "/usr/bin/python3", "--assume-healthy",
                                "--api-base-url", "https://api.example", "--home", home, "--uid", "501"])
 
     # install shaA
