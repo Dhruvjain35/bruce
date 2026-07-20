@@ -44,7 +44,10 @@ def render_plist(*, python: str, engine_dir: str, state_dir: str, api_base_url: 
     leftover = [p for p in _PLACEHOLDERS if p in out]
     if leftover:
         raise ValueError(f"unfilled plist placeholders: {leftover}")
+    if not python.startswith("/"):
+        raise ValueError(f"python path must be absolute in the plist, got {python!r}")
     assert_plist_secret_free(out)
+    assert_plist_safe_paths(out)
     return out
 
 
@@ -53,6 +56,33 @@ def assert_plist_secret_free(plist: str) -> None:
     for marker in _SECRET_MARKERS:
         if marker.lower() in low:
             raise ValueError(f"refusing to write a plist containing a secret marker: {marker!r}")
+
+
+def assert_plist_safe_paths(plist: str) -> None:
+    """The LaunchAgent must use ABSOLUTE paths and NO shell interpolation (ProgramArguments is an argv
+    array, never a shell string) — so nothing is re-evaluated by a shell at launch."""
+    for bad in ("$(", "`", "${"):
+        if bad in plist:
+            raise ValueError(f"refusing to write a plist with shell interpolation: {bad!r}")
+    import re
+    args = re.findall(r"<key>ProgramArguments</key>\s*<array>(.*?)</array>", plist, re.S)
+    if args:
+        first = re.findall(r"<string>(.*?)</string>", args[0], re.S)
+        if first and not first[0].startswith("/"):
+            raise ValueError(f"ProgramArguments[0] must be an absolute path, got {first[0]!r}")
+
+
+def verify_extracted_safe(version_dir: str) -> None:
+    """Reject a code checkout that contains a path-traversal or an UNSAFE SYMLINK — no file (regular or
+    link) may resolve OUTSIDE the version dir. Belt-and-suspenders over `git archive` (which already emits
+    only relative, in-tree paths from a trusted commit)."""
+    root = os.path.realpath(version_dir)
+    for dirpath, dirnames, filenames in os.walk(version_dir, followlinks=False):
+        for name in dirnames + filenames:
+            p = os.path.join(dirpath, name)
+            real = os.path.realpath(p)
+            if real != root and not real.startswith(root + os.sep):
+                raise ValueError(f"unsafe path escapes the version dir: {name!r}")
 
 
 # durable state files/dirs the installer creates but MUST NEVER overwrite/wipe on re-run.
@@ -80,6 +110,11 @@ def activate_version(install_dir: str, commit: str, *, current_link: str = "curr
     version_dir = os.path.join(install_dir, "versions", commit)
     if not os.path.isdir(version_dir):
         raise FileNotFoundError(f"version not checked out: {version_dir}")
+    verify_extracted_safe(version_dir)                 # reject a traversal / unsafe symlink before activating
+    try:
+        os.chmod(install_dir, 0o700)                   # safe perms on the code root
+    except OSError:
+        pass
     link = os.path.join(install_dir, current_link)
     tmp = link + ".tmp"
     if os.path.islink(tmp) or os.path.exists(tmp):
@@ -95,13 +130,6 @@ def active_version(install_dir: str, *, current_link: str = "current") -> str | 
         return None
     target = os.path.realpath(link)
     return os.path.basename(target)                # the <commit> dir name
-
-
-def keychain_add_argv(account: str, service: str = KEYCHAIN_SERVICE) -> list[str]:
-    """The ``security`` argv to store the device secret WITHOUT putting it in argv: no ``-w`` is passed,
-    so ``security`` PROMPTS for the secret interactively (the operator pastes the one-time value). ``-U``
-    updates in place on re-install. The secret therefore never appears in argv, env, or any log."""
-    return ["security", "add-generic-password", "-U", "-a", account, "-s", service, "-T", ""]
 
 
 def launchagent_path(home: str) -> str:
@@ -137,36 +165,78 @@ def write_plist(dest_path: str, contents: str) -> None:
 # --------------------------------------------------------------------------- CLI (called by install_relay.sh)
 
 
+def _poll_health(state_dir: str, *, deadline_s: float = 20.0) -> bool:
+    """After (re)load, verify the supervisor came up healthy (running/parked with a fresh status), so a
+    bad activation is rolled back. Reads only the content-free status file."""
+    import time as _t
+
+    from . import brucectl
+    end = _t.time() + deadline_s
+    while _t.time() < end:
+        st = brucectl.read_status(os.path.join(state_dir, "supervisor-status.json"))
+        if st and st.get("state") in ("running", "parked") and (_t.time() - float(st.get("updated_at", 0)) < 60):
+            return True
+        _t.sleep(0.5)
+    return False
+
+
 def _prepare(args) -> int:
-    """Idempotent file/plist/version work for install OR upgrade OR rollback: never wipes durable state,
-    flips the `current` symlink to the (already-checked-out) approved commit, renders + writes the
-    secret-free plist. Prints the Mac-only launchctl commands (the shell runs them). --dry-run prints
-    only. Returns 0 on success."""
+    """Compatibility-checked, atomic install / upgrade / rollback: never wipes durable state, BLOCKS an
+    incompatible rollback (on-disk state newer than the target supports), runs forward migrations after a
+    privacy-safe backup, flips the `current` symlink atomically, writes the secret-free plist, (re)loads
+    the LaunchAgent, and — unless --assume-healthy/--dry-run — verifies health and RESTORES the prior
+    version+state if activation or health fails. Returns 0 on success."""
     import subprocess
 
-    ensure_state_dir(args.state_dir) if not args.dry_run else print(f"[dry-run] ensure_state_dir {args.state_dir} (0700, no wipe)")
-    code_dir = os.path.join(args.install_dir, "versions", args.commit)
-    if args.dry_run:
-        print(f"[dry-run] activate_version -> {code_dir}")
+    from . import state_manifest
+
+    if args.dry_run or args.assume_healthy:
+        # file work only; no health gate (dry-run prints; unit tests exercise file ops).
+        if args.dry_run:
+            print(f"[dry-run] ensure_state_dir {args.state_dir} (0700, no wipe)")
+            print(f"[dry-run] compat-check + activate_version -> {os.path.join(args.install_dir, 'versions', args.commit)}")
+        else:
+            ensure_state_dir(args.state_dir)
+            state_manifest.safe_activate(install_dir=args.install_dir, state_dir=args.state_dir,
+                                         commit=args.commit,
+                                         activate=lambda c: activate_version(args.install_dir, c),
+                                         health_check=lambda: True)
+            print(f"active version -> {active_version(args.install_dir)}")
     else:
-        active = activate_version(args.install_dir, args.commit)
-        print(f"active version -> {active}")
+        ensure_state_dir(args.state_dir)
+
     engine_dir = os.path.join(args.install_dir, "current", "engine")
     plist = render_plist(python=args.python, engine_dir=engine_dir, state_dir=args.state_dir,
                          api_base_url=args.api_base_url, pinned_commit=args.commit)
     dest = launchagent_path(args.home)
+
+    def _reload():
+        for c in load_argv(dest, uid=args.uid) + [kickstart_argv(args.uid)]:
+            subprocess.run(c, check=False)                 # bootout may fail if not loaded — that's fine
+
     if args.dry_run:
         print(f"[dry-run] write_plist -> {dest} (0644, secret-free: OK)")
+        for c in load_argv(dest, uid=args.uid) + [kickstart_argv(args.uid)]:
+            print("[dry-run] " + " ".join(c))
+        return 0
+
+    if not args.assume_healthy:
+        # full path: activation is gated on post-load health; a failure restores the prior version+state.
+        ensure_state_dir(args.state_dir)
+
+        def _activate_and_load(commit):
+            activate_version(args.install_dir, commit)
+            write_plist(dest, render_plist(python=args.python, engine_dir=engine_dir, state_dir=args.state_dir,
+                                           api_base_url=args.api_base_url, pinned_commit=commit))
+            _reload()
+        state_manifest.safe_activate(install_dir=args.install_dir, state_dir=args.state_dir, commit=args.commit,
+                                     activate=_activate_and_load,
+                                     health_check=lambda: _poll_health(args.state_dir))
+        print(f"active version -> {active_version(args.install_dir)} (healthy)")
     else:
         write_plist(dest, plist)
+        _reload()
         print(f"wrote {dest}")
-    # (re)load the LaunchAgent for the GUI session (idempotent). kickstart on an upgrade/rollback.
-    cmds = load_argv(dest, uid=args.uid) + [kickstart_argv(args.uid)]
-    for c in cmds:
-        if args.dry_run:
-            print("[dry-run] " + " ".join(c))
-        else:
-            subprocess.run(c, check=False)                 # bootout may fail if not loaded — that's fine
     return 0
 
 
@@ -183,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--home", default=os.path.expanduser("~"))
     pr.add_argument("--uid", type=int, default=os.getuid())
     pr.add_argument("--dry-run", dest="dry_run", action="store_true")
+    pr.add_argument("--assume-healthy", dest="assume_healthy", action="store_true",
+                    help="skip the post-load health gate (used by tests; the shell uses the real gate)")
     args = p.parse_args(argv)
     if args.command == "prepare":
         return _prepare(args)

@@ -14,14 +14,16 @@
 # What it does NOT do (by design):
 #   * NO `git pull` / no fetch of an arbitrary ref — it exports the EXACT approved commit only.
 #   * NO wiping of durable state (checkpoint / outbound ledger / pending attachments survive every path).
-#   * NO secret in the plist, argv, env, or logs — the device secret is prompted for and stored ONLY in
-#     the login Keychain (config.py reads it there); `security` is invoked WITHOUT -w so it never hits argv.
+#   * NO permanent credential in the plist, argv, env, disk, or logs — the installer registers over a
+#     short-lived single-use bootstrap token and moves the returned credential straight into the login
+#     Keychain via Security.framework (config.py reads it there). The operator never sees/pastes it.
 #
 set -euo pipefail
 
 COMMIT=""
 API_BASE_URL="${BRUCE_API_BASE_URL:-}"
 ACCOUNT="default"
+DEVICE=""
 DRY_RUN=0
 INSTALL_DIR="${BRUCE_RELAY_INSTALL_DIR:-$HOME/.bruce-relay-app}"    # versioned code checkouts + `current`
 STATE_DIR="${BRUCE_RELAY_STATE_DIR:-$HOME/.bruce-relay}"            # durable runtime state (never wiped)
@@ -32,6 +34,7 @@ while [ $# -gt 0 ]; do
     --commit) COMMIT="$2"; shift 2 ;;
     --api-base-url) API_BASE_URL="$2"; shift 2 ;;
     --account) ACCOUNT="$2"; shift 2 ;;
+    --device) DEVICE="$2"; shift 2 ;;
     --install-dir) INSTALL_DIR="$2"; shift 2 ;;
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -47,14 +50,33 @@ run() { if [ "$DRY_RUN" = 1 ]; then echo "[dry-run] $*"; else "$@"; fi; }
 [ -n "$API_BASE_URL" ] || { echo "error: --api-base-url is required (or set BRUCE_API_BASE_URL)" >&2; exit 64; }
 [ "$(uname)" = "Darwin" ] || { echo "error: the relay installs on macOS only" >&2; exit 64; }
 [ "$(id -u)" -ne 0 ] || { echo "error: run as the bruce-relay LOGIN user, never as root" >&2; exit 64; }
+# Wrong-account guard: the intended login user may be pinned via BRUCE_RELAY_EXPECT_USER.
+if [ -n "${BRUCE_RELAY_EXPECT_USER:-}" ] && [ "${BRUCE_RELAY_EXPECT_USER}" != "$(id -un)" ]; then
+  echo "error: running as '$(id -un)', expected '${BRUCE_RELAY_EXPECT_USER}'" >&2; exit 64
+fi
+UID_NUM="$(id -u)"
+# Active GUI login is required (LaunchAgent bootstrap needs a real Aqua session).
+if ! launchctl print "gui/${UID_NUM}" >/dev/null 2>&1; then
+  echo "error: no active GUI login session for uid ${UID_NUM} — log in on the desktop first" >&2; exit 64
+fi
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
-git -C "$REPO_ROOT" rev-parse --verify "${COMMIT}^{commit}" >/dev/null 2>&1 \
-  || { echo "error: commit $COMMIT not found in this repo — fetch the approved build first" >&2; exit 64; }
+# EXACT commit SHA required (not a branch/ref): resolve, and require the input to equal the full SHA.
+RESOLVED="$(git -C "$REPO_ROOT" rev-parse --verify "${COMMIT}^{commit}" 2>/dev/null || true)"
+[ -n "$RESOLVED" ] || { echo "error: commit $COMMIT not found — fetch the approved build first" >&2; exit 64; }
+[ "$RESOLVED" = "$COMMIT" ] || { echo "error: pass the EXACT 40-char commit SHA, not a ref ($COMMIT -> $RESOLVED)" >&2; exit 64; }
+# Reject a dirty working tree (avoid installing from an ambiguous checkout).
+if [ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]; then
+  echo "error: repository working tree is dirty — commit/clean before installing" >&2; exit 64
+fi
+# API readiness preflight (never prints a response body).
+if ! curl -fsS --max-time 10 "${API_BASE_URL%/}/healthz" >/dev/null 2>&1 \
+   && ! curl -fsS --max-time 10 "${API_BASE_URL%/}/" >/dev/null 2>&1; then
+  echo "warning: API at $API_BASE_URL did not respond to a readiness probe (continuing)" >&2
+fi
 
 PYTHON="${BRUCE_RELAY_PYTHON:-$REPO_ROOT/engine/.venv/bin/python}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 ENGINE_DIR="$INSTALL_DIR/current/engine"
-UID_NUM="$(id -u)"
 
 echo "install: commit=$COMMIT account=$ACCOUNT"
 echo "  install_dir=$INSTALL_DIR  state_dir=$STATE_DIR (durable, never wiped)"
@@ -71,14 +93,24 @@ else
   echo "  version already present: $VER_DIR"
 fi
 
-# ---- 2. store the device secret in the Keychain (INTERACTIVE; never in argv) -----------------------
-# security prompts for the secret (no -w), so it never appears in argv/env/logs. Paste the ONE-TIME value
-# printed by `python -m scripts.register_relay_device` during device registration.
+# ---- 2. secure device bootstrap: register + store the credential in the Keychain (never shown) ------
+# The installer OWNS the credential bootstrap. Using the SHORT-LIVED, SINGLE-USE bootstrap token
+# (BRUCE_RELAY_BOOTSTRAP_TOKEN, minted by `python -m scripts.relay_bootstrap mint`), it registers the
+# device over TLS, moves the returned PERMANENT credential straight into the login Keychain via
+# Security.framework, verifies it authenticates, and self-revokes on any failure. The permanent
+# credential is never displayed, pasted, written to disk, placed in argv/env, or logged.
+DEVICE="${DEVICE:-$ACCOUNT}"
 if security find-generic-password -s "$SERVICE" -a "$ACCOUNT" >/dev/null 2>&1; then
-  echo "  keychain: device secret already present for account=$ACCOUNT (leaving as-is)"
+  echo "  keychain: device credential already present for account=$ACCOUNT (leaving as-is)"
+elif [ -n "${BRUCE_RELAY_BOOTSTRAP_TOKEN:-}" ]; then
+  echo "  bootstrap: registering device=$DEVICE and storing the credential in the Keychain (never shown)"
+  run env BRUCE_RELAY_BOOTSTRAP_TOKEN="$BRUCE_RELAY_BOOTSTRAP_TOKEN" \
+      PYTHONPATH="$ENGINE_DIR:$REPO_ROOT/engine" "$PYTHON" -m relay.bootstrap \
+      --base-url "$API_BASE_URL" --device "$DEVICE" --account "$ACCOUNT"
 else
-  echo "  keychain: paste the one-time device secret at the prompt (input hidden, not stored in argv)"
-  run security add-generic-password -U -a "$ACCOUNT" -s "$SERVICE"
+  echo "error: no device credential in the Keychain and no BRUCE_RELAY_BOOTSTRAP_TOKEN to bootstrap one." >&2
+  echo "  mint one first:  BRUCE_ENV=<env> ... python -m scripts.relay_bootstrap mint --device $DEVICE" >&2
+  exit 64
 fi
 
 # ---- 3. state dir + version symlink + plist + (re)load — all the testable file work in Python -------
