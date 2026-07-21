@@ -54,6 +54,8 @@ DEFAULT_PAUSED_BACKOFF_S = 30.0   # bounded backoff after a pause/hold (client-s
 # ACCIDENTAL clean exit (0) must restart, never park; only an AUTHENTICATED stop parks.
 STOP_DIRECTIVE_EXIT = 75          # an authenticated `stop` directive -> park (remotely resumable)
 REVOKED_CREDENTIAL_EXIT = 78      # EX_CONFIG: revoked/invalid credential -> park (resumes if re-registered)
+MISCONFIGURED_EXIT = 76           # a fatal, non-transient misconfig (e.g. the pinned imsg binary is
+                                  # missing/not executable) -> PARK, don't crash-loop; resumes on kickstart
 
 
 def _kind_for(mime: str) -> str | None:

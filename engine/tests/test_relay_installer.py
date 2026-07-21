@@ -10,12 +10,27 @@ in the runbook as the on-device approval steps.
 from __future__ import annotations
 
 import os
+import plistlib
 import stat
 import subprocess
 
 import pytest
 
 from relay import installer
+
+
+def _make_exe(dirpath, name: str = "imsg") -> str:
+    """Create an executable file and return its absolute path (a stand-in for the real imsg binary)."""
+    os.makedirs(dirpath, exist_ok=True)
+    p = os.path.join(dirpath, name)
+    with open(p, "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(p, 0o755)
+    return p
+
+
+def _env_vars(plist_text: str) -> dict:
+    return plistlib.loads(plist_text.encode())["EnvironmentVariables"]
 
 
 def _mode(path: str) -> int:
@@ -27,9 +42,11 @@ def _mode(path: str) -> int:
 
 def test_render_plist_substitutes_and_is_secret_free():
     out = installer.render_plist(python="/opt/py", engine_dir="/app/engine", state_dir="/state",
-                                 api_base_url="https://api.example", pinned_commit="abc123sha")
+                                 api_base_url="https://api.example", pinned_commit="abc123sha",
+                                 imsg_bin="/bin/echo")
     assert "@PYTHON@" not in out and "@PINNED_COMMIT@" not in out and "@API_BASE_URL@" not in out
-    assert "/opt/py" in out and "abc123sha" in out and "https://api.example" in out
+    assert "@IMSG_BIN@" not in out
+    assert "/opt/py" in out and "abc123sha" in out and "https://api.example" in out and "/bin/echo" in out
     for marker in ("BRUCE_RELAY_SECRET", "Bearer ", "password", "Authorization"):
         assert marker not in out                          # no secret in the plist
 
@@ -37,8 +54,8 @@ def test_render_plist_substitutes_and_is_secret_free():
 def test_render_plist_refuses_a_secret_marker():
     tmpl = installer.load_template().replace("@API_BASE_URL@", "@API_BASE_URL@ BRUCE_RELAY_SECRET")
     with pytest.raises(ValueError):
-        installer.render_plist(python="p", engine_dir="e", state_dir="s", api_base_url="u",
-                               pinned_commit="c", template=tmpl)
+        installer.render_plist(python="/p", engine_dir="/e", state_dir="/s", api_base_url="u",
+                               pinned_commit="c", imsg_bin="/bin/echo", template=tmpl)
 
 
 def test_assert_plist_secret_free_rejects_bearer():
@@ -49,7 +66,7 @@ def test_assert_plist_secret_free_rejects_bearer():
 def test_render_plist_requires_absolute_python():
     with pytest.raises(ValueError):
         installer.render_plist(python="python3", engine_dir="/e", state_dir="/s",   # relative -> rejected
-                               api_base_url="https://x", pinned_commit="c")
+                               api_base_url="https://x", pinned_commit="c", imsg_bin="/bin/echo")
 
 
 def test_plist_safe_paths_rejects_shell_interpolation():
@@ -132,7 +149,8 @@ def test_prepare_install_upgrade_rollback_preserves_state(tmp_path, monkeypatch)
     def _prepare(commit):
         return installer.main(["prepare", "--install-dir", install, "--state-dir", state,
                                "--commit", commit, "--python", "/usr/bin/python3", "--assume-healthy",
-                               "--api-base-url", "https://api.example", "--home", home, "--uid", "501"])
+                               "--api-base-url", "https://api.example", "--home", home, "--uid", "501",
+                               "--imsg-bin", "/bin/echo"])
 
     # install shaA
     assert _prepare("shaA") == 0
@@ -162,7 +180,71 @@ def test_prepare_dry_run_writes_nothing(tmp_path):
     _make_version(install, "shaA")
     rc = installer.main(["prepare", "--install-dir", install, "--state-dir", state, "--commit", "shaA",
                          "--python", "/usr/bin/python3", "--api-base-url", "https://x", "--home", home,
-                         "--uid", "501", "--dry-run"])
+                         "--uid", "501", "--imsg-bin", "/bin/echo", "--dry-run"])
     assert rc == 0
     assert not os.path.exists(installer.launchagent_path(home))   # dry-run wrote no plist
     assert not os.path.islink(os.path.join(install, "current"))   # and flipped no symlink
+
+
+# --------------------------------------------------------------------------- imsg binary is pinned absolute
+
+
+def test_render_plist_pins_absolute_imsg_so_launchd_path_is_irrelevant(tmp_path):
+    """The Homebrew-style absolute imsg path is rendered into EnvironmentVariables — so launchd's minimal
+    PATH (which the supervisor + relay child inherit) never matters; the relay uses the pinned path."""
+    imsg = _make_exe(str(tmp_path / "opt" / "homebrew" / "bin"))
+    out = installer.render_plist(python="/opt/py", engine_dir="/e", state_dir="/s",
+                                 api_base_url="https://x", pinned_commit="c", imsg_bin=imsg)
+    env = _env_vars(out)
+    assert env["BRUCE_IMSG_BIN"] == imsg and imsg.startswith("/")   # absolute -> no PATH lookup
+
+
+def test_render_plist_rejects_relative_imsg():
+    for rel in ("imsg", "./imsg", "bin/imsg"):
+        with pytest.raises(ValueError):
+            installer.render_plist(python="/p", engine_dir="/e", state_dir="/s", api_base_url="https://x",
+                                   pinned_commit="c", imsg_bin=rel)
+
+
+def test_render_plist_rejects_missing_imsg(tmp_path):
+    with pytest.raises(ValueError):
+        installer.render_plist(python="/p", engine_dir="/e", state_dir="/s", api_base_url="https://x",
+                               pinned_commit="c", imsg_bin=str(tmp_path / "nope" / "imsg"))
+
+
+def test_render_plist_rejects_non_executable_imsg(tmp_path):
+    p = tmp_path / "imsg"; p.write_text("not executable"); os.chmod(str(p), 0o644)
+    with pytest.raises(ValueError):
+        installer.render_plist(python="/p", engine_dir="/e", state_dir="/s", api_base_url="https://x",
+                               pinned_commit="c", imsg_bin=str(p))
+
+
+def test_render_plist_imsg_path_is_xml_and_space_safe(tmp_path):
+    """Spaces and XML-sensitive characters in the imsg path stay plist-safe (escaped) and round-trip."""
+    imsg = _make_exe(str(tmp_path / "a & b dir"))                 # space + '&' in the path
+    out = installer.render_plist(python="/opt/py", engine_dir="/e", state_dir="/s",
+                                 api_base_url="https://x", pinned_commit="c", imsg_bin=imsg)
+    assert "&amp;" in out and "& b" not in out.replace("&amp;", "")   # '&' was escaped in the raw text
+    assert _env_vars(out)["BRUCE_IMSG_BIN"] == imsg                   # ...and parses back to the real path
+
+
+def test_render_plist_rejects_imsg_path_with_shell_metachars(tmp_path):
+    """An (executable) path containing shell-interpolation metacharacters is refused — nothing that a
+    shell could re-evaluate ever reaches the plist."""
+    imsg = _make_exe(str(tmp_path / "a$(whoami)b"))               # '$(' must never survive into the plist
+    with pytest.raises(ValueError):
+        installer.render_plist(python="/opt/py", engine_dir="/e", state_dir="/s",
+                               api_base_url="https://x", pinned_commit="c", imsg_bin=imsg)
+
+
+def test_prepare_missing_imsg_blocks_before_plist_and_symlink(tmp_path, monkeypatch):
+    """A missing imsg fails the install with NO plist written and NO `current` symlink flipped."""
+    install = str(tmp_path / "app"); state = str(tmp_path / "state"); home = str(tmp_path / "home")
+    _make_version(install, "shaA")
+    monkeypatch.setattr(subprocess, "run", lambda c, **k: None)   # no real launchctl
+    with pytest.raises(ValueError):
+        installer.main(["prepare", "--install-dir", install, "--state-dir", state, "--commit", "shaA",
+                        "--python", "/usr/bin/python3", "--assume-healthy", "--api-base-url", "https://x",
+                        "--home", home, "--uid", "501", "--imsg-bin", str(tmp_path / "gone" / "imsg")])
+    assert not os.path.exists(installer.launchagent_path(home))   # no plist written
+    assert not os.path.islink(os.path.join(install, "current"))   # no version activated

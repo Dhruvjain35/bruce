@@ -40,12 +40,13 @@ from logging.handlers import RotatingFileHandler
 from typing import Awaitable, Callable, Protocol
 import logging
 
-from .relay import REVOKED_CREDENTIAL_EXIT, STOP, STOP_DIRECTIVE_EXIT
+from .relay import MISCONFIGURED_EXIT, REVOKED_CREDENTIAL_EXIT, STOP, STOP_DIRECTIVE_EXIT
 
 log = logging.getLogger("bruce.supervisor")
 
 # Relay exit codes that mean "PARK, do not restart" (everything else, including 0, is a restart).
-_PARK_EXITS = {STOP_DIRECTIVE_EXIT: "stop", REVOKED_CREDENTIAL_EXIT: "revoked"}
+_PARK_EXITS = {STOP_DIRECTIVE_EXIT: "stop", REVOKED_CREDENTIAL_EXIT: "revoked",
+               MISCONFIGURED_EXIT: "misconfigured"}
 
 
 class State(str, enum.Enum):

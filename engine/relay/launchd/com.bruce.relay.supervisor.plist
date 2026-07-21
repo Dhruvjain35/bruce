@@ -35,8 +35,12 @@
         <string>@API_BASE_URL@</string>
         <key>BRUCE_RELAY_PINNED_COMMIT</key>
         <string>@PINNED_COMMIT@</string>
-        <!-- These are NON-secret (a URL + a commit hash). The device SECRET is read from the Keychain by
-             config.py — it is NEVER placed in this plist, in argv, or in the environment. -->
+        <key>BRUCE_IMSG_BIN</key>
+        <string>@IMSG_BIN@</string>
+        <!-- These are NON-secret (paths, a URL, a commit hash). BRUCE_IMSG_BIN is the ABSOLUTE imsg path
+             the installer resolved (launchd's minimal PATH excludes Homebrew, so the relay must not rely
+             on PATH). The device SECRET is read from the Keychain by config.py — it is NEVER placed in
+             this plist, in argv, or in the environment. -->
     </dict>
 
     <key>RunAtLoad</key>

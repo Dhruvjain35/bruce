@@ -14,11 +14,11 @@ import sys
 
 from .backend import HttpBackend
 from .checkpoint import FileCheckpoint
-from .config import RelayConfig
+from .config import ConfigError, RelayConfig
 from .imsg import SubprocessImsg
 from .outbound_ledger import OutboundLedger
 from .pending import PendingStore
-from .relay import Relay
+from .relay import MISCONFIGURED_EXIT, Relay
 
 
 def build_relay(cfg: RelayConfig) -> Relay:
@@ -59,7 +59,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",  # ids + statuses only
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log request URLs (keep logs focused)
-    cfg = RelayConfig.from_env()
+    try:
+        cfg = RelayConfig.from_env()
+    except ConfigError as exc:
+        # Fatal, non-transient misconfig (e.g. the pinned imsg binary is gone). Exit with the PARK code
+        # so the supervisor stays ALIVE and parks (no crash-loop), resuming on a kickstart once fixed.
+        # The message is path-free — no filesystem detail reaches remote telemetry.
+        logging.getLogger("bruce.relay").error("relay_misconfigured: %s", exc)
+        sys.exit(MISCONFIGURED_EXIT)
     relay = build_relay(cfg)
     logging.getLogger("bruce.relay").info("relay_start base=%s", cfg.base_url)
     try:
