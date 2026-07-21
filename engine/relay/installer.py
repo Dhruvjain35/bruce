@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import os
 import stat
+from xml.sax.saxutils import escape as _xml_escape
 
 LABEL = "com.bruce.relay.supervisor"
 KEYCHAIN_SERVICE = "com.bruce.relay.device-secret"   # must match relay/config.py
 _TEMPLATE = os.path.join(os.path.dirname(__file__), "launchd", f"{LABEL}.plist")
 
 # Substituted into the template. NONE of these is a secret (paths, a URL, a commit hash).
-_PLACEHOLDERS = ("@PYTHON@", "@ENGINE_DIR@", "@STATE_DIR@", "@API_BASE_URL@", "@PINNED_COMMIT@")
+_PLACEHOLDERS = ("@PYTHON@", "@ENGINE_DIR@", "@STATE_DIR@", "@API_BASE_URL@", "@PINNED_COMMIT@", "@IMSG_BIN@")
 
 # Patterns that must NEVER appear in a rendered plist (belt-and-suspenders secret guard).
 _SECRET_MARKERS = ("BRUCE_RELAY_SECRET", "device-secret-value", "Authorization", "Bearer ", "password")
@@ -34,12 +35,27 @@ def load_template(path: str | None = None) -> str:
         return f.read()
 
 
+def assert_imsg_executable(imsg_bin: str) -> None:
+    """The imsg binary the relay drives must be an ABSOLUTE, existing, executable file — launchd's minimal
+    PATH excludes Homebrew, so the relay must never rely on PATH. Reject empty / relative / nonexistent /
+    non-executable. install_relay.sh resolves it up front so this fails BEFORE any on-disk mutation."""
+    if not imsg_bin or not imsg_bin.startswith("/"):
+        raise ValueError(f"imsg binary path must be absolute, got {imsg_bin!r}")
+    if not (os.path.isfile(imsg_bin) and os.access(imsg_bin, os.X_OK)):
+        raise ValueError(f"imsg binary is not an executable file: {imsg_bin!r}")
+
+
 def render_plist(*, python: str, engine_dir: str, state_dir: str, api_base_url: str,
-                 pinned_commit: str, template: str | None = None) -> str:
-    """Render the LaunchAgent plist. Raises if any placeholder is left unfilled or a secret leaks in."""
+                 pinned_commit: str, imsg_bin: str, template: str | None = None) -> str:
+    """Render the LaunchAgent plist. Raises if a placeholder is left unfilled, ``imsg_bin`` is not an
+    absolute executable file, or a secret leaks in. ``imsg_bin`` is the ABSOLUTE imsg path (launchd's
+    minimal PATH excludes Homebrew, so the relay must never rely on PATH); it is validated here and
+    XML-escaped so any spaces / XML-sensitive characters stay plist-safe."""
+    assert_imsg_executable(imsg_bin)
     out = template if template is not None else load_template()
     for key, val in (("@PYTHON@", python), ("@ENGINE_DIR@", engine_dir), ("@STATE_DIR@", state_dir),
-                     ("@API_BASE_URL@", api_base_url), ("@PINNED_COMMIT@", pinned_commit)):
+                     ("@API_BASE_URL@", api_base_url), ("@PINNED_COMMIT@", pinned_commit),
+                     ("@IMSG_BIN@", _xml_escape(imsg_bin))):
         out = out.replace(key, val)
     leftover = [p for p in _PLACEHOLDERS if p in out]
     if leftover:
@@ -190,6 +206,8 @@ def _prepare(args) -> int:
 
     from . import state_manifest
 
+    assert_imsg_executable(args.imsg_bin)   # fail BEFORE any on-disk mutation (state dir / symlink / plist)
+
     if args.dry_run or args.assume_healthy:
         # file work only; no health gate (dry-run prints; unit tests exercise file ops).
         if args.dry_run:
@@ -207,7 +225,7 @@ def _prepare(args) -> int:
 
     engine_dir = os.path.join(args.install_dir, "current", "engine")
     plist = render_plist(python=args.python, engine_dir=engine_dir, state_dir=args.state_dir,
-                         api_base_url=args.api_base_url, pinned_commit=args.commit)
+                         api_base_url=args.api_base_url, pinned_commit=args.commit, imsg_bin=args.imsg_bin)
     dest = launchagent_path(args.home)
 
     def _reload():
@@ -227,7 +245,8 @@ def _prepare(args) -> int:
         def _activate_and_load(commit):
             activate_version(args.install_dir, commit)
             write_plist(dest, render_plist(python=args.python, engine_dir=engine_dir, state_dir=args.state_dir,
-                                           api_base_url=args.api_base_url, pinned_commit=commit))
+                                           api_base_url=args.api_base_url, pinned_commit=commit,
+                                           imsg_bin=args.imsg_bin))
             _reload()
         state_manifest.safe_activate(install_dir=args.install_dir, state_dir=args.state_dir, commit=args.commit,
                                      activate=_activate_and_load,
@@ -250,6 +269,8 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("--commit", required=True)
     pr.add_argument("--python", required=True)
     pr.add_argument("--api-base-url", dest="api_base_url", required=True)
+    pr.add_argument("--imsg-bin", dest="imsg_bin", required=True,
+                    help="ABSOLUTE path to the imsg binary (resolved by install_relay.sh; launchd's PATH lacks Homebrew)")
     pr.add_argument("--home", default=os.path.expanduser("~"))
     pr.add_argument("--uid", type=int, default=os.getuid())
     pr.add_argument("--dry-run", dest="dry_run", action="store_true")

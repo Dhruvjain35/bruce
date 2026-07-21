@@ -38,6 +38,18 @@ def resolve_secret(account: str = "default") -> str:
     return secret
 
 
+def _resolve_imsg_bin() -> str:
+    """The imsg binary the relay drives. The installer pins an ABSOLUTE path into the LaunchAgent env
+    (launchd's PATH does not include Homebrew), so an absolute path MUST exist and be executable — fail
+    CLEARLY (the supervisor then PARKS via MISCONFIGURED_EXIT) rather than crash-looping if it disappears
+    later. A bare name (dev/test default) is left unresolved for a PATH lookup / injected fake. The error
+    is path-free so no filesystem detail reaches remote telemetry."""
+    b = os.environ.get("BRUCE_IMSG_BIN", "imsg")
+    if b.startswith("/") and not (os.path.isfile(b) and os.access(b, os.X_OK)):
+        raise ConfigError("configured imsg binary is missing or not executable")
+    return b
+
+
 @dataclass(frozen=True)
 class RelayConfig:
     base_url: str
@@ -64,7 +76,7 @@ class RelayConfig:
             secret=resolve_secret(os.environ.get("BRUCE_RELAY_ACCOUNT", "default")),
             spool_dir=os.path.join(state, "spool"),
             checkpoint_path=os.path.join(state, "checkpoint.json"),
-            imsg_bin=os.environ.get("BRUCE_IMSG_BIN", "imsg"),
+            imsg_bin=_resolve_imsg_bin(),
             poll_interval=float(os.environ.get("BRUCE_RELAY_POLL_INTERVAL", "2.0")),
             reconnect_delay=float(os.environ.get("BRUCE_RELAY_RECONNECT_DELAY", "3.0")),
             attachment_max_wait_s=float(os.environ.get("BRUCE_RELAY_ATTACHMENT_MAX_WAIT_S", "120")),

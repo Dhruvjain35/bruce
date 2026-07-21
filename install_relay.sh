@@ -82,6 +82,18 @@ if ! curl -fsS --max-time 10 "${API_BASE_URL%/}/healthz" >/dev/null 2>&1 \
   echo "warning: API at $API_BASE_URL did not respond to a readiness probe (continuing)" >&2
 fi
 
+# Resolve the imsg binary to an ABSOLUTE, executable path BEFORE any mutation. The relay drives imsg from
+# the LaunchAgent, where launchd's minimal PATH does NOT include Homebrew — so we pin the absolute path
+# into the plist and never rely on the caller's PATH after installation. Fail here (no side effects yet).
+IMSG_BIN="${BRUCE_IMSG_BIN:-$(command -v imsg 2>/dev/null || true)}"
+case "$IMSG_BIN" in
+  /*) : ;;
+  "") echo "error: imsg not found — install it (e.g. 'brew install imsg') or set BRUCE_IMSG_BIN to its absolute path" >&2; exit 64 ;;
+  *)  echo "error: imsg must resolve to an ABSOLUTE path, got '$IMSG_BIN'" >&2; exit 64 ;;
+esac
+[ -x "$IMSG_BIN" ] || { echo "error: imsg at '$IMSG_BIN' is not executable" >&2; exit 64; }
+echo "  imsg: $IMSG_BIN"
+
 PYTHON="${BRUCE_RELAY_PYTHON:-$REPO_ROOT/engine/.venv/bin/python}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 ENGINE_DIR="$INSTALL_DIR/current/engine"
@@ -138,7 +150,8 @@ fi
 
 # ---- 3. state dir + version symlink + plist + (re)load — all the testable file work in Python -------
 PREP=(--install-dir "$INSTALL_DIR" --state-dir "$STATE_DIR" --commit "$COMMIT" \
-      --python "$PYTHON" --api-base-url "$API_BASE_URL" --home "$HOME" --uid "$UID_NUM")
+      --python "$PYTHON" --api-base-url "$API_BASE_URL" --home "$HOME" --uid "$UID_NUM" \
+      --imsg-bin "$IMSG_BIN")
 [ "$DRY_RUN" = 1 ] && PREP+=(--dry-run)
 run env PYTHONPATH="$ENGINE_DIR:$REPO_ROOT/engine" "$PYTHON" -m relay.installer prepare "${PREP[@]}"
 

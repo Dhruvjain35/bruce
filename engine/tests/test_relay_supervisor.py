@@ -20,7 +20,7 @@ import pytest
 
 from relay import brucectl
 from relay import supervisor as S
-from relay.relay import REVOKED_CREDENTIAL_EXIT, STOP_DIRECTIVE_EXIT
+from relay.relay import MISCONFIGURED_EXIT, REVOKED_CREDENTIAL_EXIT, STOP_DIRECTIVE_EXIT
 from relay.supervisor import RestartPolicy, SingleInstanceLock, State, Supervisor
 
 
@@ -281,6 +281,20 @@ def test_10_authenticated_stop_parks_alive_no_restart(tmp_path):
 
 
 # ------------------------------------------------- 11 revoked (78) parks without thrash
+
+
+def test_11b_misconfigured_76_parks_no_crash_loop(tmp_path):
+    """A fatal misconfig (e.g. the pinned imsg binary vanished -> relay exits MISCONFIGURED_EXIT) PARKS
+    the supervisor alive instead of crash-looping; it resumes on a kickstart once fixed."""
+    sp = _spawner([FakeChild(exit_code=MISCONFIGURED_EXIT), FakeChild(forever=True)])
+    sup = _sup(tmp_path, sp)
+
+    async def go():
+        task = await _drive_until(sup, lambda: sup.state == State.PARKED and sup.park_reason == "misconfigured")
+        await asyncio.sleep(0.05)                                # let a few cycles pass
+        assert sup.spawn_count == 1 and sup.restart_count == 0 and not task.done()   # parked, no thrash
+        await _stop(sup, task)
+    _run(go())
 
 
 def test_11_revoked_78_parks_no_thrash(tmp_path):
