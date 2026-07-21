@@ -27,7 +27,10 @@ async def _run(args: argparse.Namespace) -> None:
         token = await internal_test.mint_magic_link_token(uuid.UUID(args.user), ttl_seconds=args.ttl)
         base = args.base_url.rstrip("/")
         print(f"internal test sign-in link for user={args.user} (expires in {args.ttl}s, single-use):")
-        print(f"  {base}/internal/test/auth?t={token}")
+        # Token rides in the URL FRAGMENT (after '#'), which browsers never send to the server — so it
+        # never lands in the query string, access logs, or the Referer header. First-party page JS reads
+        # it, clears it, and POSTs it to be consumed once.
+        print(f"  {base}/internal/test/login#token={token}")
         print("Open it in the browser once; it establishes a short-lived HttpOnly session and is consumed.")
 
 

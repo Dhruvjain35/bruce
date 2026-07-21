@@ -464,13 +464,13 @@ def test_page_dashboard_embeds_csrf_when_internal(clean_db, monkeypatch):
 
 
 def test_magic_link_signs_in_internal_user(clean_db, monkeypatch):
-    """An operator-minted magic link exchanges for a fresh Secure/HttpOnly/SameSite session cookie and
-    lands the founder in the authenticated view — no token paste."""
+    """An operator-minted single-use magic link (token consumed from the POST body, never the URL)
+    exchanges for a fresh Secure/HttpOnly/SameSite session cookie and lands the founder in the view."""
     uid = uuid4(); _make_internal(monkeypatch, uid)
     c = _client()
     tok = asyncio.run(internal_test.mint_magic_link_token(uid, ttl_seconds=600))
-    r = c.get(f"/internal/test/auth?t={tok}", follow_redirects=False)
-    assert r.status_code == 303 and r.headers["location"] == internal_test.COOKIE_PATH
+    r = c.post("/internal/test/session", json={"token": tok})
+    assert r.status_code == 200 and r.json()["ok"] is True
     setc = r.headers.get("set-cookie", "").lower()
     assert "httponly" in setc and "secure" in setc and "samesite=strict" in setc
     # the cookie now authenticates the page (authenticated view, not the sign-in landing)
@@ -479,26 +479,26 @@ def test_magic_link_signs_in_internal_user(clean_db, monkeypatch):
 
 
 def test_magic_link_non_internal_is_generic_denied(clean_db, monkeypatch):
-    """A magic token for a NON-internal user is refused with a generic denied page (no enumeration)."""
+    """A magic token for a NON-internal user is refused with a generic 403 (no enumeration), no cookie."""
     internal, outsider = uuid4(), uuid4()
     _make_internal(monkeypatch, internal)                      # allowlist has ONLY `internal`
     c = _client()
     outsider_tok = asyncio.run(internal_test.mint_magic_link_token(outsider))
-    r = c.get(f"/internal/test/auth?t={outsider_tok}", follow_redirects=False)
-    assert r.status_code == 403 and "not authorized" in r.text.lower()
+    r = c.post("/internal/test/session", json={"token": outsider_tok})
+    assert r.status_code == 403
     assert internal_test.SESSION_COOKIE not in r.headers.get("set-cookie", "")
 
 
 def test_magic_link_invalid_or_expired_is_denied(clean_db, monkeypatch):
     uid = uuid4(); _make_internal(monkeypatch, uid)
     c = _client()
-    assert c.get("/internal/test/auth?t=not-a-token", follow_redirects=False).status_code == 403
+    assert c.post("/internal/test/session", json={"token": "not-a-token"}).status_code == 403
     expired = asyncio.run(internal_test.mint_magic_link_token(uid, ttl_seconds=-5))
-    assert c.get(f"/internal/test/auth?t={expired}", follow_redirects=False).status_code == 403
+    assert c.post("/internal/test/session", json={"token": expired}).status_code == 403
 
 
 def test_a_plain_session_jwt_is_not_accepted_as_a_magic_token(clean_db, monkeypatch):
-    """The magic endpoint requires the e1_magic scope — a normal session JWT cannot sign in via /auth
+    """The magic sign-in requires the e1_magic scope — a normal session JWT cannot sign in via /session
     (it is not a general bearer channel)."""
     uid = uuid4(); _make_internal(monkeypatch, uid)
     assert internal_test._verify_magic_token(_token(uid)) is None   # no e1_magic claim -> rejected

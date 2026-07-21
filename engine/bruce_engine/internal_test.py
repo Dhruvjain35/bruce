@@ -49,7 +49,7 @@ from uuid import UUID
 
 import jwt
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import func, select, update
 
 from . import auth, relay_control, schema
@@ -540,24 +540,45 @@ async def login(request: Request) -> JSONResponse:
     return resp
 
 
-async def magic_auth(request: Request) -> HTMLResponse:
-    """Browser sign-in via an operator-minted magic link. Verify the short-lived e1_magic token (sig,
-    exp, scope, user, environment), confirm the user is internal, then ATOMICALLY CONSUME the single-use
-    link; only if consumption succeeds exchange it for a fresh HttpOnly/Secure/SameSite session cookie and
-    redirect into the app. The founder never pastes a token / uses Terminal. A reused / expired / missing
-    / wrong-user / wrong-environment link all return the SAME generic denied page (no enumeration)."""
-    verified = _verify_magic_token(request.query_params.get("t", ""))
+async def login_page(request: Request) -> HTMLResponse:
+    """The founder sign-in landing that the magic link points at. The single-use token rides in the URL
+    FRAGMENT (``/internal/test/login#token=…``) — a fragment is NEVER sent to the server, so the token
+    never reaches the query string, access logs, or the Referer header. First-party, nonce-CSP'd inline
+    JS reads the fragment, clears it via ``history.replaceState`` immediately, and POSTs it to /session.
+    Strict CSP; no third-party scripts."""
+    nonce = secrets.token_urlsafe(16)
+    resp = HTMLResponse(_login_page_html(nonce))
+    resp.headers["Content-Security-Policy"] = (
+        f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+        f"connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+
+async def session_from_magic(request: Request) -> JSONResponse:
+    """Consume a single-use magic token supplied in the POST BODY (never the URL). Verify sig/exp/scope/
+    user, atomically CONSUME the matching unused jti, and set a fresh HttpOnly/Secure/SameSite session
+    cookie ONLY on success. A reused / expired / missing / wrong-user / wrong-environment / malformed
+    token all return the SAME generic 403 (no enumeration). No token is logged."""
+    token = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            token = body.get("token")
+    except (json.JSONDecodeError, ValueError):
+        token = None
+    verified = _verify_magic_token(token or "")
     if verified is None:
-        return HTMLResponse(_denied_html(), status_code=403)
+        raise HTTPException(status_code=403, detail="forbidden")
     uid, jti = verified
     if not is_internal_user(uid):
-        return HTMLResponse(_denied_html(), status_code=403)
+        raise HTTPException(status_code=403, detail="forbidden")
     if not await _consume_magic_link(jti, uid, _safe_env()):
-        return HTMLResponse(_denied_html(), status_code=403)   # reused / expired / wrong env — generic
+        raise HTTPException(status_code=403, detail="forbidden")   # reused / expired / wrong env — generic
     session = auth.mint_bruce_jwt(uid, ttl_seconds=_session_ttl())   # fresh, normal session cookie
-    resp = RedirectResponse(COOKIE_PATH, status_code=303)
+    resp = JSONResponse({"ok": True, "next": COOKIE_PATH})
     _set_session_cookie(resp, session)
-    log.info("internal_test_magic_auth user=%s env=%s", uid, _safe_env())   # content-free (no jti/token)
+    log.info("internal_test_session user=%s env=%s", uid, _safe_env())   # content-free (no jti/token)
     return resp
 
 
@@ -638,7 +659,8 @@ def register(app) -> None:
     """Attach the E1 internal-test routes to ``app``. Uses ``add_api_route`` directly (see the PREFIX
     note above — include_router of a prefixed APIRouter is unreliable on the pinned FastAPI/Starlette)."""
     app.add_api_route(f"{PREFIX}/login", login, methods=["POST"], include_in_schema=False)
-    app.add_api_route(f"{PREFIX}/auth", magic_auth, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
+    app.add_api_route(f"{PREFIX}/login", login_page, methods=["GET"], response_class=HTMLResponse, include_in_schema=False)
+    app.add_api_route(f"{PREFIX}/session", session_from_magic, methods=["POST"], include_in_schema=False)
     app.add_api_route(f"{PREFIX}/logout", logout, methods=["POST"], include_in_schema=False)
     app.add_api_route(f"{PREFIX}/readiness", readiness, methods=["GET"], include_in_schema=False)
     app.add_api_route(f"{PREFIX}/results", results, methods=["GET"], include_in_schema=False)
@@ -708,6 +730,35 @@ def _login_html() -> str:
 <p class="note">Open the secure sign-in link your operator generated for you (it expires shortly). No
 token to copy, no Terminal — just open the link in this browser and you'll land here signed in.</p>
 </div></div></body></html>"""
+
+
+def _login_page_html(nonce: str) -> str:
+    """The magic-link landing (GET /internal/test/login). The single-use token arrives in the URL
+    FRAGMENT; nonce-CSP'd first-party JS reads it, clears it from the URL immediately via
+    history.replaceState, and POSTs it to /session — so the token never touches the query string,
+    access logs, or the Referer header."""
+    n = html.escape(nonce)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bruce — Internal Test (sign in)</title><style nonce="{n}">{_STYLE}</style></head><body><div class="wrap">
+{_env_banner()}
+<h1>Bruce · Internal Test Surface</h1><p class="sub">Authorized internal users only.</p>
+<div class="card"><h2>Sign in</h2>
+<p class="note" id="msg">Opening your secure single-use sign-in link…</p>
+</div></div>
+<script nonce="{n}">
+(function(){{
+  var msg=document.getElementById('msg');
+  var m=/(?:^|[#&])token=([^&]+)/.exec(location.hash||'');
+  try{{history.replaceState(null,'',location.pathname);}}catch(e){{}}   // clear the fragment immediately
+  if(!m){{msg.textContent='Open the secure single-use link your operator generated for you (it expires shortly). No token to copy, no Terminal.';return;}}
+  var token=decodeURIComponent(m[1]);
+  fetch('{COOKIE_PATH}/session',{{method:'POST',headers:{{'Content-Type':'application/json'}},credentials:'same-origin',body:JSON.stringify({{token:token}})}})
+    .then(function(r){{if(r.ok){{location.replace('{COOKIE_PATH}');}}else{{msg.textContent='This sign-in link is invalid or already used. Ask your operator for a fresh one.';}}}})
+    .catch(function(){{msg.textContent='Network error signing in — open the link again.';}});
+}})();
+</script>
+</body></html>"""
 
 
 def _denied_html() -> str:
