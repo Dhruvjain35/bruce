@@ -44,12 +44,13 @@ import html
 import json
 import logging
 import os
+import secrets
 from uuid import UUID
 
 import jwt
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from . import auth, relay_control, schema
 from .access_control import (
@@ -59,7 +60,7 @@ from .access_control import (
     revoke_staging_test,
 )
 from .auth import AuthenticatedUser
-from .db import user_session, worker_session
+from .db import admin_session, user_session, worker_session
 
 log = logging.getLogger("bruce.internal_test")  # content-free: ids / statuses / counts only, never text
 
@@ -177,31 +178,49 @@ def _require_csrf(request: Request) -> None:
 
 # --------------------------------------------------------------------------- magic-link browser sign-in
 # The founder must never paste a JWT, use curl, open dev tools, or run Terminal. An authorized operator
-# mints a SHORT-LIVED magic link (scripts/internal_magic_link.py); the founder just opens it in the
-# browser. The magic token is a limited, short-TTL, e1_magic-scoped JWT that is EXCHANGED for a fresh
-# HttpOnly session cookie — it is never usable as a general API session, and the URL-borne token expires
-# quickly. Access still requires membership of the internal allowlist.
+# mints a SHORT-LIVED, SINGLE-USE magic link (scripts/internal_magic_link.py); the founder just opens it
+# in the browser. The magic token is a limited, short-TTL, e1_magic-scoped JWT carrying a random ``jti``.
+# Only the sha256 HASH of that jti is stored server-side (bound to user + environment, with an expiry);
+# /internal/test/auth atomically CONSUMES the matching unused row and only then exchanges the token for a
+# fresh HttpOnly session cookie. A replay — or a concurrent double-open — yields exactly one session. The
+# raw JWT / sign-in URL is never stored or logged. Access still requires the internal allowlist.
 
 MAGIC_DEFAULT_TTL = 600   # seconds
 
 
-def mint_magic_link_token(user_id: UUID, *, ttl_seconds: int = MAGIC_DEFAULT_TTL) -> str:
-    """Mint the short-lived magic token (operator side — needs BRUCE_JWT_SECRET). e1_magic-scoped so it
-    can only establish an internal-test session, never act as a general bearer."""
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+async def mint_magic_link_token(user_id: UUID, *, ttl_seconds: int = MAGIC_DEFAULT_TTL) -> str:
+    """Mint a SHORT-LIVED, SINGLE-USE magic token (operator side — needs BRUCE_JWT_SECRET). A random jti
+    is embedded in the e1_magic-scoped JWT; only the sha256 HASH of that jti is persisted, bound to
+    (user, environment) with issued/expiry times, so the link can be consumed exactly once. Returns the
+    JWT; the raw token / URL is never stored or logged."""
     secret = os.environ.get("BRUCE_JWT_SECRET")
     if not secret:
         raise RuntimeError("BRUCE_JWT_SECRET is not set")
-    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    payload = {"sub": str(user_id), "iat": now, "exp": now + int(ttl_seconds), "e1_magic": True}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    iat = int(now.timestamp())
+    exp = iat + int(ttl_seconds)
+    jti = secrets.token_urlsafe(32)
+    env = _safe_env()
+    async with admin_session() as s:
+        s.add(schema.MagicLinkToken(
+            jti_hash=_sha256(jti), user_id=user_id, environment=env,
+            issued_at=now,
+            expires_at=datetime.datetime.fromtimestamp(exp, datetime.timezone.utc)))
+    payload = {"sub": str(user_id), "iat": iat, "exp": exp, "e1_magic": True, "jti": jti}
     aud = os.environ.get("BRUCE_JWT_AUDIENCE")
     if aud:
         payload["aud"] = aud
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
-def _verify_magic_token(token: str) -> UUID | None:
-    """Verify a magic token (signature + exp + the e1_magic scope). Returns the user id or None (generic
-    failure — no distinction between bad/expired/wrong-scope, so nothing is enumerable)."""
+def _verify_magic_token(token: str) -> tuple[UUID, str] | None:
+    """Verify a magic token (signature + exp + the e1_magic scope + a jti). Returns (user_id, jti) or
+    None — a single generic failure so nothing is enumerable. A token without a jti is rejected (the
+    single-use scheme requires one)."""
     if not token:
         return None
     secret = os.environ.get("BRUCE_JWT_SECRET") or ""
@@ -211,9 +230,32 @@ def _verify_magic_token(token: str) -> UUID | None:
                             options={"require": ["exp"]})
         if not claims.get("e1_magic"):
             return None
-        return UUID(str(claims["sub"]))
+        jti = claims.get("jti")
+        if not isinstance(jti, str) or not jti:
+            return None
+        return UUID(str(claims["sub"])), jti
     except (jwt.InvalidTokenError, KeyError, ValueError):
         return None
+
+
+async def _consume_magic_link(jti: str, user_id: UUID, environment: str) -> bool:
+    """Atomically consume the matching UNUSED, unexpired magic link for (user, environment). A single
+    conditional UPDATE on ``consumed_at IS NULL`` under a row lock guarantees that, of any number of
+    concurrent attempts, EXACTLY ONE succeeds. Returns True iff this call consumed it (reused / expired /
+    missing / wrong-user / wrong-environment all return False)."""
+    now = _utcnow()
+    async with admin_session() as s:
+        res = await s.execute(
+            update(schema.MagicLinkToken)
+            .where(
+                schema.MagicLinkToken.jti_hash == _sha256(jti),
+                schema.MagicLinkToken.consumed_at.is_(None),
+                schema.MagicLinkToken.user_id == user_id,
+                schema.MagicLinkToken.environment == environment,
+                schema.MagicLinkToken.expires_at > now,
+            )
+            .values(consumed_at=now))
+    return res.rowcount == 1
 
 
 # --------------------------------------------------------------------------- privacy-safe helpers
@@ -499,17 +541,23 @@ async def login(request: Request) -> JSONResponse:
 
 
 async def magic_auth(request: Request) -> HTMLResponse:
-    """Browser sign-in via an operator-minted magic link: verify the short-lived e1_magic token, confirm
-    the user is internal, then EXCHANGE it for a fresh HttpOnly/Secure/SameSite session cookie and
-    redirect into the app. The founder never pastes a token / uses Terminal. Invalid/expired/non-internal
-    -> a GENERIC denied page (no enumeration; identical regardless of why)."""
-    uid = _verify_magic_token(request.query_params.get("t", ""))
-    if uid is None or not is_internal_user(uid):
+    """Browser sign-in via an operator-minted magic link. Verify the short-lived e1_magic token (sig,
+    exp, scope, user, environment), confirm the user is internal, then ATOMICALLY CONSUME the single-use
+    link; only if consumption succeeds exchange it for a fresh HttpOnly/Secure/SameSite session cookie and
+    redirect into the app. The founder never pastes a token / uses Terminal. A reused / expired / missing
+    / wrong-user / wrong-environment link all return the SAME generic denied page (no enumeration)."""
+    verified = _verify_magic_token(request.query_params.get("t", ""))
+    if verified is None:
         return HTMLResponse(_denied_html(), status_code=403)
+    uid, jti = verified
+    if not is_internal_user(uid):
+        return HTMLResponse(_denied_html(), status_code=403)
+    if not await _consume_magic_link(jti, uid, _safe_env()):
+        return HTMLResponse(_denied_html(), status_code=403)   # reused / expired / wrong env — generic
     session = auth.mint_bruce_jwt(uid, ttl_seconds=_session_ttl())   # fresh, normal session cookie
     resp = RedirectResponse(COOKIE_PATH, status_code=303)
     _set_session_cookie(resp, session)
-    log.info("internal_test_magic_auth user=%s env=%s", uid, _safe_env())   # content-free
+    log.info("internal_test_magic_auth user=%s env=%s", uid, _safe_env())   # content-free (no jti/token)
     return resp
 
 

@@ -9,24 +9,26 @@ must also be on the server-side internal allowlist (BRUCE_INTERNAL_USER_IDS) for
     BRUCE_JWT_SECRET=... [BRUCE_JWT_AUDIENCE=...] \
       python -m scripts.internal_magic_link mint --user <uuid> --base-url https://<api-host> [--ttl 600]
 
-Prints ONE URL. It is short-lived; treat it like a one-time link (deliver it privately).
+Prints ONE URL. It is single-use and short-lived: server-side it is consumed on first open, so a
+replay fails even within its TTL (deliver it privately).
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import uuid
 
 from bruce_engine import internal_test
 
 
-def _run(args: argparse.Namespace) -> None:
+async def _run(args: argparse.Namespace) -> None:
     if args.command == "mint":
-        token = internal_test.mint_magic_link_token(uuid.UUID(args.user), ttl_seconds=args.ttl)
+        token = await internal_test.mint_magic_link_token(uuid.UUID(args.user), ttl_seconds=args.ttl)
         base = args.base_url.rstrip("/")
-        print(f"internal test sign-in link for user={args.user} (expires in {args.ttl}s):")
+        print(f"internal test sign-in link for user={args.user} (expires in {args.ttl}s, single-use):")
         print(f"  {base}/internal/test/auth?t={token}")
-        print("Open it in the browser once; it establishes a short-lived HttpOnly session and expires.")
+        print("Open it in the browser once; it establishes a short-lived HttpOnly session and is consumed.")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -40,7 +42,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    _run(_build_parser().parse_args())
+    asyncio.run(_run(_build_parser().parse_args()))
 
 
 if __name__ == "__main__":
