@@ -56,7 +56,9 @@ _USER_TABLES = (
     # is exempt, so it is cleared between tests like capability_audit.
     "relay_control_audit "
     # added 0016 — relay device bootstrap tokens + append-only registration audit.
-    "relay_bootstrap_tokens relay_registration_audit"
+    "relay_bootstrap_tokens relay_registration_audit "
+    # added 0017 — single-use E1 magic-link tokens (sha256 hash only; consumed atomically).
+    "magic_link_tokens"
 ).split()
 
 

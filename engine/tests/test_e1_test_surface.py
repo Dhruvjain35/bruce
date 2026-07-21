@@ -468,7 +468,7 @@ def test_magic_link_signs_in_internal_user(clean_db, monkeypatch):
     lands the founder in the authenticated view — no token paste."""
     uid = uuid4(); _make_internal(monkeypatch, uid)
     c = _client()
-    tok = internal_test.mint_magic_link_token(uid, ttl_seconds=600)
+    tok = asyncio.run(internal_test.mint_magic_link_token(uid, ttl_seconds=600))
     r = c.get(f"/internal/test/auth?t={tok}", follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == internal_test.COOKIE_PATH
     setc = r.headers.get("set-cookie", "").lower()
@@ -483,7 +483,8 @@ def test_magic_link_non_internal_is_generic_denied(clean_db, monkeypatch):
     internal, outsider = uuid4(), uuid4()
     _make_internal(monkeypatch, internal)                      # allowlist has ONLY `internal`
     c = _client()
-    r = c.get(f"/internal/test/auth?t={internal_test.mint_magic_link_token(outsider)}", follow_redirects=False)
+    outsider_tok = asyncio.run(internal_test.mint_magic_link_token(outsider))
+    r = c.get(f"/internal/test/auth?t={outsider_tok}", follow_redirects=False)
     assert r.status_code == 403 and "not authorized" in r.text.lower()
     assert internal_test.SESSION_COOKIE not in r.headers.get("set-cookie", "")
 
@@ -492,7 +493,7 @@ def test_magic_link_invalid_or_expired_is_denied(clean_db, monkeypatch):
     uid = uuid4(); _make_internal(monkeypatch, uid)
     c = _client()
     assert c.get("/internal/test/auth?t=not-a-token", follow_redirects=False).status_code == 403
-    expired = internal_test.mint_magic_link_token(uid, ttl_seconds=-5)
+    expired = asyncio.run(internal_test.mint_magic_link_token(uid, ttl_seconds=-5))
     assert c.get(f"/internal/test/auth?t={expired}", follow_redirects=False).status_code == 403
 
 
@@ -514,4 +515,4 @@ def test_login_landing_has_no_token_paste_and_shows_env_banner(clean_db, monkeyp
 def test_mint_magic_requires_signing_secret(monkeypatch):
     monkeypatch.delenv("BRUCE_JWT_SECRET", raising=False)
     with pytest.raises(RuntimeError):
-        internal_test.mint_magic_link_token(uuid4())
+        asyncio.run(internal_test.mint_magic_link_token(uuid4()))

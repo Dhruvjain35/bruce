@@ -574,6 +574,26 @@ class RelayRegistrationAudit(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class MagicLinkToken(Base):
+    """Short-lived, SINGLE-USE E1 internal-test sign-in link. Only the sha256 HASH of the token's random
+    jti is stored — never the raw JWT or the sign-in URL. Bound to (user, environment) with issued/expiry
+    times; ``/internal/test/auth`` atomically consumes the matching UNUSED row (a conditional UPDATE on
+    ``consumed_at IS NULL``), so a replay — or a concurrent double-open — yields exactly one session.
+    Admin-only RLS (mint + consume run in an ``admin_session``), added by migration 0017. Content-free:
+    no handle / token / secret is ever stored."""
+
+    __tablename__ = "magic_link_tokens"
+    id = _pk()
+    jti_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)     # sha256 of the token jti
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)    # founder the link signs in
+    environment: Mapped[str] = mapped_column(String(24), nullable=False)              # binds the link to an env
+    issued_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)  # short-lived
+    consumed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # set once
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (UniqueConstraint("jti_hash", name="uq_magic_link_jti_hash"),)
+
+
 class RelayUpload(Base, TSV):
     """A file the relay uploaded from an inbound message, staged until the intake source is created.
     Bytes live here transiently (cleared on consume); infra, so worker-only RLS. content_hash lets
