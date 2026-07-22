@@ -30,6 +30,14 @@ meta:
     native context + authoritative reply target (A3 + P0.1), the channel-aware technical renderer (P0.2),
     and iMessage style guarantees / no-em-dash (P0.3). Live iMessage end-to-end reply flow reported
     live-verified by the operator; broader live coverage still accruing.
+  # Workstream ownership partition (D-INT-4): a lane edits statuses only inside its own primitive blocks,
+  # so parallel worktrees don't collide on adjacent YAML. Shared blocks are integration-owned.
+  owners:
+    integration: [capability_access_gate, relay_control_plane, permission_privacy_controls, universal_source_intake]
+    mission-kernel: [durable_mission_engine, approval_verification, evidence_provenance]
+    school-command: [school_connector_framework, canonical_academic_graph, change_detection_engine, canvas_adapter, grades_feedback, communication_adapters, calendar_execution]
+    humanity: [conversation_reasoning_router, conversation_style_engine]
+    trust-evals: [notification_policy]
 
 # --- P0: messaging-first conversation brain (Bite 1) — the built wave ---------------------------
 primitives:
