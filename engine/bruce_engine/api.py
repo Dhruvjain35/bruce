@@ -30,6 +30,7 @@ from sqlalchemy import text as sa_text
 from . import apple_auth
 from . import auth
 from . import calendar_build
+from . import conversation_graph
 from . import extraction
 from . import intake_store
 from . import internal_test
@@ -497,14 +498,28 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
     if req.is_from_me:
         return {"status": "ignored_echo"}
     # FAIL-CLOSED relationship-event guard (Bite 2 A): a tapback, tapback-removal, unsend, or edit-only
-    # event is carried for the future ConversationContextGraph (A2) but must NEVER enter the
-    # message->reply pipeline — no conversation turn, no outbound. Distinct statuses, no side effects
-    # (stateless => idempotent on redelivery). Persisting them lands in A2.
+    # event is PERSISTED to the ConversationContextGraph (A2, for a linked owner) but must NEVER enter the
+    # message->reply pipeline — no conversation turn, no outbound. Distinct statuses; graph writes are
+    # idempotent so redelivery is a no-op. Unlinked sender => no owner => nothing persisted.
+    provider = ChannelKind.self_hosted_imessage.value
     if req.reaction_type is not None or req.reaction_target_message_id is not None:
+        owner = await conversation_graph.resolve_owner(provider, req.channel_identity)
+        if owner is not None:
+            await conversation_graph.record_reaction(
+                owner, provider=provider, provider_event_id=req.provider_message_id,
+                reaction_type=req.reaction_type or "unknown", removed=req.reaction_removed,
+                channel_identity=req.channel_identity,
+                target_provider_message_id=req.reaction_target_message_id)
         return {"status": "reaction_ignored_until_context_graph"}
     if req.unsent:
+        owner = await conversation_graph.resolve_owner(provider, req.channel_identity)
+        if owner is not None:
+            await conversation_graph.mark_unsent(owner, provider=provider, provider_message_id=req.provider_message_id)
         return {"status": "unsent_event_recorded"}
     if req.edited:
+        owner = await conversation_graph.resolve_owner(provider, req.channel_identity)
+        if owner is not None:
+            await conversation_graph.mark_edited(owner, provider=provider, provider_message_id=req.provider_message_id)
         return {"status": "relationship_event_recorded"}
     atts, refs = [], []
     for a in req.attachments:
