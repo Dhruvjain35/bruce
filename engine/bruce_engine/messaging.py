@@ -80,7 +80,18 @@ class InboundMessage(BaseModel):
     attachments: list[Attachment] = Field(default_factory=list)
     timestamp: datetime.datetime
     reply_to_message_id: str | None = None
-    thread_id: str | None = None
+    thread_id: str | None = None      # CONVERSATION/chat id (from chat_guid), NOT the inline-reply root
+    # --- Bite 2 A message-relationship contract (null-safe; provider-neutral). thread_root_message_id
+    # is the inline-reply originator and is deliberately DISTINCT from thread_id. Reaction/edit/unsent
+    # events are fenced out of the reply pipeline upstream (relay_inbound guard), so on this object they
+    # are always null/false for a real message turn — carried here only for contract completeness.
+    thread_root_message_id: str | None = None
+    reaction_target_message_id: str | None = None
+    reaction_type: str | None = None   # love|like|dislike|laugh|emphasis|question|sticker|unknown
+    reaction_removed: bool = False
+    edited: bool = False
+    unsent: bool = False
+    service: str | None = None         # "iMessage" | "SMS"
     is_group: bool = False            # group thread — the conversation runtime refuses these in Bite 1
     attachment_unavailable: bool = False  # relay gave up resolving a still-downloading attachment
 
