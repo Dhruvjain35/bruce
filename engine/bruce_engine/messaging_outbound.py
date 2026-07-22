@@ -93,6 +93,7 @@ async def claim(relay_device_id: UUID, lease_seconds: int = DEFAULT_LEASE_SECOND
 
 
 async def mark_sent(outbound_id: UUID, *, provider_message_id: str | None, relay_device_id: UUID) -> None:
+    graph = None
     async with worker_session() as s:
         row = (await s.execute(select(schema.OutboundMessageRow).where(schema.OutboundMessageRow.id == outbound_id))).scalar_one_or_none()
         if row is None:
@@ -104,6 +105,14 @@ async def mark_sent(outbound_id: UUID, *, provider_message_id: str | None, relay
         s.add(schema.DeliveryAttempt(user_id=row.user_id, outbound_message_id=outbound_id,
                                      relay_device_id=relay_device_id, attempt_no=row.attempts,
                                      status="sent", provider_message_id=provider_message_id))
+        if provider_message_id and row.user_id is not None:
+            graph = (row.user_id, row.channel, provider_message_id, row.to_handle)
+    if graph is not None:  # Bite 2 A2: canonical outbound node (separate txn; provider guid is now known)
+        from . import conversation_graph
+        uid, channel, pmid, to_handle = graph
+        await conversation_graph.ingest_outbound_message(
+            uid, provider=channel, provider_message_id=pmid, provider_chat_id=to_handle,
+            outbound_message_id=outbound_id)
 
 
 async def mark_failed(outbound_id: UUID, *, reason: str, relay_device_id: UUID,

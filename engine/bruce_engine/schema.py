@@ -720,6 +720,100 @@ class ConversationTurn(Base, TSV):
 
 
 # ================================================================================================
+# CONVERSATION CONTEXT GRAPH (Bite 2 A2 — persistence only; retrieval is A3). A THIN provider-neutral
+# graph OVER the existing content rows: it never duplicates message text or attachment bytes — it points
+# at inbound_messages / conversation_turns / outbound_messages / message_attachments / messaging_identities
+# by id and stores only the relationships (reply / thread-root / edit / reaction). Ingested by the worker
+# path for a LINKED user, so tenant_or_worker RLS (worker writes across users; a user reads only their
+# own; FORCE RLS). Account-deletion erasure is free via the users.id CASCADE. See migration 0018.
+# ================================================================================================
+
+
+class ConversationMessage(Base, TSV):
+    """Canonical node: exactly ONE row per (provider, provider_message_id), globally unique so a provider
+    message id can never be reused across users. Content lives in the referenced rows (SET NULL so pruning
+    content never deletes the node). Reaction/edit/unsent are carried, but relationship-only events never
+    become a turn (relay_inbound guard + conversation_graph)."""
+
+    __tablename__ = "conversation_messages"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)               # e.g. self_hosted_imessage
+    provider_message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_chat_id: Mapped[str | None] = mapped_column(String(255), nullable=True)   # chat/conversation id
+    sender_identity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("messaging_identities.id", ondelete="SET NULL"), nullable=True)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)              # inbound | outbound | system
+    service: Mapped[str | None] = mapped_column(String(16), nullable=True)          # imessage | sms | unknown
+    sent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    received_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    inbound_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("inbound_messages.id", ondelete="SET NULL"), nullable=True)
+    conversation_turn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("conversation_turns.id", ondelete="SET NULL"), nullable=True)
+    outbound_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("outbound_messages.id", ondelete="SET NULL"), nullable=True)
+    source_evidence_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sources.id", ondelete="SET NULL"), nullable=True)
+    edited_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    unsent_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_message_id", name="uq_conv_msg_provider"),
+        Index("ix_conv_messages_owner_chat_time", "user_id", "provider_chat_id", "received_at"),
+    )
+
+
+class ConversationMessageRelationship(Base, TSV):
+    """A directed edge between messages. The target may not be ingested yet:
+    unresolved_target_provider_message_id holds the provider guid until the target arrives, then
+    conversation_graph.reconcile links it (never across owners). One edge per (source, type)."""
+
+    __tablename__ = "conversation_message_relationships"
+    id = _pk()
+    user_id = _owner()
+    source_message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("conversation_messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    target_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("conversation_messages.id", ondelete="SET NULL"), nullable=True)
+    unresolved_target_provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    relationship_type: Mapped[str] = mapped_column(String(32), nullable=False)     # reply_to|thread_root|edit_of|replacement_for|mission_source|decision_source|attachment_caption_for
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_evidence_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("sources.id", ondelete="SET NULL"), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("source_message_id", "relationship_type", name="uq_conv_rel_source_type"),
+        Index("ix_conv_rel_unresolved", "user_id", "unresolved_target_provider_message_id"),
+    )
+
+
+class ConversationMessageAttachment(Base, TSV):
+    """Join from a graph message to an EXISTING message_attachments row, with the relationship (attached
+    here vs quoted/replied-to/generated) and order. Never copies attachment metadata or bytes."""
+
+    __tablename__ = "conversation_message_attachments"
+    id = _pk()
+    user_id = _owner()
+    message_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("conversation_messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    attachment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("message_attachments.id", ondelete="CASCADE"), nullable=False)
+    relationship: Mapped[str] = mapped_column(String(16), nullable=False, server_default="attached")  # attached|quoted|replied_to|generated
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    __table_args__ = (UniqueConstraint("message_id", "attachment_id", "relationship", name="uq_conv_msg_att"),)
+
+
+class ConversationReactionEvent(Base, TSV):
+    """A tapback add/remove. NEVER creates a reasoning turn; a removal is its own event (not a delete).
+    Idempotent on (provider, provider_event_id). Target may resolve later like a relationship edge."""
+
+    __tablename__ = "conversation_reaction_events"
+    id = _pk()
+    user_id = _owner()
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_event_id: Mapped[str] = mapped_column(String(255), nullable=False)    # deterministic idempotency key
+    actor_identity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("messaging_identities.id", ondelete="SET NULL"), nullable=True)
+    target_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("conversation_messages.id", ondelete="SET NULL"), nullable=True)
+    unresolved_target_provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reaction_type: Mapped[str] = mapped_column(String(16), nullable=False)         # love|like|dislike|laugh|emphasis|question|sticker|unknown
+    removed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    occurred_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_conv_reaction_event"),
+        Index("ix_conv_reaction_target", "user_id", "target_message_id"),
+    )
+
+
+# ================================================================================================
 # SCHOOL CONNECTOR DOMAIN (provider-neutral canonical academic graph). NO provider (Canvas/Classroom)
 # field may enter these — the adapter normalizes into these rows at the boundary (see canvas_fake.py,
 # school_store.py). Every synced object is tenant-owned and processed under user_session(user_id), so

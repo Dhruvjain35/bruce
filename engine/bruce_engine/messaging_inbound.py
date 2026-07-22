@@ -110,6 +110,13 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
                     dedup_key=f"prompt:{msg.provider_message_id}")
         return InboundOutcome(status="unlinked_prompt")
 
+    # 2a. CONVERSATION CONTEXT GRAPH (Bite 2 A2) — persistence only. Upsert the canonical inbound node +
+    # reply/thread edges for this LINKED message so A3 can later resolve a replied-to message/image
+    # without a resend. Idempotent; produces NO turn and NO reply. Runs for both runtime + legacy paths.
+    from . import conversation_graph  # local import: avoid an import cycle via api/runtime
+    msg.user_id = user_id
+    await conversation_graph.ingest_inbound_message(msg)
+
     # 2b. CONVERSATION RUNTIME (Bite 1) — DB-gated per user (Bite 1.5 keystone). A LINKED inbound goes to
     # the multimodal conversation brain instead of the legacy intake + hard-coded ACK, but only if the DB
     # access gate allows THIS user (an active production entitlement or a live staging enrollment, unless a

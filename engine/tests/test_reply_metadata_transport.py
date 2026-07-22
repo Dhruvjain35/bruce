@@ -146,8 +146,12 @@ def _inbound(req, monkeypatch):
         from bruce_engine.messaging_inbound import InboundOutcome
         return InboundOutcome(status="processed", user_id=None)
 
+    async def _unlinked(*a, **k):
+        return None  # no owner => the A2 graph guard persists nothing; offline-safe
+
     monkeypatch.setattr(api.messaging_inbound, "handle_inbound", fake_handle)
     monkeypatch.setattr(api.messaging_outbound, "QueueChannel", lambda: object())
+    monkeypatch.setattr(api.conversation_graph, "resolve_owner", _unlinked)
     status = _run(relay_inbound(req, device=object()))
     return status, calls
 
