@@ -17,13 +17,19 @@
 # a primitive that unlocks ten real outcomes beats ten disconnected feature tickets.
 
 meta:
-  version: 1
+  version: 2
   source_universe: bruce_complete_capability_universe_voice_life_finance_v2.md
-  repo_commit_at_audit: 8bec4a5
-  staging_commit: 8bec4a5           # api + worker; migration head 0011; conversation flag OFF
+  repo_commit_at_audit: be55524
+  staging_commit: be55524           # api + worker share one digest; migration head 0018
   note: >
-    live iMessage remains UNVERIFIED (dedicated-Mac dry-run pending); the conversation runtime is
-    deployed but flag-gated OFF; account linking is the only messaging capability live-verified.
+    Conversation runtime is DEPLOYED and gated by a DB capability-access decision
+    (production_account_entitlement OR live staging enrollment), NOT a simple env flag — access_control.py;
+    BRUCE_CONVERSATION_RUNTIME is only a global hard-OFF override. Since v1 (8bec4a5 / head 0011) the built
+    wave added: DB capability-access gate + staging enrollment (0013), relay control/audit/bootstrap
+    (0014-0016), magic-link single-use (0017), the ConversationContextGraph (0018, Bite 2 A2), reply-aware
+    native context + authoritative reply target (A3 + P0.1), the channel-aware technical renderer (P0.2),
+    and iMessage style guarantees / no-em-dash (P0.3). Live iMessage end-to-end reply flow reported
+    live-verified by the operator; broader live coverage still accruing.
 
 # --- P0: messaging-first conversation brain (Bite 1) — the built wave ---------------------------
 primitives:
@@ -76,11 +82,11 @@ primitives:
         autonomy: A1
         risk: medium
         primitives: [conversation_reasoning_router, conversation_style_engine, evidence_provenance]
-        status: deployed              # merged + on staging, flag OFF
-        live_verified: false
-        evidence: engine/bruce_engine/conversation_runtime.py (flag BRUCE_CONVERSATION_RUNTIME, default off)
+        status: deployed              # merged + on staging; DB entitlement/enrollment gated (not an env flag)
+        live_verified: true           # operator-reported: live iMessage reply flow verified at be55524
+        evidence: engine/bruce_engine/conversation_runtime.py; gated by access_control.conversation_access (entitlement/enrollment); BRUCE_CONVERSATION_RUNTIME is a global hard-off override only
         tests: engine/tests/test_conversation_runtime.py; staging LEVEL A + LEVEL B (real gpt-5.4-mini)
-        gaps: 1:1 only; no autonomous missions; no follow-up push (deferred)
+        gaps: 1:1 only; no autonomous missions yet (durable_mission_engine unwired to the brain); no follow-up push (deferred)
       - id: CAP-CONV-002
         name: Provider-neutral multimodal reasoner (one vision pass, typed 13-field decision)
         wave: 1
@@ -106,7 +112,7 @@ primitives:
         risk: low
         status: deployed
         live_verified: false
-        evidence: conversation_runtime._is_event/_event_fields; schema.EventCandidate; event_saved_calendar_unavailable template
+        evidence: conversation_outcomes.EventCandidateHandler (_is_event/_event_fields); schema.EventCandidate; event_saved_calendar_unavailable template
         tests: test_event_detected_by_entities_not_capability_string; LEVEL B event (real model)
         note: NEVER claims "added to your calendar" — a fact-locked template + guard prove it
       - id: CAP-CONV-005
@@ -117,6 +123,25 @@ primitives:
         status: deployed
         evidence: conversation_model retry+timeout; runtime fallback; could_not_read_attachment template
         tests: LEVEL B timeout + unreadable (real model, no hallucination)
+      - id: CAP-CONV-006
+        name: Reply-aware native context + authoritative reply target (Bite 2 A2/A3 + P0.1)
+        wave: 1
+        autonomy: A1
+        risk: medium
+        status: deployed
+        live_verified: true             # operator-reported: replying to an older image resolves that image, not the newest
+        evidence: conversation_context.ContextResolver/ContextCapsule; conversation_graph (0018); relay/chatdb.py + reply_context.py envelope; conversation_runtime authoritative-target fail-closed + recent-window suppression
+        tests: test_conversation_context.py, test_conversation_runtime P0.1 cases, test_chatdb_adapter.py, test_relay_reply_context.py
+        note: "an explicit reply target is authoritative — never answers from a newer image; iMessage part-prefixes (p:N/, bp:) normalized both sides"
+      - id: CAP-CONV-007
+        name: Outcome-dispatch seam (ordered handler pipeline; capabilities add a handler, not a handle() branch)
+        wave: 1
+        autonomy: A0
+        risk: low
+        status: implemented             # PR #65; behavior-preserving refactor (not yet deployed at time of this entry)
+        evidence: engine/bruce_engine/conversation_outcomes.py; conversation_runtime._resolve_outcome
+        tests: engine/tests/test_conversation_outcomes.py
+        note: keystone for parallel workstreams — ConversationDecision stays frozen at 13 fields; HandoffDecision is a NEW type
 
   conversation_style_engine:
     universe_primitive: 26
@@ -137,6 +162,23 @@ primitives:
         status: implemented
         evidence: conversation_style.assert_facts_preserved (raises StyleViolation)
         tests: test_conversation_style fact-preservation cases
+      - id: CAP-VOICE-003
+        name: iMessage style guarantees (no em dash EVER + strip redundant closing offers) — P0.3
+        wave: 1
+        autonomy: A0
+        risk: low
+        status: deployed
+        evidence: conversation_style.enforce_no_dashes applied unconditionally + strip_redundant_offer; conversation_runtime._present asserts no em dash
+        tests: test_conversation_style P0.3 cases (em dash on technical-looking line, offer strip keeps tutoring choices)
+      - id: CAP-RENDER-001
+        name: Channel-aware technical renderer (LaTeX/Markdown -> plain/Unicode, structural equivalence guard) — P0.2
+        wave: 1
+        autonomy: A0
+        risk: medium
+        status: deployed
+        evidence: engine/bruce_engine/technical_render.py (TechnicalBlock parse, ordered per-block signature guard, forbidden-token gate); runtime _present
+        tests: engine/tests/test_technical_render.py (46 incl. P0.2 matrix-collapse regressions)
+        note: label-to-expression association preserved (T-vs-T2); matrices no longer collapse to ",quad"
 
   durable_mission_engine:
     universe_primitive: 5
@@ -173,7 +215,7 @@ primitives:
         risk: high
         status: deployed
         live_verified: true             # two-user denial proven on the deployed staging DB
-        evidence: migrations 0002/0011; test_postgres_integration test_05/05b/08
+        evidence: migrations 0002/0011/0018 (0018 = 4 tenant_or_worker FORCE-RLS conversation-graph tables); test_postgres_integration test_05/05b/08; test_migration_rls_context (0018 populated-downgrade fail-closed guard)
       - id: CAP-PRIV-002
         name: Content-free relay + brain logs (ids/statuses only, never text/paths)
         wave: 1
@@ -182,6 +224,40 @@ primitives:
         status: deployed
         evidence: engine/relay/relay.py; conversation_runtime logging
         tests: test_relay_attachments content-free-logs
+
+  capability_access_gate:
+    universe_primitive: 25
+    capabilities:
+      - id: CAP-ACCESS-001
+        name: DB-backed capability access gate (fail-closed; entitlement + staging enrollment + kill switch)
+        wave: 1
+        autonomy: A0
+        risk: high
+        status: deployed
+        live_verified: true             # the live gate for every enrolled staging conversation test
+        evidence: engine/bruce_engine/access_control.py; migration 0013 (capability_global_state, production_account_entitlements, capability_audit — append-only)
+        tests: engine/tests/test_access_control.py; test_capability_access
+        note: per-user access is a DB decision, never the env flag; global kill wins over everything
+      - id: CAP-ACCESS-002
+        name: Magic-link single-use enrollment token
+        wave: 1
+        autonomy: A0
+        risk: medium
+        status: deployed
+        evidence: migration 0017 (magic_link_tokens, single-use)
+        tests: engine/tests/test_magic_link*
+
+  relay_control_plane:
+    universe_primitive: 1
+    capabilities:
+      - id: CAP-RELAY-002
+        name: Relay control + audit + bootstrap (device registration, control audit, append-only)
+        wave: 1
+        autonomy: A0
+        risk: medium
+        status: deployed
+        evidence: migrations 0014-0016 (relay_control, relay_control_audit, relay_registration_audit — BEFORE UPDATE/DELETE guard = append-only even for owner)
+        tests: engine/tests/test_relay_control.py, test_relay_bootstrap.py, test_relay_state_manifest.py
 
 # --- P1: student command center (planned) ------------------------------------------------------
   school_connector_framework:
