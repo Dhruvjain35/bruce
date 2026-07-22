@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from . import conversation_store, messaging_outbound
+from . import conversation_store, messaging_outbound, technical_render
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, IntentKind, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
@@ -161,19 +161,31 @@ class _Runtime:
                 reply = self.style.template("event_saved_calendar_unavailable", title=title,
                                             when=when, where=where)
             else:
-                reply = self.style.render(decision.user_visible_response,
-                                          risk_level=decision.risk_level, profile=profile)
+                reply = self._present(decision.user_visible_response, decision=decision,
+                                      profile=profile, channel=ch)
         else:
             # everything else (casual, tutoring, extraction, unsupported): the model's honest reply,
             # styled. No autonomous mission is ever created from the model in Bite 1.
-            reply = self.style.render(decision.user_visible_response, risk_level=decision.risk_level,
-                                      profile=profile)
+            reply = self._present(decision.user_visible_response, decision=decision,
+                                  profile=profile, channel=ch)
 
         await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
                              decision=decision, event_candidate_id=event_candidate_id)
         log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s", pmid, decision.intent.value,
                  decision.response_type.value, event_candidate_id is not None)
         return InboundOutcome(status="processed", user_id=user_id)
+
+    def _present(self, text: str, *, decision: ConversationDecision, profile, channel: str) -> str:
+        """Channel-aware presentation. For plain-text channels (iMessage/SMS): LaTeX/Markdown ->
+        readable plain text/Unicode (fact-equivalence-guarded), then voice styling that leaves
+        technical lines verbatim, then a HARD gate so no raw TeX/Markdown ever ships. Presentation
+        only — every value/sign/entry is preserved. Non-plain channels pass through unstyled math."""
+        readable = technical_render.render_for_channel(text, channel=channel)
+        styled = self.style.render(readable, risk_level=decision.risk_level, profile=profile,
+                                   protect_technical=True)
+        if channel in technical_render.PLAIN_TEXT_CHANNELS and technical_render.forbidden_tokens(styled):
+            styled = technical_render.render_for_channel(styled, channel=channel)   # last-resort re-clean
+        return styled
 
     async def _already_answered(self, user_id, channel, pmid) -> bool:
         from .db import user_session
