@@ -11,9 +11,10 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from . import conversation_context, conversation_store, messaging_outbound, technical_render
+from . import (conversation_context, conversation_outcomes, conversation_store, messaging_outbound,
+               technical_render)
 from .attachment_pipeline import UnreadableAttachment, normalize_image
-from .conversation_contract import ConversationDecision, IntentKind, RiskLevel
+from .conversation_contract import ConversationDecision, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
 from .conversation_style import ConversationStyleEngine, VoiceProfile, enforce_no_dashes, strip_redundant_offer
 from .messaging import ChannelKind, InboundMessage, MessagingChannel
@@ -65,48 +66,27 @@ def _context(recent: list) -> str:
     return "Recent conversation (oldest first):\n" + "\n".join(lines[-8:])
 
 
-def _event_fields(decision: ConversationDecision) -> tuple[str, str, str, dict]:
-    """Build (title, when, where, provenance) from grounded entities. Provenance keeps verbatim spans."""
-    title = when = where = ""
-    spans = []
-    for e in decision.extracted_entities:
-        et = (e.type or "").lower()
-        if not title and ("title" in et or "event" in et or "name" in et):
-            title = e.value
-        elif "date" in et or "time" in et or "day" in et:
-            when = (when + " " + (e.normalized or e.value)).strip()
-        elif "location" in et or "place" in et or "venue" in et or "address" in et:
-            where = e.value
-        if e.source_span:
-            spans.append({"type": e.type, "span": e.source_span})
-    title = title or (decision.proposed_goal or "your event")
-    when = (when + "\n") if when else ""
-    where = where or ""
-    return title, when, where, {"entities": spans}
-
-
-def _is_event(decision: ConversationDecision) -> bool:
-    """An event = a title-like AND a date-like entity. Robust to model phrasing (do NOT rely on an
-    exact capability id — the real model says 'calendar creation', 'add to calendar', etc.)."""
-    types = [(e.type or "").lower() for e in decision.extracted_entities]
-    has_title = any(("title" in t) or ("event" in t) or ("name" in t) for t in types)
-    has_date = any(("date" in t) or ("time" in t) or ("day" in t) for t in types)
-    return has_title and has_date
-
-
-def _wants_calendar(decision: ConversationDecision, msg_text: str | None) -> bool:
-    if decision.intent is IntentKind.actionable:
-        return True
-    if any("calendar" in c.lower() for c in decision.required_capabilities):
-        return True
-    return "calendar" in (msg_text or "").lower()
-
-
 class _Runtime:
     def __init__(self, reasoner: ConversationReasoner | None = None,
-                 style: ConversationStyleEngine | None = None) -> None:
+                 style: ConversationStyleEngine | None = None,
+                 handlers: list | None = None) -> None:
         self.reasoner = reasoner or production_reasoner()
         self.style = style or ConversationStyleEngine()
+        # the outcome-dispatch pipeline (D-INT-1). Workstreams add capability handlers here without
+        # touching handle(); the terminal DefaultReplyHandler always resolves.
+        self.handlers = handlers if handlers is not None else conversation_outcomes.default_handlers()
+
+    async def _resolve_outcome(self, *, decision, capsule, msg, profile, channel, user_id, pmid):
+        """Run the ordered handler pipeline; first non-None ResolvedReply wins. The default handler is
+        terminal, so this never returns None (defensive raise if a caller ships a list without one)."""
+        octx = conversation_outcomes.OutcomeContext(
+            user_id=user_id, decision=decision, capsule=capsule, msg=msg, profile=profile,
+            channel=channel, pmid=pmid, present=self._present, style=self.style, store=conversation_store)
+        for h in self.handlers:
+            res = await h.resolve(octx)
+            if res is not None:
+                return res
+        raise RuntimeError("no outcome handler resolved the decision (missing terminal handler)")
 
     async def handle(self, channel: MessagingChannel, msg: InboundMessage, *,
                      user_id: UUID, reply_target: str) -> InboundOutcome:
@@ -179,35 +159,16 @@ class _Runtime:
             return InboundOutcome(status="model_error", user_id=user_id)
 
         decision = rr.decision
-        event_candidate_id: UUID | None = None
 
-        if _is_event(decision):
-            # An event was extracted: PERSIST the candidate with provenance (a durable, useful artifact
-            # regardless of exact model phrasing). If the user wanted it on a calendar, reply with the
-            # fact-locked "can't add yet" template — NEVER claim it was added.
-            title, when, where, provenance = _event_fields(decision)
-            event_candidate_id = await conversation_store.persist_event_candidate(
-                user_id, title=title,
-                idempotency_key=f"ec:{ch}:{pmid}",
-                confidence=decision.confidence,
-                missing_fields=[f for f in ("date",) if not when] or None,
-                provenance={**provenance, "inbound_provider_message_id": pmid})
-            if _wants_calendar(decision, msg.text):
-                reply = self.style.template("event_saved_calendar_unavailable", title=title,
-                                            when=when, where=where)
-            else:
-                reply = self._present(decision.user_visible_response, decision=decision,
-                                      profile=profile, channel=ch)
-        else:
-            # everything else (casual, tutoring, extraction, unsupported): the model's honest reply,
-            # styled. No autonomous mission is ever created from the model in Bite 1.
-            reply = self._present(decision.user_visible_response, decision=decision,
-                                  profile=profile, channel=ch)
+        # Outcome dispatch (D-INT-1): the ordered handler pipeline turns the decision into a reply +
+        # any side effect to persist. Ported branch parity: event-candidate first, styled default last.
+        outcome = await self._resolve_outcome(decision=decision, capsule=capsule, msg=msg,
+                                              profile=profile, channel=ch, user_id=user_id, pmid=pmid)
 
-        await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
-                             decision=decision, event_candidate_id=event_candidate_id)
-        log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s", pmid, decision.intent.value,
-                 decision.response_type.value, event_candidate_id is not None)
+        await self._finalize(user_id, ch, ident, pmid, outcome.reply, reply_target,
+                             decision=decision, event_candidate_id=outcome.event_candidate_id)
+        log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s handler=%s", pmid, decision.intent.value,
+                 decision.response_type.value, outcome.event_candidate_id is not None, outcome.handler)
         return InboundOutcome(status="processed", user_id=user_id)
 
     def _present(self, text: str, *, decision: ConversationDecision, profile, channel: str) -> str:
@@ -264,6 +225,7 @@ class _Runtime:
 
 async def handle(channel: MessagingChannel, msg: InboundMessage, *, user_id: UUID, reply_target: str,
                  reasoner: ConversationReasoner | None = None,
-                 style: ConversationStyleEngine | None = None) -> InboundOutcome:
-    return await _Runtime(reasoner=reasoner, style=style).handle(
+                 style: ConversationStyleEngine | None = None,
+                 handlers: list | None = None) -> InboundOutcome:
+    return await _Runtime(reasoner=reasoner, style=style, handlers=handlers).handle(
         channel, msg, user_id=user_id, reply_target=reply_target)
