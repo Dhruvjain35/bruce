@@ -99,6 +99,21 @@ async def create_handoff_mission(
         return MissionCreation(mission_id=mission.id, created=True, phase=phase)
 
 
+async def latest_active_handoff_mission(user_id: UUID) -> dict | None:
+    """The most recent OPEN handoff mission for this user (backs a status question like 'what are u doing
+    with that?'). Active = status 'running'. Owner-scoped; None if there is no open handoff mission."""
+    async with user_session(user_id) as s:
+        m = (await s.execute(select(schema.Mission).where(
+            schema.Mission.user_id == user_id,
+            schema.Mission.kind == HANDOFF_KIND,
+            schema.Mission.status == "running").order_by(
+            schema.Mission.created_at.desc()).limit(1))).scalar_one_or_none()
+        if m is None:
+            return None
+        return {"mission_id": str(m.id), "kind": m.kind, "status": m.status, "phase": m.phase,
+                "short_status": m.short_status, "goal": m.goal}
+
+
 async def get_mission_state(user_id: UUID, mission_id: UUID) -> dict | None:
     """Owner-scoped read of a mission's persisted state — backs 'what are u doing with that?'. Content-safe
     (returns the durable goal/phase/status, never chain-of-thought). None if not found / not the owner."""

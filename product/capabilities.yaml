@@ -207,9 +207,9 @@ primitives:
         risk: medium
         status: partial              # created + tracked only; execution/approval/verification/recovery pending
         live_verified: false         # partial until the live staging acceptance passes (flyer 'take this from here')
-        evidence: engine/bruce_engine/mission_kernel.py (atomic create + first phase event, idempotent on owner+source+capability); handoff.decide_handoff (model proposes, only explicit-user policy authorizes); conversation_outcomes.MissionHandoffHandler (claims only when authorizes_mutation)
-        gaps: capture/track only — no external action; status-read + execution/approval/verification/recovery are later phases
-        tests: test_mission_kernel.py (atomic/idempotent/RLS/links), test_handoff.py (hallucination cannot authorize), test_conversation_runtime.py (A1 acceptance + redelivery no-dup)
+        evidence: engine/bruce_engine/mission_kernel.py (atomic create + first phase event, idempotent on owner+source+capability; latest_active_handoff_mission for status reads); handoff.decide_handoff (model proposes, only explicit-user policy authorizes); conversation_outcomes MissionHandoffHandler (claims only when authorizes_mutation) + StatusQueryHandler (A1.1 honest persisted-state read)
+        gaps: capture/track + honest status-read only — no external action; execution/approval/verification/recovery are later phases
+        tests: test_mission_kernel.py (atomic/idempotent/RLS/links/latest-active), test_handoff.py (hallucination cannot authorize), test_conversation_runtime.py (A1 acceptance + redelivery no-dup + status-read)
 
   evidence_provenance:
     universe_primitive: 10

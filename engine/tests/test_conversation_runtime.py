@@ -429,3 +429,31 @@ def test_a1_no_explicit_handoff_creates_no_mission(clean_db):
     assert len(_run(_missions(uid))) == 0                  # no explicit handoff -> no state
     ob = _run(_outbound(uid))
     assert len(ob) == 1 and "56" in ob[-1].text            # the model's normal reply, styled
+
+
+def test_a1_1_status_query_reports_persisted_mission_state(clean_db):
+    uid = uuid4(); _run(_ensure_user(uid))
+    _run(conversation_runtime.handle(
+        FakeChannel(), _msg("f1", text="take this from here, the science fair reg"),
+        user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="x", needs_mission=True))))
+    assert len(_run(_missions(uid))) == 1
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("s1", text="what are u doing with that?"), user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="model freeform"))))
+    assert out.status == "processed"
+    ob = _run(_outbound(uid))
+    assert "external action" in ob[-1].text.lower()      # honest persisted state, not the model freeform
+    assert "model freeform" not in ob[-1].text
+    assert len(_run(_missions(uid))) == 1                 # a status READ creates no new mission
+
+
+def test_a1_1_status_query_with_no_active_mission_is_a_normal_reply(clean_db):
+    uid = uuid4(); _run(_ensure_user(uid))
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("s2", text="what are u doing with that?"), user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="nothing rn lol"))))
+    assert out.status == "processed"
+    ob = _run(_outbound(uid))
+    assert "nothing rn" in ob[-1].text.lower()           # declined -> normal model reply
+    assert len(_run(_missions(uid))) == 0

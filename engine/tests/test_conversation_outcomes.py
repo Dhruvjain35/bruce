@@ -138,11 +138,18 @@ def test_select_tie_at_top_priority_fails_loudly():
 
 def test_default_pipeline_shape():
     hs = co.default_handlers()
-    assert [h.name for h in hs] == ["mission_handoff", "event_candidate"]
+    assert [h.name for h in hs] == ["mission_status", "mission_handoff", "event_candidate"]
     assert co.default_fallback().name == "default_reply"
-    # explicit priorities: handoff outranks event; fallback is lowest and never a claim
-    assert co.MissionHandoffHandler().priority > co.EventCandidateHandler().priority
-    assert co.DefaultReplyHandler().priority == 0
+    # explicit, DISTINCT priorities (no collision): status read > handoff > event > fallback
+    prios = [co.StatusQueryHandler().priority, co.MissionHandoffHandler().priority,
+             co.EventCandidateHandler().priority, co.DefaultReplyHandler().priority]
+    assert prios == sorted(prios, reverse=True) and len(set(prios)) == 4
+
+
+def test_status_query_handler_declines_without_status_language():
+    d = _decision(text="take this from here")
+    v = _run(co.StatusQueryHandler().evaluate(_octx(d, text="take this from here")))
+    assert v.disposition == co.Disposition.decline and v.reason == "not_a_status_query"
 
 
 def test_mission_handoff_claims_on_explicit_authorized_handoff():

@@ -88,10 +88,28 @@ _MIN_MISSION_CONFIDENCE = 0.55
 
 
 def has_explicit_handoff_language(text: str | None) -> bool:
-    """True iff the user's own words explicitly ask Bruce to take something on / follow up / confirm it
-    went through. Deterministic substring match on a fixed phrase set — no model, no inference."""
+    """True iff the user's own words explicitly ask Bruce to take something on / follow up. Deterministic
+    substring match on a fixed phrase set — no model, no inference."""
     t = (text or "").lower()
     return any(p in t for p in _EXPLICIT_HANDOFF)
+
+
+# Language that asks about an EXISTING mission's state (a read, never a create). Disjoint from the handoff
+# creation set on purpose: "did that go through?" reports status, it does not start a new mission.
+_STATUS_QUERY = (
+    "what are u doing with", "what are you doing with", "what are u doing", "what are you doing",
+    "what's the status", "whats the status", "status update", "any update", "any updates",
+    "how's that going", "hows that going", "how's it going with", "hows it going with",
+    "where are we on", "where are we with", "what's happening with", "whats happening with",
+    "did that go through", "did this go through", "did it go through", "did that actually go through",
+    "what's up with that", "whats up with that", "hows that coming", "how's that coming",
+)
+
+
+def has_status_query_language(text: str | None) -> bool:
+    """True iff the user is asking about the state of something Bruce is (or might be) handling."""
+    t = (text or "").lower()
+    return any(p in t for p in _STATUS_QUERY)
 
 
 def decide_handoff(inp: HandoffInputs) -> HandoffDecision:
