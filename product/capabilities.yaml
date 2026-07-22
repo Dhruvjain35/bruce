@@ -200,6 +200,16 @@ primitives:
         live_verified: partial          # at-most-once proven live during the 30s-resend incident fix
         evidence: schema.Mission/mission_phase_events; messaging_outbound lease + sent-ledger
         tests: test_no_false_completion, test_relay_component (outbound), test_async_intake_pg
+      - id: CAP-MISSION-002
+        name: Conversation -> durable mission (A1 — authorized handoff creates + tracks; no external action)
+        wave: 1
+        autonomy: A1
+        risk: medium
+        status: partial              # created + tracked only; execution/approval/verification/recovery pending
+        live_verified: false         # partial until the live staging acceptance passes (flyer 'take this from here')
+        evidence: engine/bruce_engine/mission_kernel.py (atomic create + first phase event, idempotent on owner+source+capability); handoff.decide_handoff (model proposes, only explicit-user policy authorizes); conversation_outcomes.MissionHandoffHandler (claims only when authorizes_mutation)
+        gaps: capture/track only — no external action; status-read + execution/approval/verification/recovery are later phases
+        tests: test_mission_kernel.py (atomic/idempotent/RLS/links), test_handoff.py (hallucination cannot authorize), test_conversation_runtime.py (A1 acceptance + redelivery no-dup)
 
   evidence_provenance:
     universe_primitive: 10

@@ -97,7 +97,8 @@ class _Runtime:
         output = await selected.execute(octx)                 # mutation happens HERE, post-selection
         reply = self._finalize_presentation(output, decision=decision, profile=profile, channel=channel)
         return conversation_outcomes.ResolvedReply(
-            reply=reply, handler=selected.name, event_candidate_id=output.event_candidate_id)
+            reply=reply, handler=selected.name, event_candidate_id=output.event_candidate_id,
+            mission_id=output.mission_id)
 
     def _finalize_presentation(self, output, *, decision, profile, channel) -> str:
         """Runtime-owned presentation applied to a handler's RAW factual output (invariant 1: safety runs
@@ -194,8 +195,9 @@ class _Runtime:
 
         await self._finalize(user_id, ch, ident, pmid, outcome.reply, reply_target,
                              decision=decision, event_candidate_id=outcome.event_candidate_id)
-        log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s handler=%s", pmid, decision.intent.value,
-                 decision.response_type.value, outcome.event_candidate_id is not None, outcome.handler)
+        log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s mission=%s handler=%s", pmid, decision.intent.value,
+                 decision.response_type.value, outcome.event_candidate_id is not None,
+                 outcome.mission_id is not None, outcome.handler)
         return InboundOutcome(status="processed", user_id=user_id)
 
     def _present(self, text: str, *, decision: ConversationDecision, profile, channel: str) -> str:

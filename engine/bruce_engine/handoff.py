@@ -71,8 +71,10 @@ class HandoffDecision:
                 "authorizes_mutation": self.authorizes_mutation}
 
 
-# Explicit user language that STRONGLY indicates a handoff. Presence of one of these is REQUIRED before
-# any mission-creating action is even considered; the model's needs_mission flag alone is insufficient.
+# Explicit user language that STRONGLY indicates a handoff (DELEGATION). Presence of one of these is
+# REQUIRED before any mission-creating action is even considered; the model's needs_mission flag alone is
+# insufficient. Status-check phrases ("did that go through") are deliberately EXCLUDED — those ask about an
+# existing mission's state (a read), never create one; the status-query path handles them.
 _EXPLICIT_HANDOFF = (
     "take this from here", "take it from here", "take this over", "take over from here",
     "handle this", "handle it", "deal with this", "deal with it", "take care of this",
@@ -80,7 +82,6 @@ _EXPLICIT_HANDOFF = (
     "keep following up", "follow up on this", "keep chasing", "stay on top of this",
     "make sure this gets done", "make sure it gets done", "make sure this happens",
     "only bother me when", "only bug me when", "only ping me when", "only tell me when",
-    "did that actually go through", "did this go through", "did it go through",
 )
 
 _MIN_MISSION_CONFIDENCE = 0.55
@@ -101,11 +102,14 @@ def decide_handoff(inp: HandoffInputs) -> HandoffDecision:
       2. Explicit handoff, capability not wired -> honest unsupported.
       3. Explicit + supported, but high/critical risk OR irreversible OR low confidence -> request_decision
          (approval required before anything durable).
-      4. Explicit + supported + acceptable risk: a standing protocol pre-authorizes creation
-         (authorizes_mutation=True); otherwise propose_mission (the user still confirms).
+      4. Explicit + supported + acceptable risk: the explicit handoff IS the authorization to CREATE a
+         durable mission (authorizes_mutation=True). Creating the mission record takes NO external action;
+         it lands in a proposed/understanding state. A named protocol governs later auto-EXECUTION, not
+         creation, so it changes only the reason here, not the authority.
 
-    Only step 4-with-protocol sets authorizes_mutation, and only because has_matching_protocol is a
-    deterministic, user-authored fact the model cannot fabricate.
+    authorizes_mutation is set ONLY when the USER'S OWN words explicitly hand off to a supported, acceptable
+    capability. It is NEVER set from a model flag; propose_mission (a soft offer that creates nothing) and
+    the no-explicit / unsupported / needs-approval paths all leave it False.
     """
     explicit = has_explicit_handoff_language(inp.user_text)
 
@@ -123,10 +127,8 @@ def decide_handoff(inp: HandoffInputs) -> HandoffDecision:
         return HandoffDecision(action=HandoffAction.request_decision, requires_approval=True,
                                reason="explicit_handoff_needs_approval", confidence=inp.confidence)
 
-    if inp.has_matching_protocol:
-        return HandoffDecision(action=HandoffAction.create_mission_under_protocol,
-                               authorizes_mutation=True, reason="explicit_handoff_under_protocol",
-                               confidence=inp.confidence)
-
-    return HandoffDecision(action=HandoffAction.propose_mission,
-                           reason="explicit_handoff_supported", confidence=inp.confidence)
+    return HandoffDecision(
+        action=HandoffAction.create_mission_under_protocol, authorizes_mutation=True,
+        reason=("explicit_handoff_under_protocol" if inp.has_matching_protocol
+                else "explicit_handoff_supported"),
+        confidence=inp.confidence)
