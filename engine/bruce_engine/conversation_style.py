@@ -143,6 +143,8 @@ DEFAULT_TEMPLATES: dict[str, str] = {
     "needs_clarification_wrapper": "{question}",
     "mission_started_no_push": "on it: {what}. i'll have it ready next time you check in.",
     "mission_handoff_ack": "gotchu, i've got {what} from here. i won't do anything that needs your ok without asking first, and i'll only ping you when i actually need your call.",
+    "mission_status_report": "i've got {what}. right now i'm {phase}, and i haven't taken any external action yet. i'll ping you the moment i need your call.",
+    "mission_status_none": "i'm not actively working on anything for u right now.",
 }
 DEFAULT_PROFILES: dict = {"base": {"register": "lowercase", "max_bubble_chars": 320, "result_first": True}}
 

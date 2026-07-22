@@ -146,6 +146,44 @@ class OutcomeHandler(Protocol):
 # --------------------------------------------------------------------------------------------------
 # Handlers
 # --------------------------------------------------------------------------------------------------
+_FRIENDLY_PHASE = {
+    "created": "just getting started", "understanding": "still figuring out exactly what's needed",
+    "extracting": "pulling out the details", "awaiting_approval": "waiting on your ok",
+    "executing": "working on it", "waiting_external": "waiting on an external service",
+    "verifying": "double-checking the result", "succeeded": "done", "blocked": "stuck, i need you",
+    "failed": "it didn't finish",
+}
+
+
+class StatusQueryHandler:
+    """A1.1: a status question ('what are u doing with that?', 'did that go through?') about an active
+    handoff mission -> report its PERSISTED state honestly. A1 truth: captured + tracked, NO external action
+    yet, so it never claims something happened. evaluate() reads only and CLAIMS only when there's an active
+    mission to report; otherwise DECLINES so a status-shaped question with nothing open gets a normal reply."""
+    name = "mission_status"
+    priority = 65                      # a status READ outranks a new handoff creation
+
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+        if not handoff.has_status_query_language(octx.msg.text):
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="not_a_status_query")
+        state = await mission_kernel.latest_active_handoff_mission(octx.user_id)   # READ only, no mutation
+        if state is None:
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="no_active_mission")
+        return HandlerVerdict(disposition=Disposition.claim, priority=self.priority,
+                              reason="active_mission", telemetry={"mission_phase": state["phase"]})
+
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        state = await mission_kernel.latest_active_handoff_mission(octx.user_id)
+        if state is None:              # raced to closed between evaluate and execute -> honest fallback
+            return HandlerOutput(text=octx.style.template("mission_status_none"), styled=False)
+        what = (state.get("goal") or {}).get("proposed_goal") or "that"
+        reply = octx.style.template("mission_status_report", what=what,
+                                    phase=_FRIENDLY_PHASE.get(state["phase"], state["phase"]))
+        return HandlerOutput(text=reply, styled=False)
+
+
 class MissionHandoffHandler:
     """A1: on an AUTHORIZED handoff, CLAIM the outcome and create ONE durable Mission (capture/track only —
     no external action), then acknowledge. Otherwise DECLINE (telemetry only), leaving the normal reply
@@ -251,7 +289,7 @@ class DefaultReplyHandler:
 def default_handlers() -> list[OutcomeHandler]:
     """Claim-candidate handlers, evaluated every turn (pure). Ordering is by explicit priority, not list
     position. A workstream inserts its handler here with a stable priority."""
-    return [MissionHandoffHandler(), EventCandidateHandler()]
+    return [StatusQueryHandler(), MissionHandoffHandler(), EventCandidateHandler()]
 
 
 def default_fallback() -> OutcomeHandler:
