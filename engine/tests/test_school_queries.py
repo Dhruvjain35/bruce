@@ -176,6 +176,109 @@ def test_what_should_i_do_next_is_prioritized_and_grounded(clean_db):
     _run(run())
 
 
+# --------------------------------------------------------------------------- 5. did I submit this?
+
+
+def test_did_i_submit_this_reports_submitted_unsubmitted_and_unknown_honestly(clean_db):
+    async def run():
+        uid = uuid4()
+        await _seed(uid)
+
+        # submitted-not-graded -> "yes", with full provenance
+        sub = await school_queries.did_i_submit_this(uid, assignment_id="1005")  # Problem Set 7 (submitted)
+        assert sub.matched and sub.answer == "yes"
+        assert sub.submission_state is sc.SubmissionStateKind.submitted
+        _assert_full_provenance(sub.provenance)
+
+        # graded -> "yes"
+        graded = await school_queries.did_i_submit_this(uid, assignment_id="1004")  # Unit 5 Test (graded)
+        assert graded.answer == "yes" and graded.submission_state is sc.SubmissionStateKind.graded
+
+        # genuinely unsubmitted -> honest "no" (the provider DID say it wasn't turned in)
+        no = await school_queries.did_i_submit_this(uid, assignment_id="1001")  # DBQ Essay (unsubmitted)
+        assert no.matched and no.answer == "no"
+        assert no.submission_state is sc.SubmissionStateKind.none
+        _assert_full_provenance(no.provenance)
+
+        # a title (nearest-match) resolves to the right assignment
+        by_title = await school_queries.did_i_submit_this(uid, title="problem set")
+        assert by_title.matched and by_title.assignment.name == "Problem Set 7" and by_title.answer == "yes"
+
+        # a reference that matches nothing is honest, NOT a false "no"
+        miss = await school_queries.did_i_submit_this(uid, assignment_id="does-not-exist")
+        assert not miss.matched and miss.answer == "unknown" and miss.assignment is None
+
+        # give an assignment a genuinely UNKNOWN submission state (provider reports none), then re-sync,
+        # and prove it is reported as "unknown" — never collapsed to "no".
+        conn = CanvasFakeConnector()
+        conn.update_assignment(
+            1007, at=datetime.datetime(2026, 3, 8, tzinfo=datetime.timezone.utc),  # Midterm Exam
+            submission={"workflow_state": None, "submitted_at": None, "score": None, "grade": None,
+                        "late": False, "missing": False, "attempt": None})
+        await school_store.sync_provider(conn, uid)
+
+        unknown = await school_queries.did_i_submit_this(uid, assignment_id="1007")
+        assert unknown.matched
+        assert unknown.submission_state is sc.SubmissionStateKind.unknown
+        assert unknown.answer == "unknown"          # the whole point: unknown stays unknown, not "no"
+        _assert_full_provenance(unknown.provenance)
+    _run(run())
+
+
+# --------------------------------------------------------------------------- 6. catch me up
+
+
+def test_catch_me_up_summarizes_and_prioritizes_changes_with_provenance(clean_db):
+    async def run():
+        uid = uuid4()
+        await _seed(uid)
+        # the initial load itself is a catch-up: new announcements + newly-added materials are surfaced
+        full = await school_queries.catch_me_up(uid)
+        assert any(i.category == "new_announcement" for i in full.items)
+        assert any(i.category == "new_material" for i in full.items)
+        assert full.last_synced_at is not None and full.latest_change_at is not None
+
+        # checkpoint AFTER the initial load (all initial changes share one detected_at; +1ms excludes them)
+        seeded = await school_store.changes_since(uid)
+        checkpoint = seeded[0].detected_at + datetime.timedelta(milliseconds=1)
+
+        # a teacher adds a new assignment and posts a grade on an existing one, then we re-sync
+        conn = CanvasFakeConnector()
+        conn.add_assignment(course_id=101, name="Pop Quiz", provider_id=1099,
+                            at=datetime.datetime(2026, 3, 8, tzinfo=datetime.timezone.utc),
+                            due_at="2026-03-30T23:59:00Z")
+        conn.update_assignment(
+            1001, at=datetime.datetime(2026, 3, 8, 1, tzinfo=datetime.timezone.utc),  # DBQ Essay graded
+            submission={"workflow_state": "graded", "submitted_at": "2026-03-07T10:00:00Z", "score": 92.0,
+                        "grade": "A-", "late": False, "missing": False, "attempt": 1})
+        await school_store.sync_provider(conn, uid)
+
+        catch = await school_queries.catch_me_up(uid, since=checkpoint)
+        by_pid = {(i.object_type, i.provider_id): i for i in catch.items}
+
+        # the newly-added assignment is surfaced as a create, resolved to a live object + full provenance
+        new_item = by_pid[("assignment", "1099")]
+        assert new_item.category == "new_assignment" and new_item.object is not None
+        _assert_full_provenance(new_item.provenance)
+
+        # the posted grade is surfaced, prioritized, resolves to the live (now graded) assignment
+        grade_item = by_pid[("assignment", "1001")]
+        assert grade_item.category == "grade_posted"
+        assert grade_item.object.submission.kind is sc.SubmissionStateKind.graded
+        _assert_full_provenance(grade_item.provenance)
+
+        # summarized + prioritized: a posted grade outranks a new assignment; counts + freshness are set
+        assert catch.items[0].category == "grade_posted"
+        assert catch.counts.get("grade_posted") == 1 and catch.counts.get("new_assignment") == 1
+        assert catch.last_synced_at is not None and catch.latest_change_at is not None
+
+        # ``since`` really filters: the incremental window is a strict subset of the full history, and an
+        # untouched initial create (Reading Quiz 4) is NOT in the window.
+        assert ("assignment", "1002") not in by_pid
+        assert len(catch.items) < len(full.items)
+    _run(run())
+
+
 # --------------------------------------------------------------------------- unsupported note
 
 
