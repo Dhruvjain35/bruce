@@ -132,6 +132,21 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # ROLLBACK COMPATIBILITY (A3): a destructive downgrade must NOT silently drop a POPULATED
+    # ConversationContextGraph. Once A3 writes live reply context, this is not a normal rollback — it
+    # needs an explicit, approved, privacy-safe action. Fail closed unless BRUCE_ALLOW_GRAPH_DROP=1.
+    import os
+    bind = op.get_bind()
+    if "conversation_messages" in set(sa.inspect(bind).get_table_names()):
+        try:
+            n = bind.execute(sa.text("SELECT count(*) FROM conversation_messages")).scalar() or 0
+        except Exception:
+            n = 0
+        if n and os.environ.get("BRUCE_ALLOW_GRAPH_DROP") != "1":
+            raise RuntimeError(
+                f"refusing to drop a POPULATED ConversationContextGraph ({n} rows): this is a destructive "
+                "rollback, not a normal one. Take a privacy-safe backup and set BRUCE_ALLOW_GRAPH_DROP=1 "
+                "to authorize.")
     # Drop children before parents (FK order); policies drop with the table but be explicit.
     for t in reversed(_TABLES):
         op.execute(f"DROP POLICY IF EXISTS tenant_or_worker ON {t}")

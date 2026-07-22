@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from . import conversation_store, messaging_outbound, technical_render
+from . import conversation_context, conversation_store, messaging_outbound, technical_render
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, IntentKind, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
@@ -122,7 +122,22 @@ class _Runtime:
         await conversation_store.persist_user_turn(
             user_id, channel=ch, channel_identity=ident, provider_message_id=pmid, text=msg.text)
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
+        # A3.2: resolve the EXPLICITLY-referenced message/attachment/prior-answer into a bounded capsule
+        # the GENERIC reasoner consumes as evidence (no reply-specific branch).
+        capsule = await conversation_context.resolve(user_id, msg)
         images, unreadable = _prepare_images(msg)
+
+        # Replied-to attachment that isn't downloaded on the Mac yet, with nothing else to reason from ->
+        # honest ask (never claim to see content we could not resolve).
+        if (capsule.attachment_pending and not capsule.referenced_images and not images
+                and not (capsule.referenced_text or capsule.prior_answer)
+                and not (msg.text and msg.text.strip())):
+            reply = self.style.template("reply_attachment_pending")
+            await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                                 decision=None, intent="image_understanding")
+            return InboundOutcome(status="processed", user_id=user_id)
+
+        images = images + capsule.referenced_images     # the referenced attachment joins the vision pass
 
         # attachment the relay couldn't fetch OR bytes we genuinely can't open, and nothing else to go
         # on -> honest resend ask. (A healthy HEIC no longer lands here — it's normalized to JPEG above.)
@@ -132,8 +147,12 @@ class _Runtime:
                                  decision=None, intent="image_understanding")
             return InboundOutcome(status="processed", user_id=user_id)
 
+        ctx = _context(recent)
+        _ev = conversation_context.evidence_text(capsule)       # referenced content, fenced as DATA
+        if _ev:
+            ctx = ctx + "\n\n" + _ev
         try:
-            rr = await self.reasoner.decide(text=msg.text, images=images, context=_context(recent))
+            rr = await self.reasoner.decide(text=msg.text, images=images, context=ctx)
         except Exception:
             # A model/backend glitch is OUR fault, not the image's. Never say "couldn't read that" for
             # a healthy photo (the exact false-negative we're fixing) — own it and ask for a retry.
