@@ -15,7 +15,7 @@ from . import conversation_context, conversation_store, messaging_outbound, tech
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, IntentKind, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
-from .conversation_style import ConversationStyleEngine, VoiceProfile
+from .conversation_style import ConversationStyleEngine, VoiceProfile, enforce_no_dashes, strip_redundant_offer
 from .messaging import ChannelKind, InboundMessage, MessagingChannel
 from .messaging_inbound import InboundOutcome
 
@@ -204,6 +204,13 @@ class _Runtime:
                                    protect_technical=True)
         if channel in technical_render.PLAIN_TEXT_CHANNELS and technical_render.forbidden_tokens(styled):
             styled = technical_render.render_for_channel(styled, channel=channel)   # last-resort re-clean
+        # P0.3 deterministic channel guarantees (after the style model, never trusting it to comply):
+        #   - drop a redundant trailing "want me to…" offer for casual/tutoring replies;
+        #   - HARD-guarantee no em dash ever ships (fact-preserving; matrices contain none).
+        if decision.risk_level not in (RiskLevel.sensitive, RiskLevel.high):
+            styled = strip_redundant_offer(styled)
+        styled = enforce_no_dashes(styled)
+        assert "—" not in styled, "em dash must never ship to a plain-text channel"
         return styled
 
     async def _already_answered(self, user_id, channel, pmid) -> bool:
