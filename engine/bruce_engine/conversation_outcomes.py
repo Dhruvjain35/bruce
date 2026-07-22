@@ -1,40 +1,46 @@
-"""Outcome-dispatch seam (D-INT-1) — the ONE place a conversation decision becomes a reply.
+"""Outcome-dispatch seam (D-INT-1, hardened by D-INT-3 to integration invariant 1).
 
-Before this module, ``conversation_runtime.handle()`` resolved a decision with a hardcoded
-``if _is_event / else`` branch. Every future capability (a mission handoff, a school "what's due"
-answer, an approval prompt) would have had to edit those same ~30 lines, so four parallel workstreams
-would collide on ``handle()`` every merge.
+``conversation_runtime.handle()`` turns ONE conversation decision into ONE reply by running a two-phase
+handler pipeline — NOT an implicit first-match if/else tree:
 
-Instead, ``handle()`` now runs an ORDERED pipeline of ``OutcomeHandler``s over an ``OutcomeContext``.
-The first handler that returns a ``ResolvedReply`` wins; a terminal default handler always resolves, so
-the pipeline never falls through. A workstream adds a capability by adding a handler module and inserting
-it into the list — it never touches ``handle()`` control flow.
+  Phase 1 — EVALUATE (pure): every handler returns a HandlerVerdict {claim | decline | blocked, priority,
+    reason, telemetry}. Evaluation MUST NOT mutate durable state and MUST NOT enqueue anything.
+  Selection (deterministic, in the runtime): claims take precedence over blocked; among the owners the
+    single highest PRIORITY wins; a tie at the top priority FAILS LOUDLY (raises + privacy-safe telemetry);
+    ZERO owners route through one explicit fallback handler.
+  Phase 2 — EXECUTE (only the selected handler): may mutate + returns a HandlerOutput (raw factual text +
+    whether it should be voice-styled + side effects to record).
 
-Contract (integration-owned):
-  * ``OutcomeContext`` fields are APPEND-ONLY. A handler reads new fields; nothing is removed/renamed.
-  * A handler is PURE w.r.t. control flow: it returns a ``ResolvedReply`` or ``None`` (pass to the next).
-    Side effects (persisting an event candidate, later creating a mission) happen inside ``resolve`` and
-    are recorded on the returned reply so ``_finalize`` can persist them.
-  * Behavior parity: ``EventCandidateHandler`` + ``DefaultReplyHandler`` reproduce the pre-seam branch
-    EXACTLY, in that order. This module changes no user-visible behavior on its own.
+Presentation is RUNTIME-owned and runs AFTER selection: the runtime finalizes the factual output, applies
+safety gates, and applies style — never a handler. So safety gates run for EVERY outcome uniformly and no
+handler can skip them.
+
+A workstream adds a capability by adding a handler with a stable priority; it never edits handle().
+``ConversationDecision`` stays frozen at 13 fields; a handoff is decided by the deterministic
+``handoff`` policy, not by a model flag.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from uuid import UUID
 
-if TYPE_CHECKING:                                      # type-only: no runtime import cycle with the runtime
+from . import handoff
+
+if TYPE_CHECKING:
     from .conversation_context import ContextCapsule
     from .conversation_contract import ConversationDecision
     from .conversation_style import ConversationStyleEngine
     from .messaging import InboundMessage
 
+log = logging.getLogger("bruce.conversation")   # content-free: ids/dispositions/reasons, never user text
+
 
 # --------------------------------------------------------------------------------------------------
-# Event helpers — relocated verbatim from conversation_runtime (they are event-OUTCOME logic, and the
-# runtime importing them back would be a cycle). Nothing outside the runtime referenced them.
+# Event helpers (relocated from the runtime in D-INT-1; event-OUTCOME logic).
 # --------------------------------------------------------------------------------------------------
 def _event_fields(decision: "ConversationDecision") -> tuple[str, str, str, dict]:
     """Build (title, when, where, provenance) from grounded entities. Provenance keeps verbatim spans."""
@@ -57,8 +63,7 @@ def _event_fields(decision: "ConversationDecision") -> tuple[str, str, str, dict
 
 
 def _is_event(decision: "ConversationDecision") -> bool:
-    """An event = a title-like AND a date-like entity. Robust to model phrasing (do NOT rely on an
-    exact capability id — the real model says 'calendar creation', 'add to calendar', etc.)."""
+    """An event = a title-like AND a date-like entity. Robust to model phrasing."""
     types = [(e.type or "").lower() for e in decision.extracted_entities]
     has_title = any(("title" in t) or ("event" in t) or ("name" in t) for t in types)
     has_date = any(("date" in t) or ("time" in t) or ("day" in t) for t in types)
@@ -77,49 +82,107 @@ def _wants_calendar(decision: "ConversationDecision", msg_text: str | None) -> b
 # --------------------------------------------------------------------------------------------------
 # Seam types
 # --------------------------------------------------------------------------------------------------
+class Disposition(Enum):
+    claim = "claim"                    # I own this outcome and will produce the reply
+    decline = "decline"               # not my concern — pass
+    blocked = "blocked"               # this IS my concern but I cannot complete it (honest block)
+
+
+class OutcomeCollision(Exception):
+    """Two+ handlers claimed the SAME top priority — a configuration bug. Fails loudly; the runtime
+    degrades the user to a safe fallback while this is logged at error level (privacy-safe)."""
+
+
 @dataclass
-class OutcomeContext:
-    """Everything a handler needs to resolve ONE decision into a reply. Read-only inputs plus the
-    runtime's presentation + persistence helpers, so a handler never re-derives them. APPEND-ONLY."""
-    user_id: UUID
-    decision: "ConversationDecision"
-    capsule: "ContextCapsule"
-    msg: "InboundMessage"
-    profile: object                                    # VoiceProfile (opaque to handlers)
-    channel: str
-    pmid: str
-    present: Callable[..., str]                         # bound _Runtime._present (channel render + style)
-    style: "ConversationStyleEngine"
-    store: object                                      # conversation_store module (persist_event_candidate…)
+class HandlerVerdict:
+    disposition: Disposition
+    priority: int = 0                  # stable, explicit; higher wins among owners
+    reason: str = ""                  # privacy-safe category, never user content
+    telemetry: dict = field(default_factory=dict)   # privacy-safe; the runtime logs it
+
+
+@dataclass
+class HandlerOutput:
+    """What the SELECTED handler produces on execute(): the RAW factual reply text + presentation intent
+    + side effects to record. The runtime (not the handler) renders/styles/safety-gates this."""
+    text: str
+    styled: bool = True                # False = fact-locked copy -> runtime skips voice styling
+    event_candidate_id: UUID | None = None
 
 
 @dataclass
 class ResolvedReply:
-    """A handler's result: the reply text + any side effect the runtime must persist on finalize."""
+    """Final result the runtime enqueues: the finished reply + which handler produced it + side effects."""
     reply: str
-    handler: str                                       # which handler produced it (content-free telemetry)
+    handler: str
     event_candidate_id: UUID | None = None
+
+
+@dataclass
+class OutcomeContext:
+    """Inputs a handler may read + the collaborators execute() needs. APPEND-ONLY. Handlers must not
+    mutate durable state during evaluate()."""
+    user_id: UUID
+    decision: "ConversationDecision"
+    capsule: "ContextCapsule"
+    msg: "InboundMessage"
+    profile: object
+    channel: str
+    pmid: str
+    style: "ConversationStyleEngine"
+    store: object                      # conversation_store module
 
 
 @runtime_checkable
 class OutcomeHandler(Protocol):
     name: str
-    async def resolve(self, octx: OutcomeContext) -> ResolvedReply | None: ...
+    priority: int
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict: ...   # PURE — no mutation, no enqueue
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput: ...     # only if selected; may mutate
 
 
 # --------------------------------------------------------------------------------------------------
-# Default handlers (behavior parity with the pre-seam branch)
+# Handlers
 # --------------------------------------------------------------------------------------------------
-class EventCandidateHandler:
-    """An extracted event -> persist a candidate (durable, provenance-kept) then reply with the honest
-    fact-locked 'can't add to calendar yet' template (never 'added'), or the styled model reply. Ported
-    verbatim from the pre-seam handle() event branch."""
-    name = "event_candidate"
+class MissionHandoffHandler:
+    """Telemetry-only in D-INT-3 (invariant 2). Runs the DETERMINISTIC handoff policy and records what it
+    decided (privacy-safe), creates NO state, and DECLINES — the normal reply flow proceeds unchanged.
+    The mission kernel (workstream A) will later flip this to CLAIM + create a durable Mission, consuming
+    HandoffDecision.authorizes_mutation. Its evaluate() is pure: a hallucinated model needs_mission cannot
+    make it claim or mutate."""
+    name = "mission_handoff"
+    priority = 60                      # above event-candidate: once it CLAIMS, a handoff outranks an event
 
-    async def resolve(self, octx: OutcomeContext) -> ResolvedReply | None:
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
         d = octx.decision
-        if not _is_event(d):
-            return None
+        inp = handoff.HandoffInputs(
+            user_text=octx.msg.text,
+            model_needs_mission=getattr(d, "needs_mission", False),
+            model_proposed_goal=getattr(d, "proposed_goal", None),
+            model_suggested_capability=(d.required_capabilities[0] if d.required_capabilities else None),
+            capability_supported=False,          # D-INT-3: no mission capability is wired yet
+            confidence=d.confidence)
+        decision = handoff.decide_handoff(inp)
+        # telemetry-only + mutation-free: never claim, never block -> let the reply flow proceed.
+        return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                              reason="telemetry_only_stub",
+                              telemetry={**decision.telemetry(), "model_needs_mission": inp.model_needs_mission})
+
+
+class EventCandidateHandler:
+    """An extracted event -> CLAIM. execute() persists a candidate (durable, provenance-kept) and returns
+    the honest fact-locked 'can't add to calendar yet' template (never 'added'), or the styled model reply.
+    evaluate() is pure (only reads the decision)."""
+    name = "event_candidate"
+    priority = 50
+
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+        if _is_event(octx.decision):
+            return HandlerVerdict(disposition=Disposition.claim, priority=self.priority, reason="event_entities")
+        return HandlerVerdict(disposition=Disposition.decline, priority=self.priority, reason="not_an_event")
+
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        d = octx.decision
         title, when, where, provenance = _event_fields(d)
         ec_id = await octx.store.persist_event_candidate(
             octx.user_id, title=title,
@@ -128,27 +191,49 @@ class EventCandidateHandler:
             missing_fields=[f for f in ("date",) if not when] or None,
             provenance={**provenance, "inbound_provider_message_id": octx.pmid})
         if _wants_calendar(d, octx.msg.text):
-            reply = octx.style.template("event_saved_calendar_unavailable", title=title,
-                                        when=when, where=where)
-        else:
-            reply = octx.present(d.user_visible_response, decision=d, profile=octx.profile,
-                                 channel=octx.channel)
-        return ResolvedReply(reply=reply, handler=self.name, event_candidate_id=ec_id)
+            # fact-locked copy -> runtime must NOT voice-style it (styled=False)
+            reply = octx.style.template("event_saved_calendar_unavailable", title=title, when=when, where=where)
+            return HandlerOutput(text=reply, styled=False, event_candidate_id=ec_id)
+        return HandlerOutput(text=d.user_visible_response, styled=True, event_candidate_id=ec_id)
 
 
 class DefaultReplyHandler:
-    """Terminal handler: the model's honest reply, styled. Always resolves, so the pipeline can never
-    fall through. No autonomous mission is ever created here (that is a dedicated handler)."""
+    """The explicit FALLBACK (never a claim): the model's honest reply, styled. Selected only when no
+    handler claims or blocks, so the pipeline can never fall through."""
     name = "default_reply"
+    priority = 0
 
-    async def resolve(self, octx: OutcomeContext) -> ResolvedReply | None:
-        d = octx.decision
-        reply = octx.present(d.user_visible_response, decision=d, profile=octx.profile,
-                             channel=octx.channel)
-        return ResolvedReply(reply=reply, handler=self.name)
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+        return HandlerVerdict(disposition=Disposition.decline, priority=self.priority, reason="fallback")
+
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        return HandlerOutput(text=octx.decision.user_visible_response, styled=True)
 
 
 def default_handlers() -> list[OutcomeHandler]:
-    """The ordered outcome pipeline. Workstreams INSERT capability handlers before DefaultReplyHandler
-    (which must stay last — it always resolves). Order = event-candidate, then the styled default."""
-    return [EventCandidateHandler(), DefaultReplyHandler()]
+    """Claim-candidate handlers, evaluated every turn (pure). Ordering is by explicit priority, not list
+    position. A workstream inserts its handler here with a stable priority."""
+    return [MissionHandoffHandler(), EventCandidateHandler()]
+
+
+def default_fallback() -> OutcomeHandler:
+    """The single explicit fallback used when zero handlers claim or block."""
+    return DefaultReplyHandler()
+
+
+def select_owner(verdicts: list[tuple[OutcomeHandler, HandlerVerdict]]) -> OutcomeHandler | None:
+    """Deterministic selection: claims outrank blocked; the single highest-priority owner wins; a tie at
+    the top priority raises OutcomeCollision (fail loudly). Returns None when there is no owner (-> the
+    caller uses the explicit fallback)."""
+    claims = [(h, v) for h, v in verdicts if v.disposition == Disposition.claim]
+    blocked = [(h, v) for h, v in verdicts if v.disposition == Disposition.blocked]
+    owners = claims or blocked
+    if not owners:
+        return None
+    top = max(v.priority for _, v in owners)
+    top_owners = [h for h, v in owners if v.priority == top]
+    if len(top_owners) > 1:
+        names = sorted(h.name for h in top_owners)
+        log.error("outcome_multi_claim n=%d priority=%d handlers=%s", len(top_owners), top, names)
+        raise OutcomeCollision(f"{len(top_owners)} handlers claimed at priority {top}: {names}")
+    return top_owners[0]

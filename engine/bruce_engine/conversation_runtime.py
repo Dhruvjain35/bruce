@@ -69,24 +69,44 @@ def _context(recent: list) -> str:
 class _Runtime:
     def __init__(self, reasoner: ConversationReasoner | None = None,
                  style: ConversationStyleEngine | None = None,
-                 handlers: list | None = None) -> None:
+                 handlers: list | None = None, fallback=None) -> None:
         self.reasoner = reasoner or production_reasoner()
         self.style = style or ConversationStyleEngine()
-        # the outcome-dispatch pipeline (D-INT-1). Workstreams add capability handlers here without
-        # touching handle(); the terminal DefaultReplyHandler always resolves.
+        # the outcome-dispatch pipeline (D-INT-1/D-INT-3). Claim-candidate handlers are EVALUATED (pure)
+        # every turn and selected by explicit priority; a workstream adds a handler here, never edits
+        # handle(). `fallback` is the single explicit handler used when nobody claims or blocks.
         self.handlers = handlers if handlers is not None else conversation_outcomes.default_handlers()
+        self.fallback = fallback if fallback is not None else conversation_outcomes.default_fallback()
 
     async def _resolve_outcome(self, *, decision, capsule, msg, profile, channel, user_id, pmid):
-        """Run the ordered handler pipeline; first non-None ResolvedReply wins. The default handler is
-        terminal, so this never returns None (defensive raise if a caller ships a list without one)."""
+        """Two-phase dispatch (invariant 1): PURE evaluate() over every handler, deterministic priority
+        selection (claims outrank blocked; single top-priority owner; a tie fails loudly; zero owners ->
+        explicit fallback), then execute() ONLY the selected handler (mutation happens here, post-
+        selection). Presentation (render/style/safety) is applied AFTER, by the runtime, not the handler."""
         octx = conversation_outcomes.OutcomeContext(
             user_id=user_id, decision=decision, capsule=capsule, msg=msg, profile=profile,
-            channel=channel, pmid=pmid, present=self._present, style=self.style, store=conversation_store)
-        for h in self.handlers:
-            res = await h.resolve(octx)
-            if res is not None:
-                return res
-        raise RuntimeError("no outcome handler resolved the decision (missing terminal handler)")
+            channel=channel, pmid=pmid, style=self.style, store=conversation_store)
+        verdicts = []
+        for h in self.handlers:                               # PURE evaluation — no mutation, no enqueue
+            v = await h.evaluate(octx)
+            verdicts.append((h, v))
+            if v.telemetry:
+                log.info("outcome_eval handler=%s disp=%s prio=%s tel=%s",
+                         h.name, v.disposition.value, v.priority, v.telemetry)
+        selected = conversation_outcomes.select_owner(verdicts) or self.fallback
+        output = await selected.execute(octx)                 # mutation happens HERE, post-selection
+        reply = self._finalize_presentation(output, decision=decision, profile=profile, channel=channel)
+        return conversation_outcomes.ResolvedReply(
+            reply=reply, handler=selected.name, event_candidate_id=output.event_candidate_id)
+
+    def _finalize_presentation(self, output, *, decision, profile, channel) -> str:
+        """Runtime-owned presentation applied to a handler's RAW factual output (invariant 1: safety runs
+        for every outcome; style runs on finalized factual content). Model freeform is rendered + voice-
+        styled + safety-gated; fact-locked copy is authoritative — only the hard no-em-dash guarantee."""
+        if output.styled:
+            styled = self._style(output.text, decision=decision, profile=profile, channel=channel)
+            return self._apply_safety_gates(styled, decision=decision, channel=channel)
+        return enforce_no_dashes(output.text)
 
     async def handle(self, channel: MessagingChannel, msg: InboundMessage, *,
                      user_id: UUID, reply_target: str) -> InboundOutcome:
@@ -160,10 +180,17 @@ class _Runtime:
 
         decision = rr.decision
 
-        # Outcome dispatch (D-INT-1): the ordered handler pipeline turns the decision into a reply +
-        # any side effect to persist. Ported branch parity: event-candidate first, styled default last.
-        outcome = await self._resolve_outcome(decision=decision, capsule=capsule, msg=msg,
-                                              profile=profile, channel=ch, user_id=user_id, pmid=pmid)
+        # Outcome dispatch (D-INT-1/D-INT-3): two-phase evaluate -> priority select -> execute, presentation
+        # runtime-owned. A handler-collision (two claims at the same top priority) is a config bug: it fails
+        # loudly (error telemetry inside select_owner) but degrades the USER to a safe honest reply.
+        try:
+            outcome = await self._resolve_outcome(decision=decision, capsule=capsule, msg=msg,
+                                                  profile=profile, channel=ch, user_id=user_id, pmid=pmid)
+        except conversation_outcomes.OutcomeCollision:
+            log.error("conv_outcome_collision pmid=%s", pmid)      # loud; details already logged, no content
+            await self._finalize(user_id, ch, ident, pmid, _FALLBACK, reply_target,
+                                 decision=None, intent="unsupported")
+            return InboundOutcome(status="outcome_collision", user_id=user_id)
 
         await self._finalize(user_id, ch, ident, pmid, outcome.reply, reply_target,
                              decision=decision, event_candidate_id=outcome.event_candidate_id)
@@ -238,6 +265,6 @@ class _Runtime:
 async def handle(channel: MessagingChannel, msg: InboundMessage, *, user_id: UUID, reply_target: str,
                  reasoner: ConversationReasoner | None = None,
                  style: ConversationStyleEngine | None = None,
-                 handlers: list | None = None) -> InboundOutcome:
-    return await _Runtime(reasoner=reasoner, style=style, handlers=handlers).handle(
+                 handlers: list | None = None, fallback=None) -> InboundOutcome:
+    return await _Runtime(reasoner=reasoner, style=style, handlers=handlers, fallback=fallback).handle(
         channel, msg, user_id=user_id, reply_target=reply_target)

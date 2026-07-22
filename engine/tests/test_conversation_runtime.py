@@ -346,3 +346,40 @@ def test_dint2_present_split_composes_to_present_and_gates_guarantee_no_em_dash(
     assert "—" not in gated                                        # trust gate guarantee
     # the split is behavior-preserving: _present == gates(style(...))
     assert rt._present(src, decision=d, profile=None, channel="self_hosted_imessage") == gated
+
+
+# D-INT-3 — structured-disposition dispatch: collision fails loud but degrades safely; a handoff phrase
+# is telemetry-only (creates no state).
+
+def test_outcome_collision_degrades_user_to_safe_reply(clean_db):
+    from bruce_engine import conversation_outcomes as co
+    uid = uuid4(); _run(_ensure_user(uid))
+
+    class _ClaimAt50:
+        def __init__(self, name): self.name = name; self.priority = 50
+        async def evaluate(self, octx):
+            return co.HandlerVerdict(disposition=co.Disposition.claim, priority=50, reason="test")
+        async def execute(self, octx):
+            return co.HandlerOutput(text="should not ship", styled=True)
+
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("c1", text="hi"), user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="hey")),
+        handlers=[_ClaimAt50("a"), _ClaimAt50("b")]))
+    assert out.status == "outcome_collision"               # failed loudly (distinct status + error log)
+    ob = _run(_outbound(uid))
+    assert len(ob) == 1 and ob[-1].text                    # but the user still got a safe reply
+
+
+def test_explicit_handoff_phrase_is_telemetry_only_no_state(clean_db):
+    # "take this from here" must NOT create a mission/event in D-INT-3 — it just gets a normal styled reply
+    uid = uuid4(); _run(_ensure_user(uid))
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("h1", text="take this from here"), user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer,
+                                        text="gotchu", needs_mission=True))))
+    assert out.status == "processed"
+    ec, ij, at = _run(_counts(uid))
+    assert ec == 0                                         # no event candidate, no mission — mutation-free
+    ob = _run(_outbound(uid))
+    assert len(ob) == 1 and "gotchu" in ob[-1].text.lower()
