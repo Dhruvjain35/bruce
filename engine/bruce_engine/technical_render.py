@@ -201,13 +201,18 @@ def _convert_textish(text: str) -> str:
     text = re.sub(r"_\s*\{([^{}]*)\}", lambda m: _subscript(m.group(1)), text)
     text = re.sub(r"\^\s*(\\?[A-Za-z0-9])", lambda m: _superscript(m.group(1).lstrip("\\")), text)
     text = re.sub(r"_\s*(\\?[A-Za-z0-9])", lambda m: _subscript(m.group(1).lstrip("\\")), text)
+    # \text{X} / \mathrm{X} / \operatorname{X} ... -> X (keep the argument, drop the wrapper AND braces).
+    text = re.sub(r"\\(?:text|textrm|textbf|textit|texttt|textsf|mathrm|mathbf|mathit|mathsf|mathbb|"
+                  r"mathcal|mathfrak|mathscr|operatorname|boldsymbol|emph)\s*\{([^{}]*)\}", r"\1", text)
+    # LaTeX control words end at the first NON-letter (\quad2 == \quad then '2'), so the boundary is
+    # (?![A-Za-z]) — NOT \b, which fails when a command is immediately followed by a digit/paren.
     for c in _DROP_CMDS:
-        text = re.sub(rf"\\{c}\b", "", text)
+        text = re.sub(rf"\\{c}(?![A-Za-z])", "", text)
     for c in _SPACE_CMDS:
-        text = re.sub(rf"\\{c}\b", " ", text)
+        text = re.sub(rf"\\{c}(?![A-Za-z])", " ", text)
     text = re.sub(r"\\[,;:> ]", " ", text)
     text = text.replace("\\!", "")
-    text = re.sub(r"\\(" + "|".join(_FUNCTIONS) + r")\b", r"\1", text)
+    text = re.sub(r"\\(" + "|".join(_FUNCTIONS) + r")(?![A-Za-z])", r"\1", text)
     text = re.sub(r"\\([A-Za-z]+)", lambda m: _SYMBOLS.get(m.group(1), m.group(0)), text)
     text = text.replace("\\[", "\n").replace("\\]", "\n").replace("\\(", "").replace("\\)", "")
     text = text.replace("$$", "").replace("$", "")
@@ -224,11 +229,14 @@ def _render_grid(grid: list[list[str]], bracket: str) -> str:
     lb, rb = _BRACKET.get(bracket, ("[", "]"))
     lines = [f"{lb} " + "  ".join(cell.ljust(widths[c]) for c, cell in enumerate(r)) + f" {rb}".rstrip()
              for r in grid]
-    return "\n" + "\n".join(line if lb else line.strip() for line in lines)
+    # Trailing newline is LOAD-BEARING: text that follows a matrix (e.g. ",\quad B =") must start on its
+    # OWN line, else it merges onto the last matrix row and the equivalence guard mis-parses the matrix
+    # dimensions (MAT2x2 -> MAT1x2) and forces the lossy fallback (collapsed matrices + ,quad).
+    return "\n" + "\n".join(line if lb else line.strip() for line in lines) + "\n"
 
 
 def _render_cases(grid: list[list[str]]) -> str:
-    return "\n" + "\n".join("  " + ",  ".join(c.strip() for c in row if c.strip()) for row in grid)
+    return "\n" + "\n".join("  " + ",  ".join(c.strip() for c in row if c.strip()) for row in grid) + "\n"
 
 
 def _render_text_block(t: str, *, is_code: bool = False) -> str:

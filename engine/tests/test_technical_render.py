@@ -331,3 +331,31 @@ def test_is_technical_line_protects_variable_case():
     assert is_technical_line("2H₂ + O₂ → 2H₂O")   # has → relation
     assert not is_technical_line("look at the F row and N column")
     assert not is_technical_line("")
+
+
+# P0.2 regressions — the exact live-failure shapes (guard false-positive collapse + ,quad + \text braces)
+
+def test_p0_two_matrices_separated_by_quad_do_not_collapse():
+    raw = (r"A = \[\begin{bmatrix} 3 & 4 \\ 1 & 2 \end{bmatrix},\quad "
+           r"B = \begin{bmatrix} 1 & -2 \\ -0.5 & 1.5 \end{bmatrix}\]")
+    out = r(raw)
+    assert "[ 3  4 ]" in out and "[ 1  2 ]" in out            # matrix A keeps brackets + BOTH rows
+    assert "[ 1     -2  ]" in out and "[ -0.5  1.5 ]" in out   # matrix B intact
+    assert ",quad" not in out and "\\" not in out             # no lossy fallback corruption
+    _no_raw(out)
+
+
+def test_p0_quad_adjacent_to_nonspace_converts():
+    assert to_readable(r"1\quad2") == "1 2"
+    assert "\\quad" not in r(r"x\quad2\quad3") and "quad" not in r(r"x\quad2")
+
+
+def test_p0_text_command_strips_its_braces():
+    out = to_readable(r"\text{if } x \geq 0")
+    assert "{" not in out and "}" not in out and "if" in out
+
+
+def test_p0_matrix_followed_by_text_keeps_structure():
+    out = r(r"A = \begin{bmatrix}1 & 2\\3 & 4\end{bmatrix} then B follows")
+    assert "[ 1  2 ]" in out and "[ 3  4 ]" in out             # matrix not split by trailing text
+    _no_raw(out)
