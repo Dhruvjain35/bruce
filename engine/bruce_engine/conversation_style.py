@@ -20,6 +20,7 @@ from pathlib import Path
 import yaml
 
 from .conversation_contract import RiskLevel
+from .technical_render import is_technical_line
 
 _PRODUCT = Path(__file__).resolve().parents[2] / "product"
 
@@ -148,11 +149,10 @@ class ConversationStyleEngine:
         return VoiceProfile(lowercase=lowercase, emoji_ok=bool(_EMOJI.search(joined)), slang_ok=True,
                             avg_bubble_chars=max(40, int(sum(len(t) for t in samples) / len(samples))))
 
-    def render(self, text: str, *, risk_level: RiskLevel = RiskLevel.none,
-               profile: VoiceProfile | None = None) -> str:
-        """Style the model's user_visible_response. Presentation-only; facts are guarded."""
-        profile = profile or VoiceProfile()
-        serious = risk_level in (RiskLevel.sensitive, RiskLevel.high)
+    def _style_segment(self, text: str, *, serious: bool, profile: VoiceProfile) -> str:
+        """Voice styling for one PROSE segment: strip filler, collapse spaces, emoji/lowercase per
+        register, no em dashes. Never applied to technical lines (whose alignment + variable case must
+        survive verbatim)."""
         styled = text.strip()
         for p in PROHIBITED_PHRASES:                     # strip corporate/robotic filler
             styled = re.sub(re.escape(p), "", styled, flags=re.IGNORECASE)
@@ -165,6 +165,24 @@ class ConversationStyleEngine:
                 styled = _EMOJI.sub("", styled).strip()
             if profile.lowercase:
                 styled = _lower_lead(styled)
-        styled = enforce_no_dashes(styled)               # HARD: student-facing Bruce uses no em dashes
+        return enforce_no_dashes(styled)                 # HARD: student-facing Bruce uses no em dashes
+
+    def render(self, text: str, *, risk_level: RiskLevel = RiskLevel.none,
+               profile: VoiceProfile | None = None, protect_technical: bool = False) -> str:
+        """Style the model's user_visible_response. Presentation-only; facts are guarded.
+
+        ``protect_technical`` styles PROSE lines only and passes technical lines (matrix rows,
+        equations, labelled expressions) through verbatim — so matrix alignment and variable case
+        (``T`` never becomes ``t``) survive the voice pass. Set it once technical content has already
+        been rendered to plain text/Unicode (see technical_render.render_for_channel)."""
+        profile = profile or VoiceProfile()
+        serious = risk_level in (RiskLevel.sensitive, RiskLevel.high)
+        if protect_technical:
+            styled = "\n".join(
+                ln if (not ln.strip() or is_technical_line(ln))
+                else self._style_segment(ln, serious=serious, profile=profile)
+                for ln in text.split("\n"))
+        else:
+            styled = self._style_segment(text, serious=serious, profile=profile)
         assert_facts_preserved(text, styled)             # HARD invariant: never ship altered facts
         return styled
