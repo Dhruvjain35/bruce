@@ -332,3 +332,17 @@ def test_p0_reply_to_available_image_feeds_it_and_drops_recent_window(clean_db):
     assert len(rec.images) == 1                       # the REFERENCED image A is fed to the vision pass
     assert "image b stuff" not in (rec.context or "") # the recent-turn window (holding B) is NOT dumped
     assert "No prior conversation" in (rec.context or "")
+
+
+# D-INT-2 — _present is split into humanity-owned _style and trust-owned _apply_safety_gates
+
+def test_dint2_present_split_composes_to_present_and_gates_guarantee_no_em_dash():
+    from bruce_engine.conversation_style import ConversationStyleEngine
+    rt = conversation_runtime._Runtime(reasoner=FakeReasoner(None), style=ConversationStyleEngine())
+    d = _decision(IntentKind.casual, ResponseType.direct_answer, text="")
+    src = "yeah — that works, want me to do it"
+    styled = rt._style(src, decision=d, profile=None, channel="self_hosted_imessage")
+    gated = rt._apply_safety_gates(styled, decision=d, channel="self_hosted_imessage")
+    assert "—" not in gated                                        # trust gate guarantee
+    # the split is behavior-preserving: _present == gates(style(...))
+    assert rt._present(src, decision=d, profile=None, channel="self_hosted_imessage") == gated
