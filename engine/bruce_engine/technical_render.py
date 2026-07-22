@@ -4,31 +4,35 @@ The conversation model writes ``user_visible_response`` as prose that can contai
 iMessage/SMS render neither, so raw ``\\begin{bmatrix}`` / ``\\frac`` / ``**bold**`` reach the student
 as broken noise even when the reasoning is correct. This module turns that into readable plain text /
 Unicode for plain-text channels — WITHOUT ever changing a value, sign, unit, variable, matrix entry,
-exponent, relation direction, probability, or conclusion.
+exponent, relation direction, probability, conclusion, OR the association between a label and its
+expression.
 
-Three guarantees:
-  * ``to_readable``            — LaTeX/Markdown -> plain/Unicode (pure, deterministic, generic).
-  * ``assert_expression_equivalent`` — the signed-number multiset (super/subscript digits normalized
-    to ASCII) AND the relation-direction multiset must match before/after. Any mismatch means the
-    render might have altered an answer, so ``render_for_channel`` FALLS BACK to a delimiter-stripped
-    canonical form rather than risk it.
-  * ``forbidden_tokens``      — a HARD outbound gate: no raw TeX/Markdown token may reach a plain-text
-    channel. ``render_for_channel`` repairs; ``assert_channel_safe`` refuses.
+Structure, not just numbers. The message is parsed into ordered TechnicalBlocks (text | matrix), each
+rendered independently and reassembled in source order, so a label ("T²") always stays with its own
+matrix. The equivalence guard compares the ORDERED, per-block signature — block kind + order, matrix
+dimensions, row-major entries, and the interleaved number/identifier tokens — so a transposed matrix,
+a reordered block, or a dropped/swapped label is caught even when the numeric multiset is unchanged.
+On any mismatch ``render_for_channel`` FALLS BACK to a delimiter-stripped canonical form.
+
+  * to_readable()            — LaTeX/Markdown -> readable plain text/Unicode (generic, deterministic).
+  * assert_expression_equivalent() — structural guard (raises on any structural change).
+  * forbidden_tokens()/assert_channel_safe() — HARD gate: no raw TeX/Markdown for a plain channel.
 
 Generic across every subject (arithmetic … linear algebra … physics … chemistry … finance). NO
-subject-, variable-, or fixture-specific logic lives here.
+subject-, variable-, or fixture-specific logic.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
 # Channels that render plain text only (no Markdown, no LaTeX). iMessage/SMS today.
 PLAIN_TEXT_CHANNELS = frozenset({"self_hosted_imessage", "imessage", "sms"})
 
 
 class ExpressionEquivalenceError(Exception):
-    """Rendering changed a numeric value / sign / relation direction — content-free message."""
+    """Rendering changed a value / sign / position / label / block order — content-free message."""
 
 
 class UnsupportedPresentationToken(Exception):
@@ -36,8 +40,8 @@ class UnsupportedPresentationToken(Exception):
 
 
 # --------------------------------------------------------------------------------------------------
-# Symbol tables. Each LaTeX control word maps to its Unicode equivalent. Presentation only: these are
-# never inserted or dropped, only substituted 1:1, so no value can change.
+# Symbol tables. Each LaTeX control word maps 1:1 to Unicode: never inserted or dropped, only
+# substituted, so no value can change and no relation can flip.
 # --------------------------------------------------------------------------------------------------
 _GREEK = {
     "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "varepsilon": "ε",
@@ -47,58 +51,30 @@ _GREEK = {
     "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ", "Pi": "Π", "Sigma": "Σ",
     "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
 }
-_OPS = {
-    "times": "×", "cdot": "·", "div": "÷", "pm": "±", "mp": "∓", "ast": "*", "star": "⋆",
-    "bullet": "•", "oplus": "⊕", "otimes": "⊗",
-}
-_RELATIONS = {
-    "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠", "approx": "≈",
-    "equiv": "≡", "sim": "~", "cong": "≅", "propto": "∝", "to": "→", "rightarrow": "→",
-    "Rightarrow": "⇒", "longrightarrow": "→", "leftarrow": "←", "Leftarrow": "⇐",
-    "leftrightarrow": "↔", "mapsto": "↦", "implies": "⇒", "iff": "⇔",
-}
-_BIG = {
-    "sum": "∑", "prod": "∏", "int": "∫", "oint": "∮", "iint": "∬", "partial": "∂",
-    "nabla": "∇", "infty": "∞", "sqrt": "√",  # sqrt is handled specially before this table
-}
-_SETS = {
-    "in": "∈", "notin": "∉", "subset": "⊂", "subseteq": "⊆", "supset": "⊃", "supseteq": "⊇",
-    "cup": "∪", "cap": "∩", "emptyset": "∅", "varnothing": "∅", "forall": "∀", "exists": "∃",
-    "neg": "¬", "land": "∧", "lor": "∨", "wedge": "∧", "vee": "∨",
-}
-_MISC = {
-    "angle": "∠", "perp": "⊥", "parallel": "∥", "degree": "°", "prime": "′", "cdots": "⋯",
-    "ldots": "…", "dots": "…", "vdots": "⋮", "langle": "⟨", "rangle": "⟩", "hbar": "ℏ",
-    "ell": "ℓ", "Re": "ℜ", "Im": "ℑ", "aleph": "ℵ", "circ": "∘",
-}
+_OPS = {"times": "×", "cdot": "·", "div": "÷", "pm": "±", "mp": "∓", "ast": "*", "star": "⋆",
+        "bullet": "•", "oplus": "⊕", "otimes": "⊗"}
+_RELATIONS = {"leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠", "approx": "≈",
+              "equiv": "≡", "sim": "~", "cong": "≅", "propto": "∝", "to": "→", "rightarrow": "→",
+              "Rightarrow": "⇒", "longrightarrow": "→", "leftarrow": "←", "Leftarrow": "⇐",
+              "leftrightarrow": "↔", "mapsto": "↦", "implies": "⇒", "iff": "⇔"}
+_BIG = {"sum": "∑", "prod": "∏", "int": "∫", "oint": "∮", "iint": "∬", "partial": "∂",
+        "nabla": "∇", "infty": "∞", "sqrt": "√"}
+_SETS = {"in": "∈", "notin": "∉", "subset": "⊂", "subseteq": "⊆", "supset": "⊃", "supseteq": "⊇",
+         "cup": "∪", "cap": "∩", "emptyset": "∅", "varnothing": "∅", "forall": "∀", "exists": "∃",
+         "neg": "¬", "land": "∧", "lor": "∨", "wedge": "∧", "vee": "∨"}
+_MISC = {"angle": "∠", "perp": "⊥", "parallel": "∥", "degree": "°", "prime": "′", "cdots": "⋯",
+         "ldots": "…", "dots": "…", "vdots": "⋮", "langle": "⟨", "rangle": "⟩", "hbar": "ℏ",
+         "ell": "ℓ", "Re": "ℜ", "Im": "ℑ", "aleph": "ℵ", "circ": "∘"}
 _SYMBOLS: dict[str, str] = {**_GREEK, **_OPS, **_RELATIONS, **_BIG, **_SETS, **_MISC}
 
-# Spacing / grouping control words that become a single space or drop entirely.
 _SPACE_CMDS = ("quad", "qquad", "thinspace", "medspace", "thickspace", "space")
 _DROP_CMDS = ("left", "right", "big", "Big", "bigg", "Bigg", "displaystyle", "textstyle", "limits",
               "mathrm", "mathbf", "mathit", "text", "operatorname", "boldsymbol")
-# Named operators/functions that render as their plain word (backslash dropped, value unchanged).
 _FUNCTIONS = ("lim", "sin", "cos", "tan", "cot", "sec", "csc", "sinh", "cosh", "tanh", "arcsin",
               "arccos", "arctan", "log", "ln", "exp", "max", "min", "det", "gcd", "lcm", "mod",
               "arg", "deg", "dim", "ker", "sgn")
-# Accents -> base char + combining mark (x-bar, v-vector, x-hat, …).
 _ACCENTS = {"bar": "̄", "overline": "̄", "hat": "̂", "widehat": "̂",
             "vec": "⃗", "tilde": "̃", "dot": "̇", "ddot": "̈"}
-_CASES_ENV = re.compile(r"\\begin\s*\{cases\}(.*?)\\end\s*\{cases\}", re.DOTALL)
-
-
-def _render_cases(body: str) -> str:
-    rows = [r for r in re.split(r"\\\\", body) if r.strip() != ""]
-    out = []
-    for row in rows:
-        cells = [_convert(c).strip() for c in re.split(r"&", row)]
-        out.append("  " + ",  ".join(c for c in cells if c))
-    return "\n" + "\n".join(out)
-
-
-def _apply_accent(mark: str, body: str) -> str:
-    body = body.strip()
-    return (body[0] + mark + body[1:]) if body else body
 
 _SUP = {**{str(d): c for d, c in zip(range(10), "⁰¹²³⁴⁵⁶⁷⁸⁹")},
         "+": "⁺", "-": "⁻", "=": "⁼", "(": "⁽", ")": "⁾", "n": "ⁿ", "i": "ⁱ",
@@ -110,14 +86,12 @@ _SUB = {**{str(d): c for d, c in zip(range(10), "₀₁₂₃₄₅₆₇₈₉"
         "a": "ₐ", "e": "ₑ", "h": "ₕ", "i": "ᵢ", "j": "ⱼ", "k": "ₖ", "l": "ₗ", "m": "ₘ",
         "n": "ₙ", "o": "ₒ", "p": "ₚ", "r": "ᵣ", "s": "ₛ", "t": "ₜ", "u": "ᵤ", "v": "ᵥ",
         "x": "ₓ", " ": " "}
-# Reverse maps: Unicode super/subscript digits -> ASCII, so the equivalence guard sees "x²" as a 2.
-_SUPSUB_DIGIT_TO_ASCII = {c: str(d) for d, c in zip(range(10), "⁰¹²³⁴⁵⁶⁷⁸⁹")}
-_SUPSUB_DIGIT_TO_ASCII.update({c: str(d) for d, c in zip(range(10), "₀₁₂₃₄₅₆₇₈₉")})
+_SUP_DIGITS, _SUB_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹", "₀₁₂₃₄₅₆₇₈₉"
+_SUPSUB_DIGIT_TO_ASCII = {c: str(d) for d, c in zip(range(10), _SUP_DIGITS)}
+_SUPSUB_DIGIT_TO_ASCII.update({c: str(d) for d, c in zip(range(10), _SUB_DIGITS)})
 
 
 def _map_script(body: str, table: dict[str, str]) -> str | None:
-    """Return the sub/superscript rendering of ``body`` if EVERY char maps, else None (caller keeps a
-    readable ``^(...)`` / ``_(...)`` form so nothing becomes ambiguous)."""
     out = []
     for ch in body:
         m = table.get(ch)
@@ -154,36 +128,65 @@ def _subscript(body: str) -> str:
     return f"_({body})" if _needs_parens(body) or len(body) > 1 else f"_{body}"
 
 
-_MATRIX_ENV = re.compile(r"\\begin\s*\{(b|p|v|B|V|)matrix\}(.*?)\\end\s*\{\1matrix\}", re.DOTALL)
-_ARRAY_ENV = re.compile(r"\\begin\s*\{array\}\s*(?:\{[^{}]*\})?(.*?)\\end\s*\{array\}", re.DOTALL)
+def _apply_accent(mark: str, body: str) -> str:
+    body = body.strip()
+    return (body[0] + mark + body[1:]) if body else body
 
 
-def _render_matrix(body: str, bracket: str) -> str:
-    rows = [r for r in re.split(r"\\\\", body) if r.strip() != ""]
-    grid = [[_convert(cell).strip() for cell in re.split(r"&", row)] for row in rows]
-    if not grid:
-        return ""
-    ncol = max(len(r) for r in grid)
-    grid = [r + [""] * (ncol - len(r)) for r in grid]
-    widths = [max(len(r[c]) for r in grid) for c in range(ncol)]
-    lb, rb = {"b": ("[", "]"), "p": ("(", ")"), "v": ("|", "|"), "": ("[", "]")}.get(bracket.lower(), ("[", "]"))
-    lines = [f"{lb} " + "  ".join(cell.ljust(widths[c]) for c, cell in enumerate(r)) + f" {rb}" for r in grid]
-    return "\n" + "\n".join(lines)
+# --------------------------------------------------------------------------------------------------
+# Structural parse: ordered TechnicalBlocks (text | matrix). Each has a stable identity + source_order,
+# so blocks render independently and reassemble in order (a label never migrates to another matrix).
+# --------------------------------------------------------------------------------------------------
+_ENV_RE = re.compile(
+    r"\\begin\s*\{(bmatrix|pmatrix|vmatrix|Bmatrix|Vmatrix|smallmatrix|matrix|array|cases)\}"
+    r"(.*?)\\end\s*\{\1\}", re.DOTALL)
+_BRACKET = {"bmatrix": ("[", "]"), "matrix": ("", ""), "pmatrix": ("(", ")"), "vmatrix": ("|", "|"),
+            "Bmatrix": ("{", "}"), "Vmatrix": ("‖", "‖"), "smallmatrix": ("[", "]"), "array": ("[", "]")}
 
 
-def _convert(text: str) -> str:
-    """The core LaTeX -> plain/Unicode transform. Deterministic 1:1 substitution + structural layout;
-    never inserts or removes a value."""
-    # 1) environments (matrices / arrays / piecewise) first — recurse into their cells via _convert.
-    text = _MATRIX_ENV.sub(lambda m: _render_matrix(m.group(2), m.group(1)), text)
-    text = _ARRAY_ENV.sub(lambda m: _render_matrix(m.group(1), "b"), text)
-    text = _CASES_ENV.sub(lambda m: _render_cases(m.group(1)), text)
+@dataclass
+class TechnicalBlock:
+    """One render unit with a stable identity. kind='matrix' carries a row-major cell grid (canonical,
+    pre-render); kind='text' carries prose/inline-math. plain_text_fallback is the safe rendering."""
+    source_order: int
+    kind: str                                       # "text" | "matrix"
+    canonical: str
+    grid: tuple[tuple[str, ...], ...] | None = None
+    bracket: str = "bmatrix"
+    is_cases: bool = False
+    plain_text_fallback: str = ""
 
-    # 2) \frac and \sqrt, innermost-first (the [^{}] class matches only brace-free = innermost groups).
+
+def parse_blocks(text: str) -> list[TechnicalBlock]:
+    """Split into ordered text/matrix blocks. Matrices (bmatrix/pmatrix/…/array/cases) become grid
+    blocks; everything else is text. Order is preserved so each label stays adjacent to its block."""
+    out: list[TechnicalBlock] = []
+    pos = order = 0
+    for m in _ENV_RE.finditer(text):
+        if m.start() > pos:
+            out.append(TechnicalBlock(order, "text", text[pos:m.start()])); order += 1
+        env, body = m.group(1), m.group(2)
+        if env == "array":
+            body = re.sub(r"\A\s*\{[^{}]*\}", "", body)     # drop the column spec {ccc}
+        rows = tuple(tuple(c.strip() for c in re.split(r"&", r))
+                     for r in re.split(r"\\\\", body) if r.strip() != "")
+        out.append(TechnicalBlock(order, "matrix", m.group(0), grid=rows,
+                                  bracket=env, is_cases=(env == "cases"))); order += 1
+        pos = m.end()
+    if pos < len(text) or not out:
+        out.append(TechnicalBlock(order, "text", text[pos:]))
+    return out
+
+
+# --------------------------------------------------------------------------------------------------
+# Rendering (per block)
+# --------------------------------------------------------------------------------------------------
+def _convert_textish(text: str) -> str:
+    """LaTeX -> plain/Unicode for a NON-matrix fragment (matrices are handled as blocks)."""
     frac_re = re.compile(r"\\d?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
     sqrt_n_re = re.compile(r"\\sqrt\s*\[([^\][]*)\]\s*\{([^{}]*)\}")
     sqrt_re = re.compile(r"\\sqrt\s*\{([^{}]*)\}")
-    for _ in range(40):  # bounded: each pass resolves one nesting level
+    for _ in range(40):                                  # innermost-first; bounded
         new = frac_re.sub(lambda m: _frac(m.group(1), m.group(2)), text)
         new = sqrt_n_re.sub(lambda m: f"{_superscript(m.group(1))}√"
                             + (f"({m.group(2).strip()})" if _needs_parens(m.group(2)) else m.group(2).strip()), new)
@@ -191,54 +194,56 @@ def _convert(text: str) -> str:
         if new == text:
             break
         text = new
-
-    # 2b) accents: \bar{x} -> x̄, \vec{v} -> v⃗ (base char + combining mark).
-    for name, mark in _ACCENTS.items():
+    for name, mark in _ACCENTS.items():                  # \bar{x} -> x̄
         text = re.sub(rf"\\{name}\s*\{{([^{{}}]*)\}}", lambda m, mk=mark: _apply_accent(mk, m.group(1)), text)
         text = re.sub(rf"\\{name}\s+([A-Za-z0-9])", lambda m, mk=mark: _apply_accent(mk, m.group(1)), text)
-
-    # 3) super/subscripts: braced groups then single tokens.
     text = re.sub(r"\^\s*\{([^{}]*)\}", lambda m: _superscript(m.group(1)), text)
     text = re.sub(r"_\s*\{([^{}]*)\}", lambda m: _subscript(m.group(1)), text)
     text = re.sub(r"\^\s*(\\?[A-Za-z0-9])", lambda m: _superscript(m.group(1).lstrip("\\")), text)
     text = re.sub(r"_\s*(\\?[A-Za-z0-9])", lambda m: _subscript(m.group(1).lstrip("\\")), text)
-
-    # 4) drop grouping/formatting commands (keep their argument) and spacing commands.
     for c in _DROP_CMDS:
         text = re.sub(rf"\\{c}\b", "", text)
     for c in _SPACE_CMDS:
         text = re.sub(rf"\\{c}\b", " ", text)
-    text = re.sub(r"\\[,;:> ]", " ", text)   # thin spaces
+    text = re.sub(r"\\[,;:> ]", " ", text)
     text = text.replace("\\!", "")
-
-    # 5) named functions -> plain word (drop backslash), then symbol control words -> Unicode.
     text = re.sub(r"\\(" + "|".join(_FUNCTIONS) + r")\b", r"\1", text)
-
-    def _sym(m: re.Match) -> str:
-        return _SYMBOLS.get(m.group(1), m.group(0))
-    text = re.sub(r"\\([A-Za-z]+)", _sym, text)
-
-    # 6) delimiters: math-mode markers vanish; escaped braces/&/% become literal.
+    text = re.sub(r"\\([A-Za-z]+)", lambda m: _SYMBOLS.get(m.group(1), m.group(0)), text)
     text = text.replace("\\[", "\n").replace("\\]", "\n").replace("\\(", "").replace("\\)", "")
     text = text.replace("$$", "").replace("$", "")
     text = re.sub(r"\\([{}&%#_])", r"\1", text)
     return text
 
 
-# --------------------------------------------------------------------------------------------------
-# Markdown -> plain
-# --------------------------------------------------------------------------------------------------
+def _render_grid(grid: list[list[str]], bracket: str) -> str:
+    if not grid:
+        return ""
+    ncol = max(len(r) for r in grid)
+    grid = [list(r) + [""] * (ncol - len(r)) for r in grid]
+    widths = [max(len(r[c]) for r in grid) for c in range(ncol)]
+    lb, rb = _BRACKET.get(bracket, ("[", "]"))
+    lines = [f"{lb} " + "  ".join(cell.ljust(widths[c]) for c, cell in enumerate(r)) + f" {rb}".rstrip()
+             for r in grid]
+    return "\n" + "\n".join(line if lb else line.strip() for line in lines)
+
+
+def _render_cases(grid: list[list[str]]) -> str:
+    return "\n" + "\n".join("  " + ",  ".join(c.strip() for c in row if c.strip()) for row in grid)
+
+
+def _render_text_block(t: str, *, is_code: bool = False) -> str:
+    return _strip_markdown(_convert_textish(t), is_code=is_code)
+
+
 def _strip_markdown(text: str, *, is_code: bool) -> str:
-    # fenced code blocks: keep the inner lines; drop the ``` fences. (Backslashes inside are left as-is
-    # when is_code, so the validator won't flag legitimate code.)
     text = re.sub(r"```[^\n]*\n(.*?)```", lambda m: m.group(1), text, flags=re.DOTALL)
-    text = re.sub(r"`([^`]*)`", r"\1", text)                      # inline code
-    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)  # ATX headings
-    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)               # **bold**
-    text = re.sub(r"__([^_]+)__", r"\1", text)                   # __bold__
-    text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"\1", text)  # *italic*
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"\1", text)
     text = _convert_md_tables(text)
-    text = re.sub(r"^\s{0,3}[-*+]\s+", "• ", text, flags=re.MULTILINE)  # bullet lists
+    text = re.sub(r"^\s{0,3}[-*+]\s+", "• ", text, flags=re.MULTILINE)
     return text
 
 
@@ -248,11 +253,9 @@ def _convert_md_tables(text: str) -> str:
     i = 0
     while i < len(lines):
         if "|" in lines[i] and i + 1 < len(lines) and re.match(r"^\s*\|?[\s:|-]+\|?\s*$", lines[i + 1]) and "-" in lines[i + 1]:
-            block = []
-            j = i
+            block, j = [], i
             while j < len(lines) and "|" in lines[j]:
-                block.append(lines[j])
-                j += 1
+                block.append(lines[j]); j += 1
             rows = [[c.strip() for c in re.split(r"\|", r.strip().strip("|"))] for k, r in enumerate(block) if k != 1]
             if rows:
                 ncol = max(len(r) for r in rows)
@@ -262,45 +265,111 @@ def _convert_md_tables(text: str) -> str:
                     out.append("  ".join(cell.ljust(widths[c]) for c, cell in enumerate(r)).rstrip())
             i = j
             continue
-        out.append(lines[i])
-        i += 1
+        out.append(lines[i]); i += 1
     return "\n".join(out)
 
 
-# --------------------------------------------------------------------------------------------------
-# Public API
-# --------------------------------------------------------------------------------------------------
 def to_readable(text: str, *, is_code: bool = False) -> str:
-    """LaTeX + Markdown -> readable plain text / Unicode. Pure and deterministic."""
+    """LaTeX + Markdown -> readable plain text/Unicode, block by block, reassembled in source order."""
     if not text:
         return text
-    out = _convert(text)
-    out = _strip_markdown(out, is_code=is_code)
-    out = re.sub(r"⟨\s+", "⟨", out)                     # tidy angle brackets: ⟨ 3, 4 ⟩ -> ⟨3, 4⟩
+    parts: list[str] = []
+    for b in parse_blocks(text):
+        if b.kind == "text":
+            parts.append(_render_text_block(b.canonical, is_code=is_code))
+        elif b.is_cases:
+            parts.append(_render_cases([[_convert_textish(c) for c in row] for row in b.grid]))
+        else:
+            parts.append(_render_grid([[_convert_textish(c).strip() for c in row] for row in b.grid], b.bracket))
+    out = "".join(parts)
+    out = re.sub(r"⟨\s+", "⟨", out)
     out = re.sub(r"\s+⟩", "⟩", out)
-    out = re.sub(r"[ \t]+\n", "\n", out)                # trailing spaces
-    out = re.sub(r"\n{3,}", "\n\n", out)                # collapse blank runs (matrix alignment kept)
+    out = re.sub(r"[ \t]+\n", "\n", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
     return out.strip()
 
 
-_SUP_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹"
-_SUB_DIGITS = "₀₁₂₃₄₅₆₇₈₉"
-
-
-def _signed_numbers(text: str) -> list[str]:
-    # A super/subscript digit RUN is its own number, and a superscript run is separate from an adjacent
-    # subscript run (∫₀¹ = lower 0 AND upper 1, not "01"; 10²³ = base 10 AND exponent 23, not "1023").
+# --------------------------------------------------------------------------------------------------
+# Structural equivalence guard
+# --------------------------------------------------------------------------------------------------
+def _tokens(s: str) -> list[str]:
+    """Ordered (NOT sorted) tokens: numbers (super/subscript digit runs split by script) and
+    identifier runs (Latin/Greek letters). Order encodes position, so a transposed matrix, a
+    reordered block, or a moved label produces a different token list."""
     for chars in (_SUP_DIGITS, _SUB_DIGITS):
-        text = re.sub(f"[{chars}]+",
-                      lambda m: " " + "".join(_SUPSUB_DIGIT_TO_ASCII[c] for c in m.group()), text)
-    nums = re.findall(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
-    return sorted(nums, key=lambda s: (float(s), s))
+        s = re.sub(f"[{chars}]+", lambda m: " " + "".join(_SUPSUB_DIGIT_TO_ASCII[c] for c in m.group()), s)
+    return re.findall(r"-?\d+(?:\.\d+)?|[A-Za-zµΑ-Ωα-ω]+", s.replace(",", ""))
+
+
+_ROW_RE = re.compile(r"^\s*[\[(|{‖].*[\])|}‖]\s*$")
+
+
+def _rendered_blocks(plain: str) -> list[tuple[str, object]]:
+    """Parse ALREADY-RENDERED plain text back into ordered text/matrix blocks (a matrix = a run of
+    consecutive bracketed rows), so the guard can compare structure against the canonical."""
+    out: list[tuple[str, object]] = []
+    txt: list[str] = []
+    mat: list[list[str]] = []
+
+    def flush_txt() -> None:
+        if txt:
+            out.append(("text", "\n".join(txt))); txt.clear()
+
+    def flush_mat() -> None:
+        if mat:
+            out.append(("matrix", tuple(tuple(r) for r in mat))); mat.clear()
+
+    for ln in plain.split("\n"):
+        if _ROW_RE.match(ln):
+            flush_txt()
+            inner = re.sub(r"^\s*[\[(|{‖]\s*", "", ln.strip())
+            inner = re.sub(r"\s*[\])|}‖]\s*$", "", inner)
+            mat.append([c for c in re.split(r"\s{2,}", inner.strip()) if c != ""] or [""])
+        else:
+            flush_mat()
+            txt.append(ln)
+    flush_mat()
+    flush_txt()
+    return out
+
+
+def _canonical_signature(text: str) -> list[str]:
+    sig: list[str] = []
+    for b in parse_blocks(text):
+        if b.kind == "text":
+            sig += _tokens(_render_text_block(b.canonical))
+        elif b.is_cases:
+            for row in b.grid:
+                for c in row:
+                    sig += _tokens(_convert_textish(c))
+        else:
+            conv = [[_convert_textish(c).strip() for c in row] for row in b.grid]
+            ncol = max((len(r) for r in conv), default=0)
+            sig.append(f"MAT{len(conv)}x{ncol}")
+            for row in conv:
+                for c in row:
+                    sig += _tokens(c)
+    return sig
+
+
+def _rendered_signature(text: str) -> list[str]:
+    sig: list[str] = []
+    for kind, payload in _rendered_blocks(text):
+        if kind == "text":
+            sig += _tokens(payload)                       # type: ignore[arg-type]
+        else:
+            grid = payload                                # tuple of tuples
+            ncol = max((len(r) for r in grid), default=0)  # type: ignore[arg-type]
+            sig.append(f"MAT{len(grid)}x{ncol}")           # type: ignore[arg-type]
+            for row in grid:                               # type: ignore[union-attr]
+                for c in row:
+                    sig += _tokens(c)
+    return sig
 
 
 def _inequalities(text: str) -> list[str]:
-    """The DIRECTIONAL relation multiset (≤ ≥ ≠ < >), with LaTeX/ASCII forms normalized. ``=`` is
-    excluded on purpose: it is ubiquitous (subscripts like i=1, matrix rows) and its direction cannot
-    flip, so counting it only creates false alarms."""
+    """Directional relation multiset (≤ ≥ ≠ < >), LaTeX/ASCII normalized. ``=`` is excluded (ubiquitous
+    and undirected)."""
     text = re.sub(r"\\leq?\b", "≤", text)
     text = re.sub(r"\\geq?\b", "≥", text)
     text = re.sub(r"\\neq?\b", "≠", text)
@@ -309,29 +378,27 @@ def _inequalities(text: str) -> list[str]:
 
 
 def assert_expression_equivalent(canonical: str, rendered: str) -> None:
-    """Raise ExpressionEquivalenceError if the render changed the signed-number multiset or a
-    directional inequality. Conservative by design — a false alarm only costs a fallback to the
-    canonical form, a missed change could ship a wrong answer. (Symbol substitution is a static 1:1
-    table, so a relation can never be *flipped* at render time — the unit tests pin the table.)"""
-    if _signed_numbers(canonical) != _signed_numbers(rendered):
-        raise ExpressionEquivalenceError("numeric multiset changed during render")
+    """Raise ExpressionEquivalenceError unless the render preserved STRUCTURE: block kind + order,
+    matrix dimensions, row-major entry positions, the interleaved number/identifier (label) tokens, and
+    directional inequalities. Conservative — a false alarm only costs a fallback to canonical text."""
+    if _canonical_signature(canonical) != _rendered_signature(rendered):
+        raise ExpressionEquivalenceError("structural signature changed during render")
     if _inequalities(canonical) != _inequalities(rendered):
         raise ExpressionEquivalenceError("inequality direction changed during render")
 
 
-# Raw tokens that must NEVER reach a plain-text channel.
+# --------------------------------------------------------------------------------------------------
+# Hard outbound gate
+# --------------------------------------------------------------------------------------------------
 _FORBIDDEN = (
     (r"\\begin\s*\{", "\\begin{"), (r"\\end\s*\{", "\\end{"), (r"\\frac\b", "\\frac"),
-    (r"\\sqrt\b", "\\sqrt"), (r"\\[a-zA-Z]+\b", "\\<cmd>"),  # any surviving control word
+    (r"\\sqrt\b", "\\sqrt"), (r"\\[a-zA-Z]+\b", "\\<cmd>"),
     (r"\\\[", "\\["), (r"\\\]", "\\]"), (r"\\\(", "\\("), (r"\\\)", "\\)"),
-    (r"\*\*", "**"), (r"^\s{0,3}#{1,6}\s", "# heading"),
-    (r"^\s*\|.*\|\s*$", "| table |"),
+    (r"\*\*", "**"), (r"^\s{0,3}#{1,6}\s", "# heading"), (r"^\s*\|.*\|\s*$", "| table |"),
 )
 
 
 def forbidden_tokens(text: str, *, is_code: bool = False) -> list[str]:
-    """Which unsupported presentation tokens survive in ``text`` (empty => channel-safe). ``$`` and
-    lone backslashes inside explicit code are allowed."""
     found = []
     for pat, label in _FORBIDDEN:
         if is_code and label.startswith("\\"):
@@ -349,21 +416,23 @@ def assert_channel_safe(text: str, *, channel: str, is_code: bool = False) -> No
 
 
 def _last_resort_strip(text: str) -> str:
-    """If a rendered form still isn't channel-safe, remove the raw delimiters/markers WITHOUT
-    restructuring, so at worst the student sees the plain math text, never TeX scaffolding."""
+    """Remove raw delimiters/markers WITHOUT restructuring, guaranteeing no TeX scaffolding or stray
+    backslash reaches the channel (facts survive; at worst the student sees plain math text)."""
     t = text.replace("\\[", "\n").replace("\\]", "\n").replace("\\(", "").replace("\\)", "")
-    t = t.replace("\\begin", "").replace("\\end", "")
-    t = re.sub(r"\\left|\\right", "", t)
+    t = re.sub(r"\\begin\s*\{[^{}]*\}", "", t)
+    t = re.sub(r"\\end\s*\{[^{}]*\}", "", t)
+    t = t.replace("\\\\", "\n").replace("&", "  ")
     t = re.sub(r"\*\*", "", t)
     t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
-    t = re.sub(r"\\([A-Za-z]+)", r"\1", t)   # \theta -> theta (readable word), never leaves a backslash
+    t = re.sub(r"\\([A-Za-z]+)", r"\1", t)                # \theta -> theta (readable word)
+    t = t.replace("\\", "")                               # nuke any stray backslash
     return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
 def render_for_channel(text: str, *, channel: str, is_code: bool = False) -> str:
-    """Render ``text`` for ``channel``. For plain-text channels: LaTeX/Markdown -> readable, guarded by
-    fact-equivalence; if the render can't be proven equivalent OR isn't channel-safe, fall back to the
-    canonical stripped form (facts intact, no scaffolding). Non-plain channels pass through unchanged."""
+    """Render ``text`` for ``channel``. Plain-text channels: LaTeX/Markdown -> readable, guarded by the
+    structural equivalence check; if it can't be proven structure-preserving OR isn't channel-safe,
+    fall back to the canonical stripped form. Non-plain channels pass through unchanged."""
     if channel not in PLAIN_TEXT_CHANNELS or not text:
         return text
     rendered = to_readable(text, is_code=is_code)
@@ -376,17 +445,11 @@ def render_for_channel(text: str, *, channel: str, is_code: bool = False) -> str
     return rendered
 
 
-# Technical lines the voice pass must NOT lowercase (a leading `T`/`KE` is a variable name, not a
-# sentence start). Used by conversation_style to protect variable case.
-_TECH_LINE = re.compile(r"^\s*(?:[\[(|].*|.*[=<>≤≥≠→⇒].*|[A-Za-z][\w']*\s*[²³⁰-⁹]*\s*[=(].*)")
-
-
+# Technical lines the voice pass must NOT lowercase (a leading `T`/`KE` is a variable, not a sentence).
 def is_technical_line(line: str) -> bool:
-    """True for matrix rows, equations, and labelled expressions — lines whose leading capital is a
-    symbol, not prose."""
     s = line.strip()
     if not s:
         return False
-    if s[0] in "[(|⟨" or any(t in s for t in ("=", "<", ">", "≤", "≥", "≠", "→", "⇒")):
+    if s[0] in "[(|⟨‖{" or any(t in s for t in ("=", "<", ">", "≤", "≥", "≠", "→", "⇒")):
         return True
     return False

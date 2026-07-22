@@ -224,22 +224,103 @@ def test_render_passthrough_for_non_plain_channel():
 # LIVE REGRESSION (the exact HEIC transition-matrix reply) ------------------------------------------
 
 def test_live_transition_matrix_regression():
-    # The model's raw reply from the live HEIC test (LaTeX + Markdown), rendered for iMessage.
+    # The model's raw reply from the live HEIC test (LaTeX + Markdown), rendered for iMessage — with
+    # the CORRECT labels: T is the transition matrix, T² is its square.
     src = (
         "**b)** the entry in the **F row, N column** is $0.40$.\n\n"
-        r"$$T^2 = \begin{bmatrix} 0.54 & 0.46 \\ 0.5175 & 0.4825 \end{bmatrix}$$"
+        r"T = $$\begin{bmatrix} 0.60 & 0.40 \\ 0.45 & 0.55 \end{bmatrix}$$"
+        "\n\nsquaring it:\n\n"
+        r"T^2 = $$\begin{bmatrix} 0.54 & 0.46 \\ 0.5175 & 0.4825 \end{bmatrix}$$"
         "\n\nso the answer is $0.54$, or 54%."
     )
     out = r(src)
-    _no_raw(out)                              # 25: nothing raw reaches iMessage
+    _no_raw(out)
     assert "**" not in out
-    assert "0.40" in out                      # fact preserved
-    assert "[ 0.54    0.46   ]" in out        # aligned matrix
-    assert "[ 0.5175  0.4825 ]" in out
-    assert "0.54, or 54%" in out
-    # every original number survives
-    for n in ("0.40", "0.54", "0.46", "0.5175", "0.4825", "54"):
+    # each label sits with ITS OWN matrix, in order
+    assert out.index("T =") < out.index("[ 0.60  0.40 ]") < out.index("T² =") < out.index("[ 0.54    0.46   ]")
+    assert "[ 0.45  0.55 ]" in out and "[ 0.5175  0.4825 ]" in out
+    for n in ("0.40", "0.60", "0.54", "0.46", "0.5175", "0.4825", "54"):
         assert n in out
+
+
+# LABEL-ASSOCIATION / STRUCTURAL PRESERVATION (the T/T² bug + guard strengthening) -----------------
+
+def test_la1_T_and_Tsquared_correct_matrix_under_each_label():
+    src = (r"T = \begin{bmatrix} 0.60 & 0.40 \\ 0.45 & 0.55 \end{bmatrix}" "\n\n"
+           r"T^2 = \begin{bmatrix} 0.54 & 0.46 \\ 0.5175 & 0.4825 \end{bmatrix}")
+    out = r(src)
+    assert out.index("T =") < out.index("[ 0.60  0.40 ]")
+    assert out.index("[ 0.45  0.55 ]") < out.index("T² =") < out.index("[ 0.54    0.46   ]")
+
+
+def test_la2_A_Asquared_Ainverse_no_label_swap():
+    src = (r"A = \begin{bmatrix}2 & 0\\0 & 2\end{bmatrix}" "\n\n"
+           r"A^2 = \begin{bmatrix}4 & 0\\0 & 4\end{bmatrix}" "\n\n"
+           r"A^{-1} = \begin{bmatrix}0.5 & 0\\0 & 0.5\end{bmatrix}")
+    out = r(src)
+    assert out.index("A =") < out.index("A² =") < out.index("A⁻¹ =")   # labels in order, none swapped
+    assert out.index("A² =") < out.index("4")                          # 4 is unique to A²'s matrix
+    assert out.index("A⁻¹ =") < out.index("0.5")                       # 0.5 is unique to A⁻¹'s matrix
+    _no_raw(out)
+
+
+def test_la3_x_and_xsquared_values_associated():
+    out = r(r"if $x = 3$ then $x^2 = 9$")
+    assert "x = 3" in out and "x² = 9" in out
+
+
+def test_la4_force_mass_acceleration_do_not_swap():
+    out = r(r"$F = 12 N$, $m = 3 kg$, $a = 4 m/s^2$")
+    assert "F = 12 N" in out and "m = 3 kg" in out and "a = 4 m/s²" in out
+
+
+def test_la5_multiple_equations_similar_numbers_keep_labels():
+    out = r("a = 5\nb = 5\nc = 5")
+    assert "a = 5" in out and "b = 5" in out and "c = 5" in out and out.count("= 5") == 3
+
+
+def test_la6_units_stay_with_correct_value():
+    out = r(r"$v = 3 m/s$ and $t = 5 s$")
+    assert "v = 3 m/s" in out and "t = 5 s" in out
+
+
+def test_la7_same_multiset_different_positions_not_equivalent():
+    # transposed first row: same numbers, different positions -> MUST NOT be equivalent
+    with pytest.raises(ExpressionEquivalenceError):
+        assert_expression_equivalent(r"\begin{bmatrix}1 & 2\\3 & 4\end{bmatrix}", "[ 2  1 ]\n[ 3  4 ]")
+
+
+def test_la8_reordered_blocks_fail_validation():
+    with pytest.raises(ExpressionEquivalenceError):
+        assert_expression_equivalent(
+            r"A = \begin{bmatrix}1 & 2\end{bmatrix} then B = \begin{bmatrix}3 & 4\end{bmatrix}",
+            "B =\n[ 3  4 ]\nA =\n[ 1  2 ]")
+
+
+def test_la9_missing_label_fails_validation():
+    with pytest.raises(ExpressionEquivalenceError):
+        assert_expression_equivalent(r"T = \begin{bmatrix}1 & 2\\3 & 4\end{bmatrix}", "[ 1  2 ]\n[ 3  4 ]")
+
+
+def test_la10_live_fixture_exact_output():
+    src = (r"T = \begin{bmatrix} 0.60 & 0.40 \\ 0.45 & 0.55 \end{bmatrix}" "\n\n"
+           r"T^2 = \begin{bmatrix} 0.54 & 0.46 \\ 0.5175 & 0.4825 \end{bmatrix}")
+    expected = ("T =\n[ 0.60  0.40 ]\n[ 0.45  0.55 ]\n\n"
+                "T² =\n[ 0.54    0.46   ]\n[ 0.5175  0.4825 ]")
+    assert r(src) == expected
+
+
+def test_la_present_pipeline_preserves_labels_and_case():
+    # the full render -> voice-styling pipeline must keep variable case (T, not t) and alignment
+    from bruce_engine.conversation_style import ConversationStyleEngine, VoiceProfile
+    eng = ConversationStyleEngine()
+    src = (r"T = \begin{bmatrix} 0.60 & 0.40 \\ 0.45 & 0.55 \end{bmatrix}" "\n\n"
+           r"T^2 = \begin{bmatrix} 0.54 & 0.46 \\ 0.5175 & 0.4825 \end{bmatrix}")
+    styled = eng.render(render_for_channel(src, channel=IM), protect_technical=True,
+                        profile=VoiceProfile(lowercase=True))
+    assert "T =" in styled and "T² =" in styled and "t =" not in styled.split("\n")[0]
+    assert "[ 0.60  0.40 ]" in styled
+    _no_raw(styled)
 
 
 # is_technical_line (voice-pass variable-case protection) ------------------------------------------
