@@ -21,7 +21,7 @@ import time
 
 from .backend import AuthError, Backend, BackendError
 from .checkpoint import FileCheckpoint
-from .imsg import Imsg, ImsgEvent, ImsgSendRejected, parse_event
+from .imsg import Imsg, ImsgEvent, ImsgSendRejected, parse_event, reaction_of
 from .outbound_ledger import (
     BLOCKED_BEFORE_SEND,
     HANDED_TO_IMSG,
@@ -70,7 +70,11 @@ def _event_to_dict(e: ImsgEvent) -> dict:
     """ImsgEvent -> raw dict that parse_event reconstructs exactly (for the restart-safe pending store)."""
     return {"guid": e.guid, "chat_guid": e.chat_guid, "sender": e.sender, "is_from_me": e.is_from_me,
             "is_group": e.is_group, "text": e.text, "created_at": e.created_at,
-            "attachments": e.attachments, "reply_to_guid": e.reply_to_guid}
+            "attachments": e.attachments, "reply_to_guid": e.reply_to_guid,
+            "thread_originator_guid": e.thread_originator_guid,
+            "associated_message_guid": e.associated_message_guid,
+            "associated_message_type": e.associated_message_type,
+            "service": e.service, "is_edited": e.is_edited, "is_unsent": e.is_unsent}
 
 
 class Relay:
@@ -178,6 +182,7 @@ class Relay:
 
     async def _post_and_checkpoint(self, event: ImsgEvent, atts: list[dict], *,
                                    attachment_unavailable: bool = False) -> str:
+        reaction_type, reaction_removed = reaction_of(event.associated_message_type)
         resp = await self.backend.post_inbound({
             "provider_message_id": event.guid,
             "channel_identity": event.sender or "",
@@ -188,6 +193,14 @@ class Relay:
             "attachments": atts,
             "attachment_unavailable": attachment_unavailable,
             "reply_to_message_id": event.reply_to_guid,
+            # Bite 2 A message-relationship contract (provider-neutral; null/false when absent).
+            "thread_root_message_id": event.thread_originator_guid,
+            "reaction_target_message_id": event.associated_message_guid if reaction_type else None,
+            "reaction_type": reaction_type,
+            "reaction_removed": reaction_removed,
+            "edited": event.is_edited,
+            "unsent": event.is_unsent,
+            "service": event.service,
             "timestamp": event.created_at,
         })
         self.checkpoint.mark(event.guid)                    # durable ack -> safe to not reprocess

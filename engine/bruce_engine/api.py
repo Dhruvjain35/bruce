@@ -478,6 +478,15 @@ class RelayInboundRequest(BaseModel):
     attachments: list[RelayAttachment] = Field(default_factory=list)
     attachment_unavailable: bool = False   # relay gave up resolving a still-downloading attachment
     reply_to_message_id: str | None = None
+    # --- Bite 2 A message-relationship contract (null-safe; provider-neutral). Persistence is A2,
+    # referenced-message/attachment retrieval is A3 — this PR only carries the fields on the wire.
+    thread_root_message_id: str | None = None   # inline-reply originator, DISTINCT from chat_guid
+    reaction_target_message_id: str | None = None
+    reaction_type: str | None = None            # love|like|dislike|laugh|emphasis|question|sticker|unknown
+    reaction_removed: bool = False
+    edited: bool = False
+    unsent: bool = False
+    service: str | None = None                  # "iMessage" | "SMS"
     timestamp: str | None = None
 
 
@@ -487,6 +496,16 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
     intake). Ignores Bruce's own echoes; deduplicated by message GUID. Returns quickly."""
     if req.is_from_me:
         return {"status": "ignored_echo"}
+    # FAIL-CLOSED relationship-event guard (Bite 2 A): a tapback, tapback-removal, unsend, or edit-only
+    # event is carried for the future ConversationContextGraph (A2) but must NEVER enter the
+    # message->reply pipeline — no conversation turn, no outbound. Distinct statuses, no side effects
+    # (stateless => idempotent on redelivery). Persisting them lands in A2.
+    if req.reaction_type is not None or req.reaction_target_message_id is not None:
+        return {"status": "reaction_ignored_until_context_graph"}
+    if req.unsent:
+        return {"status": "unsent_event_recorded"}
+    if req.edited:
+        return {"status": "relationship_event_recorded"}
     atts, refs = [], []
     for a in req.attachments:
         try:
@@ -506,6 +525,7 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
         provider_message_id=req.provider_message_id, channel=ChannelKind.self_hosted_imessage,
         channel_identity=req.channel_identity, text=req.text, attachments=atts, timestamp=ts,
         reply_to_message_id=req.reply_to_message_id, thread_id=req.chat_guid,
+        thread_root_message_id=req.thread_root_message_id, service=req.service,
         is_group=req.is_group, attachment_unavailable=req.attachment_unavailable)
     outcome = await messaging_inbound.handle_inbound(messaging_outbound.QueueChannel(), msg)
     # Once the durable source has the bytes (processed), clear the staged upload copies.

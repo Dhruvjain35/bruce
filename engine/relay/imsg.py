@@ -34,6 +34,31 @@ class ImsgEvent:
     created_at: str | None
     attachments: list[dict]        # each: {mime_type, original_path, missing, byte_count, transfer_name}
     reply_to_guid: str | None = None
+    # --- Bite 2 A: message-relationship metadata (null-safe; populated per imsg's real event schema).
+    # These are the RAW iMessage signals; the provider-neutral mapping happens at the POST boundary.
+    thread_originator_guid: str | None = None      # inline-reply originator (DISTINCT from chat_guid)
+    associated_message_guid: str | None = None     # a reaction/tapback's TARGET message
+    associated_message_type: int | None = None     # Apple tapback code (2000-3007); 0/None = not a tapback
+    service: str | None = None                     # "iMessage" | "SMS"
+    is_edited: bool = False
+    is_unsent: bool = False
+
+
+# Apple associated_message_type -> provider-neutral tapback. 2000-2007 = added, 3000-3007 = removed.
+# ONLY verified Apple codes map; any other value in the reaction range is "unknown" (never guessed).
+_TAPBACK = {2000: "love", 2001: "like", 2002: "dislike", 2003: "laugh", 2004: "emphasis",
+            2005: "question", 2006: "sticker", 2007: "sticker"}
+
+
+def reaction_of(assoc_type: int | None) -> tuple[str | None, bool]:
+    """Map an Apple associated_message_type to (provider-neutral reaction type, removed).
+    Returns (None, False) when it isn't a tapback at all (0/None or outside 2000-3999); returns
+    ("unknown", removed) for a reaction-range code we don't recognize — we never guess a meaning."""
+    if not assoc_type or not (2000 <= assoc_type < 4000):
+        return (None, False)
+    removed = assoc_type >= 3000
+    base = assoc_type - 1000 if removed else assoc_type
+    return (_TAPBACK.get(base, "unknown"), removed)
 
 
 class Imsg(Protocol):
@@ -56,6 +81,14 @@ def parse_event(raw: dict) -> ImsgEvent:
         created_at=raw.get("created_at"),
         attachments=list(raw.get("attachments") or []),
         reply_to_guid=raw.get("reply_to_guid"),
+        thread_originator_guid=raw.get("thread_originator_guid"),
+        associated_message_guid=raw.get("associated_message_guid"),
+        associated_message_type=(int(raw["associated_message_type"])
+                                 if str(raw.get("associated_message_type") or "").strip().lstrip("-").isdigit()
+                                 else None),
+        service=raw.get("service"),
+        is_edited=bool(raw.get("is_edited") or raw.get("date_edited")),
+        is_unsent=bool(raw.get("is_unsent") or raw.get("date_retracted")),
     )
 
 
