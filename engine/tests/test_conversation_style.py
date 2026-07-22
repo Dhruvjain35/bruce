@@ -7,7 +7,7 @@ import pytest
 
 from bruce_engine.conversation_contract import RiskLevel
 from bruce_engine.conversation_style import (
-    ConversationStyleEngine, StyleViolation, VoiceProfile, assert_facts_preserved, enforce_no_dashes,
+    ConversationStyleEngine, StyleViolation, VoiceProfile, assert_facts_preserved, enforce_no_dashes, strip_redundant_offer,
 )
 
 eng = ConversationStyleEngine()
@@ -84,3 +84,28 @@ def test_repo_conversation_fixture_scan_no_em_dash_in_shipped_copy():
     """Repository-wide conversation fixture scan: no shipped message template may contain an em dash."""
     offenders = {k: v for k, v in ConversationStyleEngine().templates.items() if EM in str(v)}
     assert not offenders, f"em dash in shipped copy: {sorted(offenders)}"
+
+
+# P0.3 — em dash never ships (even on a technical-looking line) + no repetitive trailing offer
+
+def test_p0_em_dash_stripped_even_on_technical_looking_line():
+    out = eng.render("yup — use arc length = 0.5 here", protect_technical=True)
+    assert "—" not in out and "arc length = 0.5" in out
+
+
+def test_p0_redundant_generic_offer_stripped_but_tutoring_choice_kept():
+    # generic low-value closers are stripped
+    assert strip_redundant_offer("the answer is 0.54. if you want, i can do that") == "the answer is 0.54."
+    assert strip_redundant_offer("cool, that works. want me to do it") == "cool, that works."
+    # a genuine tutoring choice/next-step ADDS value -> kept
+    keep = "looks like parametric motion. want a hint or should i check your answers?"
+    assert strip_redundant_offer(keep) == keep
+
+
+def test_p0_offer_with_fact_is_not_stripped():
+    s = "done, want me to send it to admin@school.edu?"
+    assert strip_redundant_offer(s) == s
+
+
+def test_p0_offer_only_message_is_kept():
+    assert strip_redundant_offer("lmk if you want the full derivation") == "lmk if you want the full derivation"

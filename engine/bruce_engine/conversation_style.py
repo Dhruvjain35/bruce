@@ -101,6 +101,32 @@ def enforce_no_dashes(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", out).strip()
 
 
+_OFFER_RE = re.compile(
+    r"(?:^|(?<=[.?!\n]))\s*(?:if (?:you|u|ya)(?:'?d| would)?\s+(?:want|like)|want me to|"
+    r"lmk if|let me know if|if (?:you|u|ya)\s+want|should i\b|i can (?:also|help)|"
+    r"wanna|do (?:you|u) want|want (?:a|me)\b)[^.?!\n]*[.?!]?\s*$", re.IGNORECASE)
+
+
+def strip_redundant_offer(text: str) -> str:
+    """Remove a TRAILING 'want me to…' / 'if you want, i can…' offer so Bruce doesn't end every reply
+    with one. Conservative: only the final sentence, and only if it carries NO fact token (never drops a
+    number/date/price/url/@handle) and something meaningful remains before it."""
+    m = _OFFER_RE.search(text)
+    if not m:
+        return text
+    tail = text[m.start():]
+    if _fact_tokens(tail):
+        return text
+    low = tail.lower()
+    # KEEP genuine tutoring choices/next-steps (they add value); only strip a generic low-value closer.
+    if " or " in low or any(k in low for k in
+                            ("hint", "walkthrough", "walk through", "example", "practice", "step",
+                             "check your", "next problem", "harder one")):
+        return text
+    kept = text[:m.start()].rstrip()
+    return kept if kept else text
+
+
 # AUTHORITATIVE defaults live in code — the safety-critical fact-locked copy must exist in every
 # deployment regardless of whether product/*.yaml shipped. product/*.yaml is an optional human-facing
 # override (merged over these). Keeping the "never claims added" copy in code is deliberate.
@@ -185,5 +211,9 @@ class ConversationStyleEngine:
                 for ln in text.split("\n"))
         else:
             styled = self._style_segment(text, serious=serious, profile=profile)
+        # HARD channel rule: an em dash NEVER ships to a student, even on a technical/protected line
+        # (matrices/equations contain none, so this can't touch a numeric range) — the failure was a
+        # casual "= " line being treated as technical and skipping the voice pass.
+        styled = enforce_no_dashes(styled)
         assert_facts_preserved(text, styled)             # HARD invariant: never ship altered facts
         return styled
