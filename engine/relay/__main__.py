@@ -17,6 +17,7 @@ from .checkpoint import FileCheckpoint
 from .config import ConfigError, RelayConfig
 from .imsg import SubprocessImsg
 from .outbound_ledger import OutboundLedger
+from .chatdb import ChatDb
 from .pending import PendingStore
 from .relay import MISCONFIGURED_EXIT, Relay
 
@@ -37,6 +38,7 @@ def build_relay(cfg: RelayConfig) -> Relay:
         attachment_max_wait_s=cfg.attachment_max_wait_s,
         attachment_sweep_interval_s=cfg.attachment_sweep_interval_s,
         attachment_max_events=cfg.attachment_max_events,
+        chatdb=ChatDb(),                                                          # A3: exact reply-context enrichment
     )
 
 

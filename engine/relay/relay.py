@@ -22,6 +22,7 @@ import time
 from .backend import AuthError, Backend, BackendError
 from .checkpoint import FileCheckpoint
 from .imsg import Imsg, ImsgEvent, ImsgSendRejected, parse_event, reaction_of
+from .reply_context import build_reply_envelope
 from .outbound_ledger import (
     BLOCKED_BEFORE_SEND,
     HANDED_TO_IMSG,
@@ -90,10 +91,12 @@ class Relay:
                  spool_dir: str, poll_interval: float = 2.0, reconnect_delay: float = 3.0,
                  sent_ledger: FileCheckpoint | None = None, pending: PendingStore | None = None,
                  attachment_max_wait_s: float = 120.0, attachment_sweep_interval_s: float = 3.0,
-                 attachment_max_events: int = 8) -> None:
+                 attachment_max_events: int = 8, chatdb=None) -> None:
         self.imsg = imsg
         self.backend = backend
         self.checkpoint = checkpoint
+        # A3: read-only chat.db adapter for EXACT reply-context enrichment (None => enrichment disabled).
+        self.chatdb = chatdb
         # Durable at-most-once ledger of outbound ids we've already attempted to send. Guarantees a
         # reclaimed row (ack lost, lease expired, relay crashed) is NEVER sent to a real person twice.
         self.sent_ledger = sent_ledger
@@ -180,9 +183,62 @@ class Relay:
                     pass
         return out, False
 
+    async def _stage_referenced_file(self, local_path, mime, transfer_name):
+        """Stage ONE referenced attachment (A3, from chat.db) into the spool + upload it — SAME hardening
+        as inbound attachments (mime allow-list, symlink/regular/size/exe rejects). Returns upload_ref or
+        None. The local path never leaves the relay."""
+        if not local_path:
+            return None
+        path = os.path.expanduser(local_path)
+        mime = mime or ""
+        if _kind_for(mime) is None or mime not in ALLOWED_MIME:
+            return None
+        try:
+            lst = os.lstat(path)
+        except OSError:
+            return None
+        if stat.S_ISLNK(lst.st_mode):
+            return None
+        real = os.path.realpath(path)
+        if not os.path.isfile(real) or os.path.getsize(real) > MAX_ATTACHMENT_BYTES:
+            return None
+        spool = os.path.join(self.spool_dir, hashlib.sha256(("ref:" + real).encode()).hexdigest())
+        shutil.copy(real, spool)
+        try:
+            with open(spool, "rb") as f:
+                data = f.read()
+            if any(data.startswith(sig) for sig in _EXE_MAGIC):
+                return None
+            return await self.backend.upload(data, mime, transfer_name)
+        finally:
+            try:
+                os.remove(spool)
+            except OSError:
+                pass
+
+    async def _build_reply_context(self, event: ImsgEvent) -> dict | None:
+        """If the message explicitly references an earlier one, resolve that EXACT message from the local
+        chat.db and return a bounded, path-free ReplyContextEnvelope wire dict. Best-effort: any failure
+        yields None (never fails the inbound)."""
+        if self.chatdb is None:
+            return None
+        if event.reply_to_guid:
+            ref, rel = event.reply_to_guid, "reply_to"
+        elif event.thread_originator_guid:
+            ref, rel = event.thread_originator_guid, "thread_root"
+        else:
+            return None
+        try:
+            env = await build_reply_envelope(self.chatdb, current_guid=event.guid, referenced_guid=ref,
+                                             relationship_type=rel, stage_fn=self._stage_referenced_file)
+            return env.to_wire()
+        except Exception:
+            return None
+
     async def _post_and_checkpoint(self, event: ImsgEvent, atts: list[dict], *,
                                    attachment_unavailable: bool = False) -> str:
         reaction_type, reaction_removed = reaction_of(event.associated_message_type)
+        reply_context = await self._build_reply_context(event)
         resp = await self.backend.post_inbound({
             "provider_message_id": event.guid,
             "channel_identity": event.sender or "",
@@ -201,6 +257,7 @@ class Relay:
             "edited": event.is_edited,
             "unsent": event.is_unsent,
             "service": event.service,
+            "reply_context": reply_context,        # A3: bounded, path-free exact-reference envelope
             "timestamp": event.created_at,
         })
         self.checkpoint.mark(event.guid)                    # durable ack -> safe to not reprocess
