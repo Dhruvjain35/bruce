@@ -250,3 +250,85 @@ def test_enabled_for_is_async_db_backed_and_denies_by_default(clean_db, monkeypa
 
     monkeypatch.setenv("BRUCE_CONVERSATION_RUNTIME", "off")                # global hard-off overrides
     assert _run(conversation_runtime.enabled_for(uid)) is False
+
+
+# --- P0.1: an explicit reply target is AUTHORITATIVE (never answer from the newest image instead) -----
+
+class RecordingReasoner(FakeReasoner):
+    def __init__(self, decision):
+        super().__init__(decision=decision)
+        self.called = False
+        self.context = None
+        self.images = None
+
+    async def decide(self, *, text, images, context):
+        self.called = True
+        self.context = context
+        self.images = images
+        return await super().decide(text=text, images=images, context=context)
+
+
+def _reply_msg(pmid, text, *, reply_to=None, reply_context=None, attachments=None):
+    return InboundMessage(provider_message_id=pmid, channel=ChannelKind.self_hosted_imessage,
+                          channel_identity=PHONE, text=text, attachments=attachments or [],
+                          timestamp=_now(), is_group=False,
+                          reply_to_message_id=reply_to, reply_context=reply_context)
+
+
+async def _stage_upload_rt(png):
+    from bruce_engine import schema as _s
+    async with worker_session() as s:
+        up = _s.RelayUpload(content_hash="h" + uuid4().hex, media_type="image/png", data=png)
+        s.add(up); await s.flush(); return up.id
+
+
+def test_p0_reply_to_unavailable_image_fails_closed_not_from_newest(clean_db):
+    uid = uuid4(); _run(_ensure_user(uid))
+    # a newer image B is answered first, so it sits in the recent-turn window
+    _run(conversation_runtime.handle(FakeChannel(),
+        _msg("imgB", attachments=[Attachment(kind=AttachmentKind.image, media_type="image/png",
+                                              data=_PNG, filename="b.png")]),
+        user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.educational_help, ResponseType.tutoring, text="that's image b"))))
+    # now the student REPLIES to old image A (bytes not downloaded on the Mac) WITH a text question
+    env = {"resolution_source": "relay_exact_lookup", "referenced_direction": "inbound",
+           "referenced_attachment_refs": [{"available": False, "unavailable_reason": "not_downloaded"}]}
+    rec = RecordingReasoner(_decision(IntentKind.educational_help, ResponseType.tutoring, text="talking about image b"))
+    out = _run(conversation_runtime.handle(FakeChannel(),
+        _reply_msg("replyA", "wait what is b here again", reply_to="guidA", reply_context=env),
+        user_id=uid, reply_target=PHONE, reasoner=rec))
+    assert out.status == "processed"
+    assert rec.called is False                       # NEVER reasoned -> impossible to answer from image B
+    ob = _run(_outbound(uid))
+    assert "downloaded" in ob[-1].text.lower()       # honest: replied-to file isn't on the Mac yet
+
+
+def test_p0_reply_to_lost_target_asks_to_resend(clean_db):
+    uid = uuid4(); _run(_ensure_user(uid))
+    rec = RecordingReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="sure"))
+    out = _run(conversation_runtime.handle(FakeChannel(),
+        _reply_msg("r1", "what did this mean again", reply_to="totally-unknown-guid"),
+        user_id=uid, reply_target=PHONE, reasoner=rec))
+    assert out.status == "processed" and rec.called is False
+    ob = _run(_outbound(uid))
+    assert "resend" in ob[-1].text.lower()           # honest: can't pull that exact one up, resend it
+
+
+def test_p0_reply_to_available_image_feeds_it_and_drops_recent_window(clean_db):
+    uid = uuid4(); _run(_ensure_user(uid))
+    _run(conversation_runtime.handle(FakeChannel(),
+        _msg("imgB", attachments=[Attachment(kind=AttachmentKind.image, media_type="image/png",
+                                              data=_PNG, filename="b.png")]),
+        user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.educational_help, ResponseType.tutoring, text="image b stuff"))))
+    ref = _run(_stage_upload_rt(_PNG))
+    env = {"resolution_source": "relay_exact_lookup", "referenced_direction": "inbound",
+           "referenced_attachment_refs": [{"available": True, "upload_ref": str(ref), "media_type": "image/png"}]}
+    rec = RecordingReasoner(_decision(IntentKind.educational_help, ResponseType.tutoring, text="answer about A"))
+    out = _run(conversation_runtime.handle(FakeChannel(),
+        _reply_msg("replyA", "what is this one", reply_to="guidA", reply_context=env),
+        user_id=uid, reply_target=PHONE, reasoner=rec))
+    assert out.status == "processed" and rec.called is True
+    assert len(rec.images) == 1                       # the REFERENCED image A is fed to the vision pass
+    assert "image b stuff" not in (rec.context or "") # the recent-turn window (holding B) is NOT dumped
+    assert "No prior conversation" in (rec.context or "")

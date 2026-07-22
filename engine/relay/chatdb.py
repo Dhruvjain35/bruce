@@ -19,8 +19,21 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
+
+# iMessage part-prefixes on a reply/thread guid (``p:0/GUID`` reply-part, ``bp:GUID``) — these DON'T
+# appear on the bare ``message.guid`` they point at, so an exact lookup misses unless we strip them.
+_GUID_PART_PREFIX = re.compile(r"^(?:bp:|p:\d+/)")
+
+
+def _normalize_guid(guid: str | None) -> str | None:
+    """Strip an iMessage part-prefix so a reply_to_guid / thread_originator_guid matches the bare
+    ``message.guid`` it refers to. Idempotent; None-safe. No content, just a routing key."""
+    if not guid:
+        return guid
+    return _GUID_PART_PREFIX.sub("", guid.strip())
 
 _APPLE_EPOCH = 978307200            # 2001-01-01T00:00:00Z in unix seconds (Apple absolute time base)
 _MAX_ATTACHMENTS = 16              # hard bound on attachments returned for one referenced message
@@ -106,6 +119,7 @@ class ChatDb:
         """The single message row for an EXACT provider guid (+ its chat guid via the join), or None."""
         if not guid:
             return None
+        guid = _normalize_guid(guid)                    # a prefixed reply_to_guid must match the bare guid
         try:
             conn = self._connect()
             try:
@@ -129,7 +143,8 @@ class ChatDb:
         return ChatMessageRow(
             guid=r["guid"], chat_guid=r["chat_guid"], sender_handle_id=r["handle_id"],
             is_from_me=bool(r["is_from_me"]), service=r["service"], sent_at=_to_iso(r["date"]),
-            reply_to_guid=r["reply_to_guid"], thread_originator_guid=r["thread_originator_guid"],
+            reply_to_guid=_normalize_guid(r["reply_to_guid"]),
+            thread_originator_guid=_normalize_guid(r["thread_originator_guid"]),
             edited=bool(r["date_edited"]), unsent=bool(r["date_retracted"]),
             has_attachments=bool(r["cache_has_attachments"]))
 
@@ -137,6 +152,7 @@ class ChatDb:
         """The attachments EXPLICITLY joined to one message guid (bounded). local_path stays local."""
         if not guid:
             return []
+        guid = _normalize_guid(guid)                    # match the bare message.guid the reply points at
         try:
             conn = self._connect()
             try:

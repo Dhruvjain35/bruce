@@ -127,17 +127,27 @@ class _Runtime:
         capsule = await conversation_context.resolve(user_id, msg)
         images, unreadable = _prepare_images(msg)
 
-        # Replied-to attachment that isn't downloaded on the Mac yet, with nothing else to reason from ->
-        # honest ask (never claim to see content we could not resolve).
-        if (capsule.attachment_pending and not capsule.referenced_images and not images
-                and not (capsule.referenced_text or capsule.prior_answer)
-                and not (msg.text and msg.text.strip())):
-            reply = self.style.template("reply_attachment_pending")
-            await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
-                                 decision=None, intent="image_understanding")
-            return InboundOutcome(status="processed", user_id=user_id)
+        # P0.1 AUTHORITATIVE TARGET. An explicit reply target is authoritative: Bruce must answer about the
+        # EXACT message the student pointed at — never a newer/most-recent image, never unrelated recent
+        # context. So when the referenced content can't be loaded AND this message carries no standalone
+        # image of its own, fail closed with an honest, specific ask. This fires even when the student
+        # typed a question alongside the reply (the question is ABOUT the thing we could not load) — the
+        # earlier bug answered such replies from the newest image instead of admitting the miss.
+        explicit_ref = (bool(msg.reply_to_message_id or msg.thread_root_message_id)
+                        or capsule.resolution_source == conversation_context.RELAY_EXACT)
+        if not capsule.referenced_images and not images:
+            if capsule.attachment_pending:                      # replied to an image/file, not downloaded
+                reply = self.style.template("reply_attachment_pending")
+                await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                                     decision=None, intent="image_understanding")
+                return InboundOutcome(status="processed", user_id=user_id)
+            if explicit_ref and not (capsule.referenced_text or capsule.prior_answer):
+                reply = self.style.template("reply_target_unavailable")        # target lost / nothing to show
+                await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                                     decision=None, intent="image_understanding")
+                return InboundOutcome(status="processed", user_id=user_id)
 
-        images = images + capsule.referenced_images     # the referenced attachment joins the vision pass
+        images = capsule.referenced_images + images     # the referenced attachment is authoritative -> first
 
         # attachment the relay couldn't fetch OR bytes we genuinely can't open, and nothing else to go
         # on -> honest resend ask. (A healthy HEIC no longer lands here — it's normalized to JPEG above.)
@@ -147,7 +157,13 @@ class _Runtime:
                                  decision=None, intent="image_understanding")
             return InboundOutcome(status="processed", user_id=user_id)
 
-        ctx = _context(recent)
+        # P0.1: with an explicit, RESOLVED reply target, THAT is the context. Do not also dump the recent
+        # turns — that window is exactly how a newer image B leaked in and got answered instead of the
+        # replied-to image A. The referenced content (fenced as DATA below) stands on its own.
+        if explicit_ref and capsule.has_reference:
+            ctx = "No prior conversation."
+        else:
+            ctx = _context(recent)
         _ev = conversation_context.evidence_text(capsule)       # referenced content, fenced as DATA
         if _ev:
             ctx = ctx + "\n\n" + _ev
