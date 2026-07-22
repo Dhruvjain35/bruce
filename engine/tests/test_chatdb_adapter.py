@@ -162,3 +162,11 @@ def test_envelope_unavailable_when_db_unreadable(tmp_path):
     env = _run(build_reply_envelope(db, current_guid="cur1", referenced_guid="ref1",
                                     relationship_type="reply_to", stage_fn=_stage_ok))
     assert env.resolution_source == "unresolved" and env.unavailable_reason == "chatdb_missing"
+
+
+def test_reply_pointer_part_prefix_normalizes_to_bare_guid(tmp_path):
+    db = ChatDb(_make_chatdb(tmp_path))
+    # iMessage can hand us a part-prefixed reply pointer; it must resolve to the bare message.guid
+    assert db.get_message_by_guid("p:0/ref1").guid == "ref1"
+    assert db.get_message_by_guid("bp:ref1").guid == "ref1"
+    assert len(db.get_attachments_for_message_guid("p:0/ref1")) == 1

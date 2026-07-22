@@ -137,6 +137,7 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "i've kept it so you don't have to resend."),
     "could_not_read_attachment": "couldn't open that one 😕 can you resend it? (a clearer photo or the file works)",
     "reply_attachment_pending": "i can see which pic ur replying to, but the file isn't downloaded on the Bruce Mac yet. give it a sec and try again",
+    "reply_target_unavailable": "i can tell u replied to an earlier msg but i can't pull that exact one up anymore. mind resending it so i'm looking at the right thing?",
     "unsupported_capability": "can't do {capability} yet, that's not wired up on my end. i can still {alternative}.",
     "tutoring_offer": "looks like {topic}. want a hint, a full walkthrough, or should i just check your answers?",
     "needs_clarification_wrapper": "{question}",

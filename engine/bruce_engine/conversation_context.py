@@ -14,6 +14,7 @@ N messages; never mixes chats/senders/owners. Honest when a target is missing / 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from uuid import UUID
 
@@ -30,6 +31,14 @@ log = logging.getLogger("bruce.conversation")   # content-free: sources/counts o
 SERVER_GRAPH = "server_graph"
 RELAY_EXACT = "relay_exact_lookup"
 UNRESOLVED = "unresolved"
+
+# An iMessage reply pointer can arrive part-prefixed (``p:0/GUID`` / ``bp:GUID``); the stored target's
+# provider_message_id is bare, so normalize the pointer before the graph match or it silently misses.
+_GUID_PART_PREFIX = re.compile(r"^(?:bp:|p:\d+/)")
+
+
+def _normalize_ref(guid: str | None) -> str | None:
+    return _GUID_PART_PREFIX.sub("", guid.strip()) if guid else guid
 
 
 @dataclass
@@ -96,7 +105,7 @@ async def _fetch_referenced_images(env: dict) -> tuple[list[VisionInput], bool]:
 async def resolve(user_id: UUID, msg: InboundMessage) -> ContextCapsule:
     """Resolve the explicit reply target into a bounded capsule. Graph first, envelope for bytes."""
     provider = msg.channel.value
-    ref = msg.reply_to_message_id or msg.thread_root_message_id
+    ref = _normalize_ref(msg.reply_to_message_id or msg.thread_root_message_id)
     env = msg.reply_context if isinstance(msg.reply_context, dict) else None
 
     referenced_text = prior_answer = direction = None
