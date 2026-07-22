@@ -299,3 +299,34 @@ def test_downgrade_and_reupgrade_roundtrip(migrated_db):
             await c.close()
 
     assert asyncio.run(_head()) == ["0018_conversation_context_graph"], "round-trip must return to head 0018"
+
+
+# (A3 rollback compatibility) a destructive 0018 downgrade must FAIL CLOSED once the graph is populated,
+# unless BRUCE_ALLOW_GRAPH_DROP=1 explicitly authorizes it.
+def test_downgrade_blocked_when_graph_populated(migrated_db, monkeypatch):
+    import uuid as _uuid
+    dsn = migrated_db["dsn"]
+    uid = _uuid.uuid4()
+
+    async def _seed():
+        c = await _connect(user=MIGRATOR, password=MIGRATOR_PW, database=MIG_DB)
+        try:
+            async with c.transaction():
+                await c.execute("SELECT set_config('app.user_id', $1, true)", str(uid))
+                await c.execute("INSERT INTO users (id, auth_provider) VALUES ($1, 'apple')", uid)
+                await c.execute(
+                    "INSERT INTO conversation_messages (user_id, provider, provider_message_id, direction) "
+                    "VALUES ($1, 'p', 'm1', 'inbound')", uid)
+        finally:
+            await c.close()
+
+    asyncio.run(_seed())
+    monkeypatch.delenv("BRUCE_ALLOW_GRAPH_DROP", raising=False)
+    blocked = _run_alembic("downgrade", "-1", dsn=dsn)
+    assert blocked.returncode != 0, "downgrade must be blocked when the graph is populated"
+    out = (blocked.stderr + blocked.stdout).lower()
+    assert "populated" in out or "refusing" in out
+
+    monkeypatch.setenv("BRUCE_ALLOW_GRAPH_DROP", "1")
+    allowed = _run_alembic("downgrade", "-1", dsn=dsn)
+    assert allowed.returncode == 0, "explicit authorization must let the downgrade proceed:\n" + allowed.stderr[-1500:]

@@ -488,6 +488,7 @@ class RelayInboundRequest(BaseModel):
     edited: bool = False
     unsent: bool = False
     service: str | None = None                  # "iMessage" | "SMS"
+    reply_context: dict | None = None           # A3 ReplyContextEnvelope from the relay's exact chat.db lookup
     timestamp: str | None = None
 
 
@@ -541,6 +542,7 @@ async def relay_inbound(req: RelayInboundRequest, device: schema.RelayDevice = D
         channel_identity=req.channel_identity, text=req.text, attachments=atts, timestamp=ts,
         reply_to_message_id=req.reply_to_message_id, thread_id=req.chat_guid,
         thread_root_message_id=req.thread_root_message_id, service=req.service,
+        reply_context=req.reply_context,
         is_group=req.is_group, attachment_unavailable=req.attachment_unavailable)
     outcome = await messaging_inbound.handle_inbound(messaging_outbound.QueueChannel(), msg)
     # Once the durable source has the bytes (processed), clear the staged upload copies.
