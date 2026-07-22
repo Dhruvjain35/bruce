@@ -1,0 +1,16 @@
+# Integration-owned shared contracts (D-INT-4, invariant 3): changes to these files touch cross-workstream
+# contracts or the migration chain, so they require integration-owner review before merge. Workstreams add
+# handler / adapter / query modules; they do not edit these directly without integration-owner sign-off.
+
+/engine/bruce_engine/schema.py                 @Dhruvjain35
+/engine/migrations/                            @Dhruvjain35
+/engine/bruce_engine/conversation_runtime.py   @Dhruvjain35
+/engine/bruce_engine/conversation_contract.py  @Dhruvjain35
+/engine/bruce_engine/conversation_context.py   @Dhruvjain35
+/engine/bruce_engine/conversation_outcomes.py  @Dhruvjain35
+/engine/bruce_engine/handoff.py                @Dhruvjain35
+/engine/bruce_engine/messaging.py              @Dhruvjain35
+/engine/bruce_engine/messaging_inbound.py      @Dhruvjain35
+/engine/bruce_engine/messaging_outbound.py     @Dhruvjain35
+/product/capabilities.yaml                     @Dhruvjain35
+/.github/                                       @Dhruvjain35
