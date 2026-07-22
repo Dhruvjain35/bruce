@@ -1,0 +1,29 @@
+name: CI auto-rerun (infra-only)
+
+# Lightweight resilience (integration invariant 6): if a CI run is CANCELLED — which is what a stuck
+# runner / job-timeout produces — rerun it ONCE automatically. A genuine test failure concludes
+# 'failure' (not 'cancelled'), so this NEVER masks a real red: tests are never skipped or weakened.
+# ci.yml deliberately has no concurrency-cancel, so 'cancelled' does not come from a superseding push.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  rerun-once:
+    # only an infra-signal cancellation, and only the first attempt (never a rerun loop)
+    if: >-
+      github.event.workflow_run.conclusion == 'cancelled' &&
+      github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rerun the cancelled CI run once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "CI run ${{ github.event.workflow_run.id }} concluded 'cancelled' on attempt ${{ github.event.workflow_run.run_attempt }} (stuck runner / timeout) — rerunning once."
+          gh run rerun ${{ github.event.workflow_run.id }} --repo ${{ github.repository }}

@@ -8,6 +8,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Backstop against a stuck runner / hung test (a normal run is ~3 min): the job is cancelled at 20
+    # min instead of hanging for hours. A hung TEST fails faster via the per-test timeout below.
+    timeout-minutes: 20
     # Real PostgreSQL 16 — the isolation/durability gate runs from a clean database on every PR.
     services:
       postgres:
@@ -37,7 +40,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install -r requirements.txt
+      # pip/network is the flaky-infra step; retry it (NOT the test step — tests are never masked).
+      - name: Install deps (retry infra flakiness)
+        run: |
+          for i in 1 2 3; do
+            pip install -r requirements.txt pytest-timeout && break
+            echo "pip install attempt $i failed; retrying in 5s"; sleep 5
+          done
       # Full suite: offline unit tests + real-Postgres adversarial integration tests.
       # The conftest fixture provisions/migrates a disposable bruce_test db and the bruce_app role.
-      - run: python -m pytest -q
+      #   --timeout=180  : a single test may never run >180s (all real tests are <10s). A HUNG test now
+      #                    FAILS with a full thread stack dump (thread method) instead of hanging the job.
+      #                    This does NOT weaken tests — it bounds them, and names the culprit on a hang.
+      #   --durations=25 : slowest-test visibility; junit report uploaded below for duration tracking.
+      - name: Run tests
+        run: python -m pytest -q --timeout=180 --timeout-method=thread --durations=25 --junitxml=pytest-report.xml
+      - name: Upload test-duration report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: engine/pytest-report.xml
+          if-no-files-found: warn
