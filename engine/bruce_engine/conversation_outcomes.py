@@ -28,7 +28,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from uuid import UUID
 
-from . import handoff
+from . import handoff, mission_kernel
 
 if TYPE_CHECKING:
     from .conversation_context import ContextCapsule
@@ -108,6 +108,7 @@ class HandlerOutput:
     text: str
     styled: bool = True                # False = fact-locked copy -> runtime skips voice styling
     event_candidate_id: UUID | None = None
+    mission_id: UUID | None = None
 
 
 @dataclass
@@ -116,6 +117,7 @@ class ResolvedReply:
     reply: str
     handler: str
     event_candidate_id: UUID | None = None
+    mission_id: UUID | None = None
 
 
 @dataclass
@@ -145,28 +147,64 @@ class OutcomeHandler(Protocol):
 # Handlers
 # --------------------------------------------------------------------------------------------------
 class MissionHandoffHandler:
-    """Telemetry-only in D-INT-3 (invariant 2). Runs the DETERMINISTIC handoff policy and records what it
-    decided (privacy-safe), creates NO state, and DECLINES — the normal reply flow proceeds unchanged.
-    The mission kernel (workstream A) will later flip this to CLAIM + create a durable Mission, consuming
-    HandoffDecision.authorizes_mutation. Its evaluate() is pure: a hallucinated model needs_mission cannot
-    make it claim or mutate."""
-    name = "mission_handoff"
-    priority = 60                      # above event-candidate: once it CLAIMS, a handoff outranks an event
+    """A1: on an AUTHORIZED handoff, CLAIM the outcome and create ONE durable Mission (capture/track only —
+    no external action), then acknowledge. Otherwise DECLINE (telemetry only), leaving the normal reply
+    flow unchanged. evaluate() is PURE — it runs the deterministic policy but mutates nothing, so a
+    hallucinated model needs_mission can never make it claim: only the user's explicit handoff to a
+    supported capability sets authorizes_mutation, and only that CLAIMS.
 
-    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+    A1's supported capability is durable CAPTURE itself (tracking the handoff with its source + attachment
+    + goal linked), which is inherently low-risk and takes no external action. EXECUTING a specific
+    capability is a later, separately-gated phase."""
+    name = "mission_handoff"
+    priority = 60                      # above event-candidate: an authorized handoff outranks an event
+
+    _CAPTURE_CAPABILITY = "student_task_capture"
+
+    def _decide(self, octx: OutcomeContext) -> handoff.HandoffDecision:
+        """PURE deterministic decision — called by both evaluate() and execute() so the two agree."""
         d = octx.decision
         inp = handoff.HandoffInputs(
             user_text=octx.msg.text,
             model_needs_mission=getattr(d, "needs_mission", False),
             model_proposed_goal=getattr(d, "proposed_goal", None),
             model_suggested_capability=(d.required_capabilities[0] if d.required_capabilities else None),
-            capability_supported=False,          # D-INT-3: no mission capability is wired yet
+            capability_supported=True,           # A1: durable capture/tracking is always supported
+            risk="low", reversible=True,         # capture takes no external action -> inherently low-risk
             confidence=d.confidence)
-        decision = handoff.decide_handoff(inp)
-        # telemetry-only + mutation-free: never claim, never block -> let the reply flow proceed.
+        return handoff.decide_handoff(inp)
+
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+        decision = self._decide(octx)
+        tel = {**decision.telemetry(),
+               "model_needs_mission": getattr(octx.decision, "needs_mission", False)}
+        if decision.authorizes_mutation:         # ONLY an authorized explicit handoff claims + mutates
+            return HandlerVerdict(disposition=Disposition.claim, priority=self.priority,
+                                  reason=decision.reason, telemetry=tel)
+        # answer_only / remember_context / propose_mission / request_decision / unsupported -> no state
         return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
-                              reason="telemetry_only_stub",
-                              telemetry={**decision.telemetry(), "model_needs_mission": inp.model_needs_mission})
+                              reason=decision.reason, telemetry=tel)
+
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        decision = self._decide(octx)
+        assert decision.authorizes_mutation, "execute() reached without authorization"   # defense in depth
+        d = octx.decision
+        goal_text = (d.proposed_goal or (octx.msg.text or "").strip() or "this")[:120]
+        attachment_refs = [{"media_type": getattr(a, "media_type", None),
+                            "filename": getattr(a, "filename", None)} for a in octx.msg.attachments]
+        evidence = {"reply_to_message_id": getattr(octx.msg, "reply_to_message_id", None),
+                    "has_referenced_context": bool(
+                        getattr(octx.capsule, "referenced_text", None)
+                        or getattr(octx.capsule, "prior_answer", None)
+                        or getattr(octx.capsule, "referenced_images", None))}
+        result = await mission_kernel.create_handoff_mission(
+            octx.user_id, capability=self._CAPTURE_CAPABILITY, source_message_id=octx.pmid,
+            proposed_goal=goal_text, short_status=f"tracking: {goal_text}",
+            autonomy=str(getattr(d, "autonomy", "A0") or "A0"), risk="low",
+            attachment_refs=attachment_refs, evidence=evidence)
+        # fact-locked ack: says WHAT Bruce is taking on + WHEN it will interrupt; never claims it acted.
+        reply = octx.style.template("mission_handoff_ack", what=goal_text)
+        return HandlerOutput(text=reply, styled=False, mission_id=result.mission_id)
 
 
 class EventCandidateHandler:

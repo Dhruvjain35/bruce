@@ -142,6 +142,7 @@ DEFAULT_TEMPLATES: dict[str, str] = {
     "tutoring_offer": "looks like {topic}. want a hint, a full walkthrough, or should i just check your answers?",
     "needs_clarification_wrapper": "{question}",
     "mission_started_no_push": "on it: {what}. i'll have it ready next time you check in.",
+    "mission_handoff_ack": "gotchu, i've got {what} from here. i won't do anything that needs your ok without asking first, and i'll only ping you when i actually need your call.",
 }
 DEFAULT_PROFILES: dict = {"base": {"register": "lowercase", "max_bubble_chars": 320, "result_first": True}}
 

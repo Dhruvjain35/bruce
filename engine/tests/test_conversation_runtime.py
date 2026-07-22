@@ -371,15 +371,61 @@ def test_outcome_collision_degrades_user_to_safe_reply(clean_db):
     assert len(ob) == 1 and ob[-1].text                    # but the user still got a safe reply
 
 
-def test_explicit_handoff_phrase_is_telemetry_only_no_state(clean_db):
-    # "take this from here" must NOT create a mission/event in D-INT-3 — it just gets a normal styled reply
+async def _missions(uid):
+    async with user_session(uid) as s:
+        return (await s.execute(select(schema.Mission).where(schema.Mission.user_id == uid))).scalars().all()
+
+
+async def _phase_events(uid, mission_id):
+    async with user_session(uid) as s:
+        return (await s.execute(select(func.count()).select_from(schema.MissionPhaseEvent).where(
+            schema.MissionPhaseEvent.mission_id == mission_id))).scalar_one()
+
+
+def test_a1_explicit_handoff_creates_one_durable_mission_links_source_and_acks(clean_db):
+    # THE acceptance: reply to a flyer "take this from here" -> one durable mission, source+attachment
+    # linked, one initial phase event, no external action, exactly one honest ack.
+    uid = uuid4(); _run(_ensure_user(uid))
+    img = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG, filename="flyer.png")
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("flyer1", text="take this from here", attachments=[img]),
+        user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer,
+                                        text="whatever the model said", needs_mission=True))))
+    assert out.status == "processed"
+    missions = _run(_missions(uid))
+    assert len(missions) == 1                              # one durable mission
+    m = missions[0]
+    assert m.kind == "handoff" and m.phase == "understanding"
+    assert m.goal["source_message_ids"] == ["flyer1"]     # exact source linked
+    assert m.goal["source_attachment_refs"][0]["filename"] == "flyer.png"   # attachment linked
+    assert _run(_phase_events(uid, m.id)) == 1            # one initial phase event
+    ec, ij, at = _run(_counts(uid))
+    assert ec == 0                                         # it's a mission, not an event candidate
+    ob = _run(_outbound(uid))
+    assert len(ob) == 1                                   # exactly one outbound
+    assert "the model said" not in ob[-1].text            # the ack is fact-locked, not the model freeform
+
+
+def test_a1_redelivery_does_not_create_a_second_mission(clean_db):
+    uid = uuid4(); _run(_ensure_user(uid))
+    d = _decision(IntentKind.casual, ResponseType.direct_answer, text="x", needs_mission=True)
+    first = _run(conversation_runtime.handle(FakeChannel(), _msg("h9", text="handle this for me"),
+                                             user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(d)))
+    dup = _run(conversation_runtime.handle(FakeChannel(), _msg("h9", text="handle this for me"),
+                                           user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(d)))
+    assert first.status == "processed" and dup.status == "duplicate"
+    assert len(_run(_missions(uid))) == 1                  # redelivery referenced, never duplicated
+
+
+def test_a1_no_explicit_handoff_creates_no_mission(clean_db):
+    # a plain question with a hallucinated needs_mission must NOT create a mission
     uid = uuid4(); _run(_ensure_user(uid))
     out = _run(conversation_runtime.handle(
-        FakeChannel(), _msg("h1", text="take this from here"), user_id=uid, reply_target=PHONE,
+        FakeChannel(), _msg("q1", text="what's 8x7"), user_id=uid, reply_target=PHONE,
         reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer,
-                                        text="gotchu", needs_mission=True))))
+                                        text="56", needs_mission=True))))
     assert out.status == "processed"
-    ec, ij, at = _run(_counts(uid))
-    assert ec == 0                                         # no event candidate, no mission — mutation-free
+    assert len(_run(_missions(uid))) == 0                  # no explicit handoff -> no state
     ob = _run(_outbound(uid))
-    assert len(ob) == 1 and "gotchu" in ob[-1].text.lower()
+    assert len(ob) == 1 and "56" in ob[-1].text            # the model's normal reply, styled

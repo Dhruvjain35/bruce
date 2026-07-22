@@ -143,3 +143,10 @@ def test_default_pipeline_shape():
     # explicit priorities: handoff outranks event; fallback is lowest and never a claim
     assert co.MissionHandoffHandler().priority > co.EventCandidateHandler().priority
     assert co.DefaultReplyHandler().priority == 0
+
+
+def test_mission_handoff_claims_on_explicit_authorized_handoff():
+    # A1: an explicit handoff to the (always-supported) capture capability CLAIMS + authorizes mutation
+    d = _decision(text="take this from here", needs_mission=True)
+    v = _run(co.MissionHandoffHandler().evaluate(_octx(d, text="take this from here")))
+    assert v.disposition == co.Disposition.claim and v.telemetry["authorizes_mutation"] is True

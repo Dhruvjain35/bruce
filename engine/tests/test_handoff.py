@@ -15,9 +15,11 @@ from bruce_engine.handoff import (
 
 def test_explicit_language_detection():
     for yes in ("take this from here", "can u handle this for me", "keep following up pls",
-                "did that actually go through?", "only bother me when you need my call"):
+                "make sure this gets done", "only bother me when you need my call"):
         assert has_explicit_handoff_language(yes)
-    for no in ("what's 8x7", "thanks!", "can you explain this problem", "add this to my calendar", None):
+    # status-check phrases are NOT creation-handoff language (they read an existing mission, never create)
+    for no in ("what's 8x7", "thanks!", "can you explain this problem", "add this to my calendar",
+               "did that actually go through?", None):
         assert not has_explicit_handoff_language(no)
 
 
@@ -67,25 +69,27 @@ def test_explicit_supported_low_confidence_requires_decision():
     assert d.action is HandoffAction.request_decision and d.authorizes_mutation is False
 
 
-def test_explicit_supported_acceptable_no_protocol_proposes():
+def test_explicit_supported_acceptable_authorizes_mutation_even_without_a_named_protocol():
+    # A1: the explicit handoff itself authorizes CREATING a durable (non-executing) mission
     d = decide_handoff(HandoffInputs(user_text="take this from here", capability_supported=True,
                                      risk="low", reversible=True, confidence=0.8))
-    assert d.action is HandoffAction.propose_mission and d.authorizes_mutation is False
+    assert d.action is HandoffAction.create_mission_under_protocol and d.authorizes_mutation is True
 
 
-def test_only_a_matching_protocol_can_authorize_mutation():
-    d = decide_handoff(HandoffInputs(user_text="take this from here", capability_supported=True,
-                                     risk="low", reversible=True, confidence=0.8, has_matching_protocol=True))
-    assert d.action is HandoffAction.create_mission_under_protocol
-    assert d.authorizes_mutation is True                   # the ONLY path that authorizes mutation
+def test_protocol_changes_the_reason_not_the_authority():
+    with_p = decide_handoff(HandoffInputs(user_text="take this from here", capability_supported=True,
+                                          risk="low", reversible=True, confidence=0.8, has_matching_protocol=True))
+    without_p = decide_handoff(HandoffInputs(user_text="take this from here", capability_supported=True,
+                                             risk="low", reversible=True, confidence=0.8))
+    assert with_p.authorizes_mutation and without_p.authorizes_mutation   # both authorize CREATION
+    assert with_p.reason != without_p.reason                              # a named protocol only annotates it
 
 
-def test_authorizes_mutation_requires_all_of_explicit_supported_lowrisk_reversible_confident_protocol():
-    # remove any single precondition -> never authorizes mutation
+def test_authorizes_mutation_requires_explicit_supported_lowrisk_reversible_confident():
+    # drop any single precondition (protocol is NOT one of them) -> never authorizes mutation
     base = dict(user_text="take this from here", capability_supported=True, risk="low",
-                reversible=True, confidence=0.8, has_matching_protocol=True)
+                reversible=True, confidence=0.8)
     assert decide_handoff(HandoffInputs(**base)).authorizes_mutation is True
     for override in (dict(user_text="just curious"), dict(capability_supported=False),
-                     dict(risk="high"), dict(reversible=False), dict(confidence=0.2),
-                     dict(has_matching_protocol=False)):
+                     dict(risk="high"), dict(reversible=False), dict(confidence=0.2)):
         assert decide_handoff(HandoffInputs(**{**base, **override})).authorizes_mutation is False
