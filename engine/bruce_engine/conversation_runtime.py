@@ -172,18 +172,30 @@ class _Runtime:
         return InboundOutcome(status="processed", user_id=user_id)
 
     def _present(self, text: str, *, decision: ConversationDecision, profile, channel: str) -> str:
-        """Channel-aware presentation. For plain-text channels (iMessage/SMS): LaTeX/Markdown ->
-        readable plain text/Unicode (fact-equivalence-guarded), then voice styling that leaves
-        technical lines verbatim, then a HARD gate so no raw TeX/Markdown ever ships. Presentation
-        only — every value/sign/entry is preserved. Non-plain channels pass through unstyled math."""
+        """Channel-aware presentation = humanity styling THEN trust safety gates (D-INT-2 seam).
+
+        Split so conversation-humanity (voice/rendering) and trust-evals (channel/fact safety) edit
+        DISJOINT methods instead of colliding on one function. Presentation only — every value/sign/
+        entry is preserved. Order is load-bearing: style first (may emit an em dash / a redundant offer),
+        gates second (guarantee they never ship)."""
+        styled = self._style(text, decision=decision, profile=profile, channel=channel)
+        return self._apply_safety_gates(styled, decision=decision, channel=channel)
+
+    def _style(self, text: str, *, decision: ConversationDecision, profile, channel: str) -> str:
+        """conversation-humanity owned. LaTeX/Markdown -> readable plain text/Unicode (fact-equivalence-
+        guarded), then voice styling that leaves technical lines verbatim. Non-plain channels pass
+        through unstyled math. Adds no safety guarantee — that is _apply_safety_gates' job."""
         readable = technical_render.render_for_channel(text, channel=channel)
-        styled = self.style.render(readable, risk_level=decision.risk_level, profile=profile,
-                                   protect_technical=True)
+        return self.style.render(readable, risk_level=decision.risk_level, profile=profile,
+                                 protect_technical=True)
+
+    def _apply_safety_gates(self, styled: str, *, decision: ConversationDecision, channel: str) -> str:
+        """trust-evals owned. Deterministic guarantees applied AFTER styling, never trusting the model or
+        the voice pass to comply: no raw TeX/Markdown reaches a plain-text channel (last-resort re-clean),
+        no redundant trailing 'want me to…' offer on a non-serious reply, and no em dash EVER. Fact-
+        preserving (matrices contain no em dash)."""
         if channel in technical_render.PLAIN_TEXT_CHANNELS and technical_render.forbidden_tokens(styled):
             styled = technical_render.render_for_channel(styled, channel=channel)   # last-resort re-clean
-        # P0.3 deterministic channel guarantees (after the style model, never trusting it to comply):
-        #   - drop a redundant trailing "want me to…" offer for casual/tutoring replies;
-        #   - HARD-guarantee no em dash ever ships (fact-preserving; matrices contain none).
         if decision.risk_level not in (RiskLevel.sensitive, RiskLevel.high):
             styled = strip_redundant_offer(styled)
         styled = enforce_no_dashes(styled)
