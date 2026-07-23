@@ -1,0 +1,68 @@
+"""I0.6 — real Google OAuth routes: auth required, honest degradation when uncredentialed, no leaks.
+
+These cover the route wiring + the not-configured / bad-input paths (no credentials, no DB round-trip). The
+live authorize->callback->token-store flow is live-verified once GOOGLE_CLIENT_ID/SECRET land (it can't be
+faked, per the no-fake-integrations rule).
+"""
+
+from __future__ import annotations
+
+import time
+from uuid import uuid4
+
+import jwt
+import pytest
+from fastapi.testclient import TestClient
+
+import bruce_engine.api as api
+
+SECRET = "test-secret-at-least-32-bytes-long-1234"
+client = TestClient(api.app)
+
+
+@pytest.fixture(autouse=True)
+def _env(monkeypatch):
+    monkeypatch.setenv("BRUCE_JWT_SECRET", SECRET)
+    monkeypatch.delenv("BRUCE_JWKS_URL", raising=False)
+    monkeypatch.delenv("BRUCE_JWT_AUDIENCE", raising=False)
+    # UNcredentialed: is_configured() must be False so we test honest degradation, never a fake
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+
+
+def _auth(uid=None):
+    tok = jwt.encode({"sub": str(uid or uuid4()), "exp": int(time.time()) + 3600}, SECRET, algorithm="HS256")
+    return {"Authorization": f"Bearer {tok}"}
+
+
+def test_status_requires_auth():
+    assert client.get("/v1/integrations/google/status").status_code in (401, 403)
+
+
+def test_status_reports_credential_blocked_when_unconfigured():
+    r = client.get("/v1/integrations/google/status", headers=_auth())
+    assert r.status_code == 200
+    assert r.json()["connection_status"] == "credential_blocked"
+
+
+def test_connect_503_when_unconfigured():
+    r = client.get("/v1/integrations/google/connect", headers=_auth(), follow_redirects=False)
+    assert r.status_code == 503 and r.json()["detail"]["error"] == "google_not_configured"
+
+
+def test_connect_requires_auth():
+    assert client.get("/v1/integrations/google/connect", follow_redirects=False).status_code in (401, 403)
+
+
+def test_callback_missing_state_is_honest_error_no_leak():
+    # no user auth on the callback BY DESIGN; a missing/invalid state -> honest 400 page, no state/code echoed
+    r = client.get("/v1/integrations/google/callback")
+    assert r.status_code == 400
+    body = r.text.lower()
+    assert "couldn't connect google" in body
+    assert "state" not in body and "code" not in body and "token" not in body
+
+
+def test_callback_consent_denied_is_honest_error():
+    r = client.get("/v1/integrations/google/callback", params={"error": "access_denied"})
+    assert r.status_code == 400 and "couldn't connect" in r.text.lower()

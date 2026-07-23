@@ -23,6 +23,7 @@ from enum import Enum
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select as sa_select
 from sqlalchemy import text as sa_text
@@ -33,6 +34,7 @@ from . import calendar_build
 from . import conversation_graph
 from . import extraction
 from . import intake_store
+from . import oauth_google
 from . import internal_test
 from . import messaging_inbound
 from . import messaging_outbound
@@ -406,6 +408,64 @@ async def disconnect_messaging_identity(identity_id: UUID, user: AuthenticatedUs
     if not ok:
         raise HTTPException(status_code=404, detail="identity not found")
     return {"disconnected": True}
+
+
+# ---------------------------------------------------------- Integrations: real Google OAuth (I0.6)
+# The OAuth exchange, single-use/expiring/PKCE-validated state, and encrypted token storage all live in
+# oauth_google.py (already secure). These routes are the self-serve connect/callback/revoke/status surface.
+# Nothing here is live until GOOGLE_CLIENT_ID/SECRET + BRUCE_ENCRYPTION_KEY are set (is_configured()).
+_log = logging.getLogger("bruce.api")
+
+
+def _oauth_page(title: str, body: str) -> str:
+    return (f"<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{title}</title><body style='font-family:-apple-system,system-ui;max-width:32rem;"
+            f"margin:4rem auto;padding:0 1.5rem;text-align:center'><h2>{title}</h2><p>{body}</p></body>")
+
+
+@app.get("/v1/integrations/google/connect")
+async def google_connect(user: AuthenticatedUser = Depends(current_user)):
+    """Start the real Google authorization for the signed-in user -> 302 to Google's consent screen."""
+    if not oauth_google.is_configured():
+        raise HTTPException(status_code=503, detail={"error": "google_not_configured"})
+    auth_url = await oauth_google.start_authorization(user.user_id)
+    return RedirectResponse(auth_url, status_code=302)
+
+
+@app.get("/v1/integrations/google/callback")
+async def google_callback(state: str | None = None, code: str | None = None, error: str | None = None):
+    """Google redirects the browser here. NO user auth by design — the single-use `state` row (validated +
+    consumed inside handle_callback) IS the identity binding. On success the encrypted refresh token is
+    stored. Never leaks state/code/token; failures render an honest, content-free page."""
+    try:
+        await oauth_google.handle_callback(state=state, code=code, error=error)
+    except oauth_google.OAuthError:
+        _log.info("google_oauth_callback_failed")            # content-free: no state/code/reason
+        return HTMLResponse(_oauth_page("couldn't connect google",
+                            "something went wrong connecting your google account. head back to bruce and try again."),
+                            status_code=400)
+    return HTMLResponse(_oauth_page("google connected ✅",
+                        "you're connected. head back to imessage — bruce can add events to your calendar now."))
+
+
+@app.post("/v1/integrations/google/revoke")
+async def google_revoke(user: AuthenticatedUser = Depends(current_user)) -> dict[str, bool]:
+    """Revoke at Google AND delete the stored credential locally (idempotent)."""
+    ok = await oauth_google.disconnect(user.user_id)
+    return {"revoked": ok}
+
+
+@app.get("/v1/integrations/google/status")
+async def google_status(user: AuthenticatedUser = Depends(current_user)) -> dict[str, str | None]:
+    """Honest connection status for the connect UI (item 13): credential_blocked | connect | reconnect | connected."""
+    if not oauth_google.is_configured():
+        return {"provider": "google_calendar", "connection_status": "credential_blocked", "account": None}
+    integ = await oauth_google.get_integration(user.user_id)
+    if integ is None:
+        return {"provider": "google_calendar", "connection_status": "connect", "account": None}
+    if getattr(integ, "revoked_at", None) is not None:
+        return {"provider": "google_calendar", "connection_status": "reconnect", "account": integ.provider_account_id}
+    return {"provider": "google_calendar", "connection_status": "connected", "account": integ.provider_account_id}
 
 
 # ------------------------------------------------------- Relay boundary (self-hosted iMessage — Alpha)
