@@ -667,3 +667,18 @@ def test_text_only_timed_event_executes_directly_no_offer(clean_db, monkeypatch)
     assert ("✅" in ob[-1].text) or ("on ur calendar" in reply)
     ms = _run(_missions(uid))
     assert len(ms) == 1 and ms[0].status == "succeeded" and ms[0].goal["capability"] == "calendar.create_event"
+
+
+def test_user_timezone_statement_is_captured_and_confirmed(clean_db):
+    # THE "i'm in cst" fix: the statement is stored as canonical IANA and confirmed — no longer just
+    # acknowledged-and-forgotten. Applies to new events (world_state.resolve_timezone reads it).
+    uid = uuid4(); _run(_ensure_user(uid))
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("tz1", text="yo i'm in cst time zone gng"),
+        user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="ok"))))
+    assert out.status == "processed"
+    from bruce_engine import world_state
+    assert _run(world_state.get_timezone(uid)) == "America/Chicago"
+    reply = _run(_outbound(uid))[-1].text.lower()
+    assert "central" in reply and "america/chicago" in reply

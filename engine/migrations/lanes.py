@@ -17,6 +17,7 @@ MIGRATION_LANES: dict[str, str] = {
     "0019": "integration-oauth",   # oauth_states tenant_or_worker RLS (real Google callback fix)
     "0020": "school-command",
     "0021": "humanity",
+    "0022": "runtime",             # general agent runtime lane opener: user_world_state (R3)
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the

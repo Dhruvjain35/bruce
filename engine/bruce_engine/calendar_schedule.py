@@ -210,7 +210,7 @@ DEFAULT_TZ = "America/Los_Angeles"          # TODO: source from the user's profi
 
 def build_calendar_event(
     decision: "ConversationDecision", *, source: str | None = None,
-    message_text: str | None = None, now: "_dt.datetime | None" = None,
+    message_text: str | None = None, now: "_dt.datetime | None" = None, tz: str | None = None,
 ) -> CalendarEvent | None:
     """Turn a grounded event into a CalendarEvent via the universal TemporalResolver, or None if no time
     info is resolvable anywhere (honest: ask, never guess).
@@ -225,13 +225,13 @@ def build_calendar_event(
     from .conversation_outcomes import _event_fields
 
     title, _when, where, _prov = _event_fields(decision)
+    zone = tz or DEFAULT_TZ                       # the user's stored IANA tz (UserWorldState) when known
     # Anchor relative expressions ("4 days from now", "today") on the SEND time in the user's local zone,
-    # not the server clock — a UTC now would slip the day near midnight. (tz still DEFAULT_TZ until the
-    # per-user UserWorldState timezone lands; the anchor instant is already correct.)
+    # not the server clock — a UTC now would slip the day near midnight.
     if now is None:
-        now = _dt.datetime.now(ZoneInfo(DEFAULT_TZ))
+        now = _dt.datetime.now(ZoneInfo(zone))
     elif now.tzinfo is not None:
-        now = now.astimezone(ZoneInfo(DEFAULT_TZ))
+        now = now.astimezone(ZoneInfo(zone))
 
     # A year seen in the title/summary anchors a date phrase that omits it (a flyer's "Aug 1-2").
     year_ctx = ""
@@ -275,7 +275,7 @@ def build_calendar_event(
         except ValueError:
             offset_aware = False
         return CalendarEvent(title=title, start=timed.start, end=timed.end, location=where or None,
-                             timezone=None if offset_aware else DEFAULT_TZ, source=source, tentative=False)
+                             timezone=None if offset_aware else zone, source=source, tentative=False)
     if day_starts:
         start = min(day_starts)
         end_excl = max(day_lasts) + _dt.timedelta(days=1)     # Google exclusive end
