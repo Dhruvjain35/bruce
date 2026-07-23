@@ -69,8 +69,8 @@ integrations:
     official_api_available: true
     auth_type: oauth2_pkce
     supported_account_types: [personal, workspace_edu]
-    scopes: ["https://www.googleapis.com/auth/calendar.events"]
-    connection_status: credential_blocked        # oauth_google + calendar_adapter exist; GOOGLE_* unset
+    scopes: ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/calendar.events"]
+    connection_status: connected                  # a real founder account is authorized + live-verified (encrypted refresh token, live access-token fetch OK)
     autonomy_ceiling: A2                          # create/update with a confirmation gate for new invitees
     risk: medium
     reversibility: reversible                     # events can be updated/deleted
@@ -83,22 +83,25 @@ integrations:
     browser_fallback_status: not_needed
     normalized_entities: [Event, ScheduleEvent]
     events: [event_changed]
-    privacy_notes: "narrow calendar.events scope only; no full-account read"
+    privacy_notes: "narrow calendar.events write scope + read-only openid/userinfo.email for account identity; no full-account read"
     retention_notes: "store provider event id + url + evidence, not the full event body"
-    test_coverage: [engine/tests/test_calendar_adapter*.py]
-    deployed_commit: null
-    live_verification: false
+    test_coverage: [engine/tests/test_calendar_adapter*.py, engine/tests/test_calendar_schedule*.py, engine/tests/test_google_calendar_contract.py]
+    deployed_commit: null                         # set to the merge SHA on deploy of the schedule milestone
+    live_verification: true                       # the CONNECTION is live-verified; a live WRITE is not yet (see create_event)
     actions:
-      - {id: search_events,        status: credential_blocked, classes: [read]}
-      - {id: check_availability,   status: credential_blocked, classes: [read]}
-      - {id: create_event,         status: credential_blocked, classes: [write, execute, verify]}
-      - {id: update_event,         status: credential_blocked, classes: [write, execute, verify]}
-      - {id: delete_event,         status: credential_blocked, classes: [write, execute, verify]}
+      - {id: search_events,        status: planned, classes: [read], note: "no events.list adapter yet"}
+      - {id: check_availability,   status: planned, classes: [read], note: "no freebusy adapter yet"}
+      # real self-serve OAuth + real GoogleCalendarAdapter + real read-back verify + operation graph are
+      # built, deployed, and bound to the connected account. NOT live_write_verified until a real event is
+      # created + fetched back on the founder account AND visually confirmed in Google Calendar.
+      - {id: create_event,         status: real_connected, classes: [write, execute, verify], note: "pending live_write_verified via live acceptance"}
+      - {id: update_event,         status: real_connected, classes: [write, execute, verify]}
+      - {id: delete_event,         status: real_connected, classes: [write, execute, verify]}
       - {id: detect_conflicts,     status: planned, classes: [read]}
       - {id: invite_attendees,     status: planned, classes: [write], note: "new-recipient approval gate"}
       - {id: recurring_events,     status: planned, classes: [write]}
-      - {id: provider_confirmation,status: credential_blocked, classes: [verify]}
-    known_limitations: "edu workspace admins can disable third-party calendar API; per-account"
+      - {id: provider_confirmation,status: real_connected, classes: [verify], note: "read-back get(event_id) implemented + real"}
+    known_limitations: "edu workspace admins can disable third-party calendar API; per-account. With calendar.events-only connections the account email is learned from the created event's organizer on first write (proven: identity endpoints 401/403 without userinfo.email)."
 
   - integration_id: gmail
     display_name: Gmail

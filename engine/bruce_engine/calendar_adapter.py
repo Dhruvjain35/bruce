@@ -106,7 +106,15 @@ class VerificationResult:
         }
 
 
-def deterministic_event_id(user_id: UUID, mission_id: UUID, event: CalendarEvent) -> str:
+def deterministic_event_id(
+    user_id: UUID,
+    mission_id: UUID,
+    event: CalendarEvent,
+    *,
+    provider_account: str | None = None,
+    source_message_id: str | None = None,
+    attachment_digest: str | None = None,
+) -> str:
     """A stable, provider-legal id for this exact (user, mission, event).
 
     Google requires base32hex: characters a-v and 0-9 only, length 5-1024. We base32hex-encode a
@@ -114,9 +122,17 @@ def deterministic_event_id(user_id: UUID, mission_id: UUID, event: CalendarEvent
 
     Identity includes title+start (not the whole object) so that re-running the SAME proposal is a
     retry, while a genuinely edited proposal (different time) is a genuinely different event rather
-    than a silent no-op that would leave the student with the old time.
+    than a silent no-op that would leave the student with the old time. The idempotency key the
+    schedule flow needs is owner + source message + attachment digest + provider account + the
+    normalized details, so those are folded in WHEN supplied — a redelivery of the same flyer to the
+    same connected account derives the SAME id (Google 409 -> verify, never a duplicate), while the
+    same flyer sent to a DIFFERENT connected account is a different event, never silently merged.
+
+    The extra components are appended only when present, so the id is unchanged for legacy callers.
     """
-    raw = f"{user_id}|{mission_id}|{event.title}|{event.start}".encode("utf-8")
+    base = f"{user_id}|{mission_id}|{event.title}|{event.start}"
+    extra = [x for x in (provider_account, source_message_id, attachment_digest) if x]
+    raw = (base if not extra else base + "|" + "|".join(extra)).encode("utf-8")
     digest = hashlib.sha256(raw).digest()
     return base64.b32hexencode(digest).decode().rstrip("=").lower()
 
@@ -154,6 +170,10 @@ def _normalize(raw: dict) -> dict:
         side = side or {}
         return side.get("dateTime") or side.get("date")
 
+    # The AUTHORITATIVE account this event lives on: the organizer/creator email Google returns. For a
+    # student's primary calendar this is their own Google account address, so it is how the schedule
+    # flow both learns WHICH account it wrote to (identity) and PROVES it wrote to the intended one.
+    account = (raw.get("organizer") or {}).get("email") or (raw.get("creator") or {}).get("email")
     return {
         "id": raw.get("id"),
         "title": raw.get("summary"),
@@ -162,7 +182,8 @@ def _normalize(raw: dict) -> dict:
         "timezone": (raw.get("start") or {}).get("timeZone"),
         "location": raw.get("location"),
         "description": raw.get("description"),
-        "calendar_id": raw.get("organizer", {}).get("email") or raw.get("_calendar_id"),
+        "account": account,
+        "calendar_id": account or raw.get("_calendar_id"),
         "status": raw.get("status"),
         "html_link": raw.get("htmlLink"),
     }
@@ -187,10 +208,22 @@ def _google_env() -> dict[str, str]:
     }
 
 
-def _to_google_body(event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None) -> dict:
+def _to_google_body(
+    event: CalendarEvent,
+    event_id: str,
+    *,
+    mission_id: UUID | None = None,
+    source_message_id: str | None = None,
+    attachment_digest: str | None = None,
+) -> dict:
     """Map a Bruce CalendarEvent onto Google's event resource.
 
     Date-only values must use `date`, timed values `dateTime` — Google 400s if they are mixed up.
+
+    Bruce metadata (the mission id, a HASH of the source message, the attachment digest) is written to
+    ``extendedProperties.private`` — machine-readable, invisible to the student, and queryable so a
+    later run can FIND the event Bruce created without scraping the description. The source message id
+    is hashed, never stored in cleartext on Google's side.
     """
     def when(value: str) -> dict:
         return {"date": value} if len(value) == 10 else {"dateTime": value}
@@ -203,6 +236,14 @@ def _to_google_body(event: CalendarEvent, event_id: str, *, mission_id: UUID | N
     }
     if event.location:
         body["location"] = event.location
+    private: dict[str, str] = {"bruce": "1"}
+    if mission_id is not None:
+        private["bruce_mission"] = str(mission_id)
+    if source_message_id:
+        private["bruce_source"] = hashlib.sha256(source_message_id.encode("utf-8")).hexdigest()[:32]
+    if attachment_digest:
+        private["bruce_attachment"] = attachment_digest[:64]
+    body["extendedProperties"] = {"private": private}
     desc = []
     if event.source:
         desc.append(f"Added by Bruce from: {event.source}")
@@ -301,7 +342,8 @@ class GoogleCalendarAdapter:
         raise CalendarError(f"Google {op} failed: HTTP {r.status_code}")
 
     async def insert(
-        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None
+        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None,
+        source_message_id: str | None = None, attachment_digest: str | None = None,
     ) -> CalendarEventRef:
         cal = await self._calendar()
         token = await self._access_token()
@@ -309,7 +351,8 @@ class GoogleCalendarAdapter:
         r = await client.post(
             f"{GOOGLE_CALENDAR_API}/calendars/{cal}/events",
             headers={"Authorization": f"Bearer {token}"},
-            json=_to_google_body(event, event_id, mission_id=mission_id),
+            json=_to_google_body(event, event_id, mission_id=mission_id,
+                                 source_message_id=source_message_id, attachment_digest=attachment_digest),
         )
         if r.status_code == 409:
             raise AlreadyExists(event_id)  # retry of an already-executed insert; not an error
@@ -387,18 +430,28 @@ class FakeCalendarAdapter:
 
     provider = "fake"
 
-    def __init__(self) -> None:
+    def __init__(self, *, account: str | None = None) -> None:
         self.events: dict[str, dict] = {}
         self.insert_calls = 0
         self.delete_calls = 0
+        # The account the provider will stamp as organizer/creator (models Google's primary-calendar
+        # behaviour) — lets the read-back's account be verified against the connected integration.
+        self.account = account
 
     async def insert(
-        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None
+        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None,
+        source_message_id: str | None = None, attachment_digest: str | None = None,
     ) -> CalendarEventRef:
         self.insert_calls += 1
         if event_id in self.events:
             raise AlreadyExists(event_id)
-        self.events[event_id] = _to_google_body(event, event_id, mission_id=mission_id)
+        body = _to_google_body(event, event_id, mission_id=mission_id,
+                               source_message_id=source_message_id, attachment_digest=attachment_digest)
+        # Model the provider stamping the connected account as organizer/creator on the primary calendar.
+        if self.account:
+            body["organizer"] = {"email": self.account}
+            body["creator"] = {"email": self.account}
+        self.events[event_id] = body
         return CalendarEventRef(
             event_id=event_id, provider=self.provider, html_link=f"https://example.test/{event_id}"
         )
@@ -423,12 +476,22 @@ class FakeCalendarAdapter:
 # --------------------------------------------------------------------------- execute + verify
 
 
-def _matches(event: CalendarEvent, read_back: dict) -> tuple[bool, str]:
+def _matches(
+    event: CalendarEvent,
+    read_back: dict,
+    *,
+    expected_timezone: str | None = None,
+    expected_account: str | None = None,
+) -> tuple[bool, str]:
     """Does what the provider now holds actually match what the student APPROVED?
 
     Compares the fields a student would be harmed by getting wrong. `location` is compared only
     when it was part of the approval — Google returns None for a field we never sent, and treating
     that as a mismatch would fail every event that simply has no location.
+
+    ``expected_account`` — when known — is HARD: an event that came back on a different Google account
+    than the connected integration is the wrong account and must NOT verify, even if the title/time
+    match. ``expected_timezone`` is checked only when supplied (all-day events carry none).
     """
     if (read_back.get("title") or "") != event.title:
         return False, "read-back title does not match the approved proposal"
@@ -439,6 +502,10 @@ def _matches(event: CalendarEvent, read_back: dict) -> tuple[bool, str]:
         return False, f"read-back end {read_back.get('end')!r} does not match the approved {expected_end!r}"
     if event.location and (read_back.get("location") or "") != event.location:
         return False, "read-back location does not match the approved proposal"
+    if expected_timezone is not None and read_back.get("timezone") != expected_timezone:
+        return False, f"read-back timezone {read_back.get('timezone')!r} does not match the approved {expected_timezone!r}"
+    if expected_account and (read_back.get("account") or "") != expected_account:
+        return False, "read-back is on a different Google account than the connected one — NOT verified"
     return True, "read-back matched the approved proposal"
 
 
@@ -477,18 +544,37 @@ async def execute_and_verify(
     *,
     user_id: UUID,
     mission_id: UUID,
+    source_message_id: str | None = None,
+    attachment_digest: str | None = None,
+    expected_account: str | None = None,
+    expected_timezone: str | None = None,
 ) -> VerificationResult:
     """Create the event exactly once, then PROVE it exists by reading it back.
 
-    Returns verified=True only when an independent read-back returned an event whose title and
-    start match what was approved. Every other path — absent, mismatched, unreadable — returns
-    verified=False with a reason. Nothing here reports success on the strength of the write alone.
+    Returns verified=True only when an independent read-back returned an event whose title, start,
+    end (and account/timezone when known) match what was approved. Every other path — absent,
+    mismatched, wrong account, unreadable — returns verified=False with a reason. Nothing here
+    reports success on the strength of the write alone.
+
+    ``source_message_id`` + ``attachment_digest`` fold into the deterministic id (so a redelivery of
+    the same flyer to the same account is a 409 -> verify, never a duplicate) and are stamped into the
+    event's extended properties. ``expected_account`` binds verification to the connected Google
+    account: a read-back on a different account is NOT verified.
     """
-    event_id = deterministic_event_id(user_id, mission_id, event)
+    # The id must be STABLE across retries. It is bound to owner + mission + source message +
+    # attachment digest — NOT to expected_account, which starts unknown and is learned on the first
+    # write: folding a None -> email transition into the id would change it mid-retry and duplicate
+    # the event. The owner (user_id) already scopes to exactly one connected integration, so the
+    # account is implied; ``expected_account`` is used only to VERIFY the read-back, never to key it.
+    event_id = deterministic_event_id(
+        user_id, mission_id, event,
+        source_message_id=source_message_id, attachment_digest=attachment_digest)
     html_link: str | None = None
 
     try:
-        ref = await adapter.insert(event, event_id, mission_id=mission_id)
+        ref = await adapter.insert(
+            event, event_id, mission_id=mission_id,
+            source_message_id=source_message_id, attachment_digest=attachment_digest)
         html_link = ref.html_link
     except AlreadyExists:
         # A retry. Execution already happened; fall through and verify the existing event rather
@@ -505,7 +591,8 @@ async def execute_and_verify(
             html_link=html_link,
         )
 
-    ok, reason = _matches(event, read_back)
+    ok, reason = _matches(event, read_back, expected_timezone=expected_timezone,
+                          expected_account=expected_account)
     return VerificationResult(
         verified=ok,
         event_id=event_id,
@@ -515,7 +602,7 @@ async def execute_and_verify(
         # check the verification themselves rather than taking `verified: true` on trust.
         read_back={
             k: read_back.get(k)
-            for k in ("title", "start", "end", "timezone", "location", "calendar_id", "html_link")
+            for k in ("title", "start", "end", "timezone", "location", "account", "calendar_id", "html_link")
         },
         html_link=html_link or read_back.get("html_link"),
     )
