@@ -41,11 +41,34 @@ class ClaimedOutbound:
     attempts: int
 
 
+_PLAIN_TEXT_CHANNELS = frozenset({"self_hosted_imessage", "imessage", "sms"})
+
+
+def gate_outbound_text(text: str, channel_value: str) -> str:
+    """FINAL channel-safety floor for EVERY outbound (integration invariant 7 — no bypasses). Applied
+    inside enqueue(), so no caller — the conversation runtime, a legacy ACK, an error, a status update —
+    can ship an em dash or a corporate filler phrase to a plain-text channel. Rich voice styling happens
+    upstream; this is the last-line HARD guarantee, not a substitute for it. Idempotent."""
+    from .conversation_style import PROHIBITED_PHRASES, enforce_no_dashes
+    if not text or channel_value not in _PLAIN_TEXT_CHANNELS:
+        return text
+    import re
+    out = text
+    for p in PROHIBITED_PHRASES:
+        out = re.sub(re.escape(p), "", out, flags=re.IGNORECASE)
+    out = re.sub(r"[ \t]{2,}", " ", out).strip()
+    out = enforce_no_dashes(out)
+    assert "—" not in out, "em dash must never ship to a plain-text channel (outbound gate)"
+    return out
+
+
 async def enqueue(*, user_id: UUID | None, to_handle: str, channel: ChannelKind, kind: str, text: str,
                   idempotency_key: str, mission_id: UUID | None = None, deep_link: str | None = None) -> None:
     """Durably queue an outbound reply. Idempotent on idempotency_key. Runs in the recipient's context
     when known (user_id) so RLS scopes it; a pre-link prompt (user_id None) is queued in a worker
-    session."""
+    session. EVERY outbound passes through gate_outbound_text first — no bypasses."""
+    text = gate_outbound_text(text, channel.value)      # HARD channel-safety floor, applied to all callers
+
     async def _write(s):
         existing = (await s.execute(
             select(schema.OutboundMessageRow).where(schema.OutboundMessageRow.idempotency_key == idempotency_key)
