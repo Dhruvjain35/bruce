@@ -78,24 +78,31 @@ def expires_at_for(now: datetime.datetime) -> datetime.datetime:
     return now + datetime.timedelta(days=raw_retention_days())
 
 
+def _owner_conn_kwargs(raw: str) -> dict:
+    """asyncpg.connect kwargs from a BRUCE_DATABASE_URL. Handles the Cloud SQL UNIX-SOCKET form on Cloud
+    Run — the instance is passed as ``?host=/cloudsql/INSTANCE`` (SQLAlchemy's asyncpg dialect honours it,
+    but raw asyncpg.connect(host=url.host) does NOT: for the socket form url.host is empty, so it silently
+    falls back to 127.0.0.1 and connection-refuses). Prefer the ``?host=`` socket dir; else TCP host:port."""
+    url = make_url(raw)
+    q = url.query.get("host")
+    socket_host = q[0] if isinstance(q, (list, tuple)) else q
+    host = socket_host or url.host
+    return dict(host=host, port=url.port or 5432, user=url.username,
+                password=url.password, database=url.database)
+
+
 async def _owner_conn() -> asyncpg.Connection:
     """Privileged (superuser/owner) asyncpg connection — bypasses RLS for cross-user enumeration.
 
-    Built from BRUCE_DATABASE_URL via make_url so it always tracks the active (test or prod) DB.
+    Built from BRUCE_DATABASE_URL via make_url so it always tracks the active (test or prod) DB, including
+    the Cloud SQL unix-socket form used on Cloud Run.
     """
     import os
 
     raw = os.environ.get("BRUCE_DATABASE_URL")
     if not raw:
         raise RuntimeError("BRUCE_DATABASE_URL not set — owner connection required for retention sweeps.")
-    url = make_url(raw)
-    return await asyncpg.connect(
-        host=url.host,
-        port=url.port or 5432,
-        user=url.username,
-        password=url.password,
-        database=url.database,
-    )
+    return await asyncpg.connect(**_owner_conn_kwargs(raw))
 
 
 async def _erase_one(source_id: UUID, user_id: UUID) -> bool:
