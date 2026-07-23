@@ -109,3 +109,33 @@ def test_oauth_error_category_mapping():
     # invalid_or_expired_state is retryable; token_exchange_rejected is not
     assert api._oauth_error_category(og.InvalidState("x"))[2] is True
     assert api._oauth_error_category(og.TokenExchangeFailed("x"))[2] is False
+
+
+def _connect_token(uid, purpose="google_connect", secret=SECRET):
+    return jwt.encode({"sub": str(uid), "purpose": purpose, "exp": int(time.time()) + 3600}, secret, algorithm="HS256")
+
+
+def test_connect_start_no_token_branded_401():
+    r = client.get("/v1/integrations/google/connect/start", follow_redirects=False)
+    assert r.status_code == 401
+    b = r.text.lower()
+    assert "isn't valid" in b and "ref:" in b and "connect link" in b
+
+
+def test_connect_start_plain_user_jwt_rejected():
+    # a valid user JWT WITHOUT purpose=google_connect must NOT act as a connect link
+    tok = jwt.encode({"sub": str(uuid4()), "exp": int(time.time()) + 3600}, SECRET, algorithm="HS256")
+    r = client.get("/v1/integrations/google/connect/start", params={"t": tok}, follow_redirects=False)
+    assert r.status_code == 401
+
+
+def test_connect_start_forged_token_rejected():
+    tok = _connect_token(uuid4(), secret="a-different-wrong-secret-at-least-32b")
+    r = client.get("/v1/integrations/google/connect/start", params={"t": tok}, follow_redirects=False)
+    assert r.status_code == 401
+
+
+def test_connect_start_valid_token_unconfigured_503():
+    # a genuine connect token, but Google isn't credentialed in the test env -> honest 503 (never a redirect)
+    r = client.get("/v1/integrations/google/connect/start", params={"t": _connect_token(uuid4())}, follow_redirects=False)
+    assert r.status_code == 503

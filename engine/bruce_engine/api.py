@@ -432,6 +432,31 @@ async def google_connect(user: AuthenticatedUser = Depends(current_user)):
     return RedirectResponse(auth_url, status_code=302)
 
 
+@app.get("/v1/integrations/google/connect/start")
+async def google_connect_start(t: str | None = None):
+    """STABLE, browser-clickable Google connect entrypoint. It authenticates the Bruce account from a signed
+    connect token (HS256, the same BRUCE_JWT_SECRET), mints a BRAND-NEW single-use PKCE state AT CLICK TIME,
+    and 302s straight to Google. The link is reusable; EVERY click mints a fresh state (a state is NEVER
+    reused). This structurally eliminates the 'pre-generated Google URL expired' failure — the OAuth state
+    exists only for the seconds between click and consent, and no background job pre-mints or revokes it."""
+    ref = uuid4().hex[:8]
+    try:
+        claims = auth._decode(t or "")
+        if claims.get("purpose") != "google_connect":     # a plain user JWT is NOT a connect link
+            raise ValueError("not a connect token")
+        user_id = UUID(str(claims["sub"]))
+    except Exception:
+        _log.warning("google_connect_start_invalid_token ref=%s", ref)   # never logs the token value
+        return HTMLResponse(_oauth_page("this connect link isn't valid anymore",
+                            f"ask Bruce for a fresh connect link.<br><br><small>ref: {ref}</small>"),
+                            status_code=401)
+    if not oauth_google.is_configured():
+        return HTMLResponse(_oauth_page("google isn't set up yet",
+                            "connecting google isn't available right now."), status_code=503)
+    auth_url = await oauth_google.start_authorization(user_id)   # fresh single-use PKCE state, minted NOW
+    return RedirectResponse(auth_url, status_code=302)
+
+
 @app.get("/v1/integrations/google/callback")
 async def google_callback(state: str | None = None, code: str | None = None, error: str | None = None):
     """Google redirects the browser here. NO user auth by design — the single-use `state` row (validated +
