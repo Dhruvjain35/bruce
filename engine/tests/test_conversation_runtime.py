@@ -498,3 +498,62 @@ def test_p0_exact_live_flyer_handoff_regression(clean_db):
     assert out2.status == "processed" and len(_run(_missions(uid))) == 1
     ob2 = _run(_outbound(uid))
     assert "haven't submitted or registered" in ob2[-1].text.lower() and "Startup School" in ob2[-1].text
+
+
+def _seed_connected_calendar(uid):
+    from bruce_engine import crypto, oauth_google
+    import os
+    os.environ.setdefault("BRUCE_ENCRYPTION_KEY", crypto.generate_key())
+    async def _seed():
+        async with user_session(uid) as s:
+            s.add(schema.Integration(
+                user_id=uid, provider=oauth_google.PROVIDER, provider_account_id=None,
+                scopes=["https://www.googleapis.com/auth/calendar.events"],
+                refresh_token_encrypted=crypto.encrypt("rt-secret"),
+                selected_calendar_id="primary", status="connected"))
+    _run(_seed())
+
+
+def test_schedule_ts_on_connected_calendar_routes_to_real_execution(clean_db, monkeypatch):
+    # THE live regression (CASE 2): a flyer + "schedule ts" on a CONNECTED calendar must create ONE
+    # durable mission, run the calendar operation graph, and reply with a scheduled/verified line — NEVER
+    # "i can't schedule calendar events from here" and NEVER a silent extraction with no action.
+    from bruce_engine import calendar_adapter
+    monkeypatch.setattr(calendar_adapter, "GoogleCalendarAdapter",
+                        lambda *a, **kw: calendar_adapter.FakeCalendarAdapter(account="founder@example.com"))
+    uid = uuid4(); _run(_ensure_user(uid))
+    _seed_connected_calendar(uid)
+    flyer = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG, filename="flyer.png")
+    d = _decision(IntentKind.image_understanding, ResponseType.extraction_result,
+                  text="i pulled the key details i can read from the image: startup school 2026",
+                  entities=[ExtractedEntity(type="event_title", value="Startup School 2026"),
+                            ExtractedEntity(type="date", value="July 25", normalized="2026-07-25"),
+                            ExtractedEntity(type="date", value="July 26", normalized="2026-07-26"),
+                            ExtractedEntity(type="location", value="Chase Center, SF")])
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("sched1", text="schedule ts", attachments=[flyer]),
+        user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(d)))
+    assert out.status == "processed"
+    missions = _run(_missions(uid))
+    assert len(missions) == 1 and missions[0].goal["capability"] == "calendar.create_event"
+    ob = _run(_outbound(uid))
+    assert len(ob) == 1                                        # exactly one outbound
+    reply = ob[-1].text.lower()
+    assert "calendar" in reply and ("✅" in ob[-1].text or "on ur calendar" in reply)
+    assert "can't" not in reply and "cannot" not in reply     # never the false capability denial
+
+
+def test_schedule_ts_disconnected_gives_connect_required_not_fake_add(clean_db, monkeypatch):
+    # disconnected -> generic capture path owns it (P0: honest, no fake "added"), never a scheduled claim
+    uid = uuid4(); _run(_ensure_user(uid))                     # NO integration seeded
+    flyer = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG, filename="flyer.png")
+    d = _decision(IntentKind.image_understanding, ResponseType.extraction_result,
+                  text="startup school 2026",
+                  entities=[ExtractedEntity(type="event_title", value="Startup School 2026"),
+                            ExtractedEntity(type="date", value="July 25", normalized="2026-07-25")])
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("sched2", text="schedule ts", attachments=[flyer]),
+        user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(d)))
+    assert out.status == "processed"
+    reply = _run(_outbound(uid))[-1].text.lower()
+    assert "✅" not in reply                                   # nothing was scheduled -> no done marker
