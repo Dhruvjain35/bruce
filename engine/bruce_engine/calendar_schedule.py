@@ -53,7 +53,7 @@ _ISO_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 # Natural-language dates the executor must handle when the model DIDN'T normalize to ISO — a flyer says
-# "July 25-26", not "2026-07-25". The runtime is the hands: it parses deterministically rather than
+# "Aug 1-2", not "2026-08-01". The runtime is the hands: it parses deterministically rather than
 # depending on the model emitting perfect ISO (the live bug that made "schedule this for me" fall through
 # to an offer). Month name/abbrev + day (+ optional range end) + optional 4-digit year.
 _MONTHS: dict[str, int] = {}
@@ -139,7 +139,7 @@ def _extract_times(decision: "ConversationDecision") -> tuple[list[str], list[st
 
 def _date_context_strings(decision: "ConversationDecision") -> list[str]:
     """Every place a year or a date phrase might live — so a flyer whose date entity is just
-    "July 25-26" can still borrow the "2026" from its title/summary."""
+    "Aug 1-2" can still borrow the "2026" from its title/summary."""
     out = [decision.attachment_summary, decision.proposed_goal, decision.user_visible_response]
     for e in decision.extracted_entities:
         out.append(e.value)
@@ -156,7 +156,7 @@ def _year_hint(decision: "ConversationDecision") -> int | None:
 
 
 def _extract_natural_dates(decision: "ConversationDecision") -> list[str]:
-    """Parse natural-language dates ("July 25-26", "Sept 3", "Aug 1 through 3") into ISO dates when the
+    """Parse natural-language dates ("Aug 1-2", "Sept 3", "Aug 1 through 3") into ISO dates when the
     model didn't normalize them. Year comes from the date phrase itself or a context hint (flyer title/
     summary); with NO year anywhere we cannot safely place the event, so we return nothing (ask, never
     guess a year). De-duplicated + sorted."""
@@ -205,58 +205,107 @@ def _plus_hour(iso_dt: str) -> str:
     return out.replace("+00:00", "Z") if iso_dt.endswith("Z") else out
 
 
-def build_calendar_event(
-    decision: "ConversationDecision", *, source: str | None = None
-) -> CalendarEvent | None:
-    """Turn a grounded event decision into a CalendarEvent, or None if no date is resolvable.
+DEFAULT_TZ = "America/Los_Angeles"          # TODO: source from the user's profile / calendar settings
 
-    Timed vs all-day vs multi-day is decided from the grounded entities, never invented:
-      * a datetime present -> timed (end = the next datetime, else +1h)
-      * only dates -> all-day; a single date is one day, several dates span min..max
-      * all-day end uses Google's EXCLUSIVE end semantics: a July 25-26 event is start 2026-07-25,
-        end 2026-07-27 (the day after the last inclusive day), so the calendar shows exactly two days.
-    Returns None (honest: ask for the date) when there is no grounded date at all — never guesses.
+
+def build_calendar_event(
+    decision: "ConversationDecision", *, source: str | None = None,
+    message_text: str | None = None, now: "_dt.datetime | None" = None,
+) -> CalendarEvent | None:
+    """Turn a grounded event into a CalendarEvent via the universal TemporalResolver, or None if no time
+    info is resolvable anywhere (honest: ask, never guess).
+
+    Provider-neutral + source-neutral: the SAME path serves "guitar class today at 11:30 pm", "dentist
+    next friday at 4", a flyer whose date entity is "Aug 1-2", or a plain ISO datetime — because the
+    resolver understands relative days, weekdays, ranges, and clock times, not one fixture's shape.
     """
+    from zoneinfo import ZoneInfo
+
+    from . import temporal
     from .conversation_outcomes import _event_fields
 
     title, _when, where, _prov = _event_fields(decision)
-    datetimes, dates = _extract_times(decision)
-    if datetimes:
-        start = datetimes[0]
-        end = datetimes[1] if len(datetimes) > 1 else _plus_hour(start)
-        return CalendarEvent(title=title, start=start, end=end, location=where or None,
-                             source=source, tentative=False)
-    if not dates:
-        dates = _extract_natural_dates(decision)     # model gave no ISO -> parse the flyer's own words
-    if dates:
-        start = dates[0]
-        end = _plus_day(dates[-1])          # exclusive end = day after the last inclusive day
-        return CalendarEvent(title=title, start=start, end=end, location=where or None,
-                             source=source, tentative=False)
+    if now is None:
+        now = _dt.datetime.now(ZoneInfo(DEFAULT_TZ))
+
+    # A year seen in the title/summary anchors a date phrase that omits it (a flyer's "Aug 1-2").
+    year_ctx = ""
+    for s in (decision.attachment_summary, decision.proposed_goal, *(e.value for e in decision.extracted_entities)):
+        if s and _YEAR_RE.search(s):
+            year_ctx = " " + _YEAR_RE.search(s).group(1)
+            break
+
+    # Candidate when-phrases: the user's own words, each grounded date/time entity, the flyer summary.
+    candidates: list[str] = []
+    if message_text:
+        candidates.append(message_text)
+    for e in decision.extracted_entities:
+        if any(k in (e.type or "").lower() for k in ("date", "time", "day", "when")):
+            candidates.append(f"{e.normalized or ''} {e.value or ''}")
+    if decision.attachment_summary:
+        candidates.append(decision.attachment_summary)
+
+    # Resolve each; a stated TIME (timed) wins — it's more precise than a date. All-day dates are
+    # COLLECTED across candidates so a flyer whose two date entities are separate ("Aug 1", "Aug 2")
+    # still becomes one multi-day span, not just the first day.
+    timed: temporal.Resolved | None = None
+    day_starts: list[_dt.date] = []
+    day_lasts: list[_dt.date] = []
+    for cand in candidates:
+        res = temporal.resolve((cand or "") + year_ctx, now=now)
+        if res is None:
+            continue
+        if not res.all_day:
+            if timed is None:
+                timed = res
+        else:
+            day_starts.append(_dt.date.fromisoformat(res.start))
+            day_lasts.append(_dt.date.fromisoformat(res.end) - _dt.timedelta(days=1))   # inclusive last
+
+    if timed is not None:
+        return CalendarEvent(title=title, start=timed.start, end=timed.end, location=where or None,
+                             timezone=DEFAULT_TZ, source=source, tentative=False)
+    if day_starts:
+        start = min(day_starts)
+        end_excl = max(day_lasts) + _dt.timedelta(days=1)     # Google exclusive end
+        return CalendarEvent(title=title, start=start.isoformat(), end=end_excl.isoformat(),
+                             location=where or None, source=source, tentative=False)
     return None
 
 
-def human_when(event: CalendarEvent) -> str:
-    """A student-facing date phrase. All-day multi-day collapses the EXCLUSIVE end back to the
-    inclusive last day: start 2026-07-25 / end 2026-07-27 -> "july 25-26" (the en dash between the
-    two day numbers is a numeric range, which the outbound gate preserves as a fact)."""
+def _day_phrase(d: "_dt.date", today: "_dt.date", *, evening: bool = False) -> str:
+    """Relative when it reads natural ('today'/'tonight'/'tomorrow'), else 'month day'."""
+    if d == today:
+        return "tonight" if evening else "today"
+    if d == today + _dt.timedelta(days=1):
+        return "tomorrow"
+    return f"{d.strftime('%B').lower()} {d.day}"
+
+
+def human_when(event: CalendarEvent, *, now: "_dt.datetime | None" = None) -> str:
+    """A student-facing when-phrase, generated from the event's state (not a fixed template). Uses
+    relative days where natural ('today'/'tonight'/'tomorrow'); an all-day multi-day collapses the
+    EXCLUSIVE end back to the inclusive last day. The only dash is a numeric date range (a fact the
+    outbound gate preserves)."""
+    from zoneinfo import ZoneInfo
+    if now is None:
+        now = _dt.datetime.now(ZoneInfo(DEFAULT_TZ))
+    today = now.date()
     if is_all_day(event):
         start = _dt.date.fromisoformat(event.start)
-        if event.end and event.end != event.start:
-            last = _dt.date.fromisoformat(event.end) - _dt.timedelta(days=1)
-        else:
-            last = start
-        month = start.strftime("%B").lower()
+        last = (_dt.date.fromisoformat(event.end) - _dt.timedelta(days=1)) if (event.end and event.end != event.start) else start
         if last <= start:
-            return f"{month} {start.day}"
+            return _day_phrase(start, today)
         if last.month == start.month and last.year == start.year:
-            return f"{month} {start.day}–{last.day}"
-        return f"{month} {start.day}–{last.strftime('%B').lower()} {last.day}"
+            base = _day_phrase(start, today)
+            return f"{base} to {last.day}" if base in ("today", "tomorrow") else f"{base}–{last.day}"
+        return f"{_day_phrase(start, today)} to {last.strftime('%B').lower()} {last.day}"
     dt = _parse_dt(event.start)
     hour = dt.hour % 12 or 12
     ampm = "am" if dt.hour < 12 else "pm"
     minute = f":{dt.minute:02d}" if dt.minute else ""
-    return f"{dt.strftime('%B').lower()} {dt.day} at {hour}{minute}{ampm}"
+    day = _day_phrase(dt.date(), today, evening=dt.hour >= 17)
+    return f"{day} at {hour}{minute}{ampm}"
 
 
 # --------------------------------------------------------------------------- execute (mutating)
@@ -317,7 +366,6 @@ async def schedule_event(
             adapter, event, user_id=user_id, mission_id=mission_id,
             source_message_id=source_message_id, attachment_digest=attachment_digest,
             expected_account=bound_account,        # None -> learn+backfill; known -> HARD-verify
-            expected_timezone=None,                # all-day carries none; the event model has no tz field
         )
     except calendar_adapter.CalendarError as exc:
         await mission_kernel.record_phase(

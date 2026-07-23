@@ -228,25 +228,27 @@ class CalendarScheduleHandler:
 
     async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
         from . import calendar_schedule, oauth_google
+        from .conversation_contract import IntentKind
         d = octx.decision
-        # DETERMINISTIC authorization to schedule: either explicit scheduling verbs ("schedule this",
-        # "put this on my calendar", "add this to my cal", "block this off") OR a generic handoff. The
-        # model proposes (entities/intent); this policy authorizes the write. This is the CASE-2 fix:
-        # "schedule ts" was never authorized before because it isn't generic-handoff language.
+        # AUTHORIZATION TO EXECUTE is model-driven first, deterministic-policy-validated. The MODEL
+        # classifies whether the student is asking for an action (intent=actionable) on the calendar;
+        # deterministic signals (explicit scheduling verbs, a generic handoff) supplement it. This is how
+        # "put that in too" executes without a phrase-matcher: the model already called it actionable.
+        model_actionable = d.intent is IntentKind.actionable
         sched_intent = handoff.has_scheduling_execution_intent(octx.msg.text)
         decision = self._decide(octx)
-        authorized = sched_intent or decision.authorizes_mutation
+        wants_cal = _wants_calendar(d, octx.msg.text)
+        authorized = sched_intent or decision.authorizes_mutation or (model_actionable and wants_cal)
         if not authorized:
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="not_authorized_to_schedule")
-        # a real dated event must be present; scheduling intent already implies the calendar is wanted
         if not _is_event(d):
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="not_an_event")
-        if not (sched_intent or _wants_calendar(d, octx.msg.text)):
+        if not (sched_intent or wants_cal):
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="not_a_calendar_intent")
-        if calendar_schedule.build_calendar_event(d) is None:
+        if calendar_schedule.build_calendar_event(d, message_text=octx.msg.text) is None:
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="no_resolvable_date")
         # only NOW read the connection (read-only, so evaluate stays pure). If the calendar isn't
@@ -268,7 +270,7 @@ class CalendarScheduleHandler:
         from . import calendar_schedule, mission_presentation
         d = octx.decision
         source = "flyer/attachment" if octx.msg.attachments else "message"
-        event = calendar_schedule.build_calendar_event(d, source=source)
+        event = calendar_schedule.build_calendar_event(d, source=source, message_text=octx.msg.text)
         if event is None:                              # defense in depth (evaluate already gated it)
             return HandlerOutput(text="i couldn't pin down the date for that, when is it?", styled=False)
         goal_text = (d.proposed_goal or event.title or "add this to your calendar")[:120]
@@ -456,7 +458,8 @@ class EventCandidateHandler:
             connected = integ is not None and integ.status == "connected" and integ.revoked_at is None
             if connected:
                 event = calendar_schedule.build_calendar_event(
-                    d, source="flyer/attachment" if octx.msg.attachments else "message")
+                    d, source="flyer/attachment" if octx.msg.attachments else "message",
+                    message_text=octx.msg.text)
                 if event is not None:
                     attachment_refs = [{"media_type": getattr(a, "media_type", None),
                                         "filename": getattr(a, "filename", None),
