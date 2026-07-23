@@ -14,6 +14,7 @@ then nothing acts on it. That separation is what makes "the model can't create s
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -71,27 +72,51 @@ class HandoffDecision:
                 "authorizes_mutation": self.authorizes_mutation}
 
 
-# Explicit user language that STRONGLY indicates a handoff (DELEGATION). Presence of one of these is
-# REQUIRED before any mission-creating action is even considered; the model's needs_mission flag alone is
-# insufficient. Status-check phrases ("did that go through") are deliberately EXCLUDED — those ask about an
-# existing mission's state (a read), never create one; the status-query path handles them.
-_EXPLICIT_HANDOFF = (
-    "take this from here", "take it from here", "take this over", "take over from here",
-    "handle this", "handle it", "deal with this", "deal with it", "take care of this",
-    "sort this out", "get this done", "get this sorted", "make it happen",
-    "keep following up", "follow up on this", "keep chasing", "stay on top of this",
-    "make sure this gets done", "make sure it gets done", "make sure this happens",
-    "only bother me when", "only bug me when", "only ping me when", "only tell me when",
+# Explicit user DELEGATION to Bruce. Presence is REQUIRED before any mission-creating action is even
+# considered; the model's needs_mission flag alone is insufficient. Semantic, not a fixed phrase list:
+# delegation verb + an object variant (this / it / that / "ts" = this), tolerant of slang + filler
+# ("bro", "pls", "rn", "gng", "for me"). Status-check phrases ("did that go through") are handled by the
+# status-query path, never here. A DIFFERENT object ("that class", "this problem") without a delegation
+# verb is not a handoff.
+_OBJ = r"(?:this|that|it|ts|tis)"
+_HANDOFF_PATTERNS = (
+    rf"\bhandle\s+{_OBJ}\b",
+    rf"\bdeal\s+with\s+{_OBJ}\b",
+    rf"\btake\s+care\s+of\s+{_OBJ}\b",
+    rf"\btake\s+{_OBJ}\s+(?:from\s+here|over)\b",
+    r"\btake\s+over\s+(?:from\s+here|this|it)?\b",
+    rf"\b(?:sort|figure)\s+(?:{_OBJ}\s+)?out\b",
+    rf"\bget\s+{_OBJ}\s+(?:done|sorted|handled)\b",
+    rf"\bmake\s+sure\s+{_OBJ}\b[^.?!]*\b(?:done|happens|gets|goes\s+through)\b",
+    rf"\bmake\s+{_OBJ}\s+happen\b",
+    rf"\b(?:follow|following)\s+up\s+(?:on\s+)?{_OBJ}\b",
+    rf"\bkeep\s+(?:following\s+up|chasing|on\s+(?:top\s+of\s+)?{_OBJ}|at\s+{_OBJ})\b",
+    rf"\bstay\s+on\s+(?:top\s+of\s+)?{_OBJ}\b",
+    r"\bonly\s+(?:bother|bug|ping|hit|tell|text)\s+me\s+when\b",
 )
+_HANDOFF_RE = re.compile("|".join(_HANDOFF_PATTERNS), re.IGNORECASE)
+# First person doing it themselves — "i'll handle it", "i got this", "how do i handle this equation",
+# "should i deal with it" — the USER is acting, NOT delegating to Bruce. Suppress (a tutoring "how do i
+# handle this" must never be read as a handoff). 2nd person ("can u handle this") is NOT suppressed.
+_SELF_HANDLING_RE = re.compile(
+    r"\b(?:(?:how\s+)?(?:do|should|can|could|would)\s+i|imma|"
+    r"i(?:'?ll| will| can| ?a?m| got|'?ve\s+got| gonna| ll| m)?)\s+"
+    r"(?:handle|deal|take|sort|figure|got|do)\b", re.IGNORECASE)
 
 _MIN_MISSION_CONFIDENCE = 0.55
 
 
 def has_explicit_handoff_language(text: str | None) -> bool:
-    """True iff the user's own words explicitly ask Bruce to take something on / follow up. Deterministic
-    substring match on a fixed phrase set — no model, no inference."""
+    """True iff the user's own words explicitly DELEGATE to Bruce (take this on / handle it / follow up).
+    Deterministic pattern match tolerant of slang, abbreviations ('ts'=this), and filler; suppressed when
+    the user says THEY will handle it. No model, no inference — this is the authorization gate, so a
+    hallucinated model flag can never substitute for it."""
     t = (text or "").lower()
-    return any(p in t for p in _EXPLICIT_HANDOFF)
+    if not t:
+        return False
+    if _SELF_HANDLING_RE.search(t):        # "i'll handle this" -> the user is doing it, not Bruce
+        return False
+    return bool(_HANDOFF_RE.search(t))
 
 
 # Language that asks about an EXISTING mission's state (a read, never a create). Disjoint from the handoff

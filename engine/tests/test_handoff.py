@@ -15,12 +15,20 @@ from bruce_engine.handoff import (
 
 def test_explicit_language_detection():
     for yes in ("take this from here", "can u handle this for me", "keep following up pls",
-                "make sure this gets done", "only bother me when you need my call"):
-        assert has_explicit_handoff_language(yes)
-    # status-check phrases are NOT creation-handoff language (they read an existing mission, never create)
-    for no in ("what's 8x7", "thanks!", "can you explain this problem", "add this to my calendar",
-               "did that actually go through?", None):
-        assert not has_explicit_handoff_language(no)
+                "make sure this gets done", "only bother me when you need my call",
+                # slang, abbreviations, typos, filler — must still register (the exact live case)
+                "handle ts for me gng", "handle this bro pls", "deal with this rn",
+                "figure this out for me", "take care of ts", "can u sort this out",
+                "make sure ts gets done", "get this done pls", "i need u to handle this"):
+        assert has_explicit_handoff_language(yes), yes
+    for no in (
+            # status-check phrases read an existing mission, never create one
+            "what's 8x7", "thanks!", "can you explain this problem", "add this to my calendar",
+            "did that actually go through?", None,
+            # first person doing it themselves is NOT a handoff (incl. a tutoring question)
+            "i'll handle this myself", "i got this", "i'll take care of it", "imma handle this",
+            "how do i handle this equation", "should i deal with this"):
+        assert not has_explicit_handoff_language(no), no
 
 
 def test_hallucinated_needs_mission_without_explicit_language_never_mutates():
