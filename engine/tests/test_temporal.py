@@ -66,3 +66,26 @@ def test_bare_hour_is_low_confidence_and_flags_am_pm():
 def test_no_time_info_returns_none():
     assert r("this looks cool") is None
     assert r("") is None
+
+
+# --- relative offsets from the send time (the "4 days from now" fix) ------------------------------
+
+def test_n_days_from_now_anchors_on_send_time():
+    assert r("basketball tourney 4 days from now at 2pm").start == "2026-07-27T14:00:00"
+    assert r("in 3 days at 10am").start == "2026-07-26T10:00:00"
+    assert r("dentist in 5 days").start == "2026-07-28"
+
+
+def test_word_number_offsets():
+    assert r("couple days from now").start == "2026-07-25"
+    assert r("in two weeks").start == "2026-08-06"
+    assert r("in a week at noon").start == "2026-07-30T12:00:00"
+
+
+def test_next_week_is_seven_days():
+    assert r("next week").start == "2026-07-30"
+
+
+def test_relative_offset_beats_bare_time_fallthrough():
+    # THE regression: with an offset present it must NOT collapse to today at the stated time
+    assert not r("4 days from now at 2pm").start.startswith("2026-07-23")

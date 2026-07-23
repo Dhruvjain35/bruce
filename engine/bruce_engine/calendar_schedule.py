@@ -225,8 +225,13 @@ def build_calendar_event(
     from .conversation_outcomes import _event_fields
 
     title, _when, where, _prov = _event_fields(decision)
+    # Anchor relative expressions ("4 days from now", "today") on the SEND time in the user's local zone,
+    # not the server clock — a UTC now would slip the day near midnight. (tz still DEFAULT_TZ until the
+    # per-user UserWorldState timezone lands; the anchor instant is already correct.)
     if now is None:
         now = _dt.datetime.now(ZoneInfo(DEFAULT_TZ))
+    elif now.tzinfo is not None:
+        now = now.astimezone(ZoneInfo(DEFAULT_TZ))
 
     # A year seen in the title/summary anchors a date phrase that omits it (a flyer's "Aug 1-2").
     year_ctx = ""

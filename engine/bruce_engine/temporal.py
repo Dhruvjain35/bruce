@@ -43,6 +43,23 @@ _DATE_RANGE_RE = re.compile(
     rf"(?:,?\s*(?P<year>\d{{4}}))?", re.IGNORECASE)
 _ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 _ISO_DT_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2})?")
+
+# Relative offsets from the message's send time: "4 days from now", "in 3 days", "in two weeks",
+# "next week". THE fix for "basketball tourney 4 days from now" resolving to today — the old resolver had
+# no offset branch, so it fell through to "bare time => today". Word-numbers a student actually types.
+_WORDNUM = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+            "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "couple": 2,
+            "few": 3, "fourteen": 14}
+_NUM = r"(?:\d{1,3}|a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|couple|few|fourteen)"
+_OFFSET_DAYS_RE = re.compile(rf"\b(?:in\s+)?(?P<n>{_NUM})\s+days?\s+from\s+(?:now|today)\b|\bin\s+(?P<n2>{_NUM})\s+days?\b", re.IGNORECASE)
+_OFFSET_WEEKS_RE = re.compile(rf"\b(?:in\s+)?(?P<n>{_NUM})\s+weeks?\s+from\s+(?:now|today)\b|\bin\s+(?P<n2>{_NUM})\s+weeks?\b", re.IGNORECASE)
+
+
+def _num(tok: str | None) -> int | None:
+    if not tok:
+        return None
+    tok = tok.lower()
+    return int(tok) if tok.isdigit() else _WORDNUM.get(tok)
 _NEXT_WEEKDAY_RE = re.compile(rf"\b(?P<mod>next|this|coming)?\s*(?P<wd>{_WEEKDAY_ALT})\b", re.IGNORECASE)
 # time: "11:30 pm", "4pm", "at 4", "23:30", "6:00", "noon", "midnight"
 _TIME_RE = re.compile(
@@ -79,6 +96,19 @@ def _resolve_date(text: str, now: _dt.datetime) -> tuple[_dt.date, _dt.date | No
         return today + _dt.timedelta(days=1), None
     if re.search(r"\b(day after tomorrow)\b", t):
         return today + _dt.timedelta(days=2), None
+    # relative offsets from the send time (before weekday matching so "in 2 weeks" isn't misread)
+    m = _OFFSET_DAYS_RE.search(t)
+    if m:
+        n = _num(m.group("n") or m.group("n2"))
+        if n is not None:
+            return today + _dt.timedelta(days=n), None
+    m = _OFFSET_WEEKS_RE.search(t)
+    if m:
+        n = _num(m.group("n") or m.group("n2"))
+        if n is not None:
+            return today + _dt.timedelta(weeks=n), None
+    if re.search(r"\bnext\s+week\b", t):
+        return today + _dt.timedelta(days=7), None
     if re.search(r"\bthis weekend\b", t):
         sat = today + _dt.timedelta(days=(5 - today.weekday()) % 7)
         return sat, sat + _dt.timedelta(days=1)

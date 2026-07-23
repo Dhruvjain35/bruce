@@ -248,7 +248,8 @@ class CalendarScheduleHandler:
         if not (sched_intent or wants_cal):
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="not_a_calendar_intent")
-        if calendar_schedule.build_calendar_event(d, message_text=octx.msg.text) is None:
+        if calendar_schedule.build_calendar_event(d, message_text=octx.msg.text,
+                                                  now=getattr(octx.msg, 'timestamp', None)) is None:
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="no_resolvable_date")
         # only NOW read the connection (read-only, so evaluate stays pure). If the calendar isn't
@@ -270,7 +271,8 @@ class CalendarScheduleHandler:
         from . import calendar_schedule, mission_presentation
         d = octx.decision
         source = "flyer/attachment" if octx.msg.attachments else "message"
-        event = calendar_schedule.build_calendar_event(d, source=source, message_text=octx.msg.text)
+        event = calendar_schedule.build_calendar_event(d, source=source, message_text=octx.msg.text,
+                                                       now=getattr(octx.msg, 'timestamp', None))
         if event is None:                              # defense in depth (evaluate already gated it)
             return HandlerOutput(text="i couldn't pin down the date for that, when is it?", styled=False)
         goal_text = (d.proposed_goal or event.title or "add this to your calendar")[:120]
@@ -459,7 +461,7 @@ class EventCandidateHandler:
             if connected:
                 event = calendar_schedule.build_calendar_event(
                     d, source="flyer/attachment" if octx.msg.attachments else "message",
-                    message_text=octx.msg.text)
+                    message_text=octx.msg.text, now=getattr(octx.msg, "timestamp", None))
                 if event is not None:
                     attachment_refs = [{"media_type": getattr(a, "media_type", None),
                                         "filename": getattr(a, "filename", None),
