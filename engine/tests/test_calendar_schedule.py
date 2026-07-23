@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 from uuid import uuid4
 
+import pytest
+
 from bruce_engine import calendar_schedule as cs
 from bruce_engine import conversation_outcomes as co
 from bruce_engine.conversation_contract import (
@@ -153,10 +155,13 @@ def test_handler_declines_when_calendar_not_connected(monkeypatch):
 
 
 def test_handler_declines_without_explicit_handoff(monkeypatch):
-    # just a flyer, no 'handle this' -> Bruce must NOT auto-write; declines so it can offer instead
+    # a passive share (model intent NOT actionable, no scheduling verb) -> Bruce must NOT auto-write;
+    # declines so the offer path can ask first. Model-driven: intent drives it, not a phrase.
     _patch_connected(monkeypatch)
-    d = _startup_school(text="startup school looks cool")
-    v = _run(co.CalendarScheduleHandler().evaluate(_octx(d, text="startup school looks cool")))
+    d = _decision(text="cool event", intent=IntentKind.image_understanding, caps=["calendar"],
+                  entities=[ExtractedEntity(type="event_title", value="Some Fair"),
+                            ExtractedEntity(type="date", value="Aug 1", normalized="2026-08-01")])
+    v = _run(co.CalendarScheduleHandler().evaluate(_octx(d, text="cool event")))
     assert v.disposition == co.Disposition.decline
 
 
@@ -167,3 +172,36 @@ def test_handler_declines_when_no_date_resolvable():
                             ExtractedEntity(type="date", value="sometime next month")])
     v = _run(co.CalendarScheduleHandler().evaluate(_octx(d, text="handle this for me, add to my calendar")))
     assert v.disposition == co.Disposition.decline and v.reason == "no_resolvable_date"
+
+
+# --- universal, fixture-free event building (varied unrelated events) ------------------------------
+
+import datetime as _dtmod
+from zoneinfo import ZoneInfo as _ZI
+_NOW = _dtmod.datetime(2026, 7, 23, 15, 0, tzinfo=_ZI("America/Los_Angeles"))   # Thu Jul 23 2026 3pm PT
+
+
+@pytest.mark.parametrize("msg,ents,expect_start,expect_timed", [
+    ("i have a guitar class today at 11:30 pm put that in too",
+     [ExtractedEntity(type="event_title", value="guitar class")], "2026-07-23T23:30:00", True),
+    ("dentist next friday at 4pm",
+     [ExtractedEntity(type="event_title", value="dentist")], "2026-07-31T16:00:00", True),
+    ("practice monday at 6pm",
+     [ExtractedEntity(type="event_title", value="practice")], "2026-07-27T18:00:00", True),
+    ("study group tomorrow",
+     [ExtractedEntity(type="event_title", value="study group")], "2026-07-24", False),
+    ("call mom tonight at 9",
+     [ExtractedEntity(type="event_title", value="call mom")], "2026-07-23T21:00:00", True),
+])
+def test_varied_text_events_build_via_one_universal_path(msg, ents, expect_start, expect_timed):
+    d = _decision(text=msg, entities=ents)
+    ev = cs.build_calendar_event(d, message_text=msg, now=_NOW)
+    assert ev is not None and ev.start == expect_start
+    assert (not cs.is_all_day(ev)) == expect_timed
+    if expect_timed:
+        assert ev.timezone == "America/Los_Angeles"
+
+
+def test_no_time_info_still_returns_none_for_a_bare_title():
+    d = _decision(text="add my club", entities=[ExtractedEntity(type="event_title", value="chess club")])
+    assert cs.build_calendar_event(d, message_text="add my club", now=_NOW) is None

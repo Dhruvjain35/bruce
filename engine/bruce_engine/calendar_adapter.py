@@ -226,7 +226,12 @@ def _to_google_body(
     is hashed, never stored in cleartext on Google's side.
     """
     def when(value: str) -> dict:
-        return {"date": value} if len(value) == 10 else {"dateTime": value}
+        if len(value) == 10:
+            return {"date": value}                    # all-day
+        d = {"dateTime": value}
+        if event.timezone:                            # timed: place the wall-clock in the user's tz
+            d["timeZone"] = event.timezone
+        return d
 
     body: dict = {
         "id": event_id,  # caller-supplied id == the execute-once guarantee
@@ -476,34 +481,50 @@ class FakeCalendarAdapter:
 # --------------------------------------------------------------------------- execute + verify
 
 
+def _same_moment(expected: str | None, actual: str | None, tz: str | None) -> bool:
+    """True if two ISO values denote the same moment. All-day (date-only) compares exactly. Timed
+    compares as INSTANTS: Google returns a dateTime with an offset ("...T23:30:00-07:00") while we send
+    a naive local wall-clock; parsing both (the naive one in the event's tz) makes the comparison
+    correct across formats and daylight saving, and implicitly verifies the timezone."""
+    if expected is None or actual is None:
+        return expected == actual
+    if len(expected) == 10 or len(actual) == 10:
+        return expected == actual
+    from zoneinfo import ZoneInfo
+    import datetime as _d
+    def aware(s: str) -> _d.datetime:
+        dt = _d.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo(tz or "UTC"))
+        return dt
+    try:
+        return aware(expected) == aware(actual)
+    except ValueError:
+        return expected == actual
+
+
 def _matches(
     event: CalendarEvent,
     read_back: dict,
     *,
-    expected_timezone: str | None = None,
     expected_account: str | None = None,
 ) -> tuple[bool, str]:
     """Does what the provider now holds actually match what the student APPROVED?
 
-    Compares the fields a student would be harmed by getting wrong. `location` is compared only
-    when it was part of the approval — Google returns None for a field we never sent, and treating
-    that as a mismatch would fail every event that simply has no location.
-
-    ``expected_account`` — when known — is HARD: an event that came back on a different Google account
-    than the connected integration is the wrong account and must NOT verify, even if the title/time
-    match. ``expected_timezone`` is checked only when supplied (all-day events carry none).
+    Compares the fields a student would be harmed by getting wrong. `location` is compared only when it
+    was part of the approval. Times are compared as instants (see _same_moment) so a timed event whose
+    provider read-back carries a tz offset still verifies. ``expected_account`` — when known — is HARD:
+    a read-back on a different Google account must NOT verify even if title/time match.
     """
     if (read_back.get("title") or "") != event.title:
         return False, "read-back title does not match the approved proposal"
-    if read_back.get("start") != event.start:
+    if not _same_moment(event.start, read_back.get("start"), event.timezone):
         return False, f"read-back start {read_back.get('start')!r} does not match the approved {event.start!r}"
     expected_end = event.end or event.start
-    if read_back.get("end") != expected_end:
+    if not _same_moment(expected_end, read_back.get("end"), event.timezone):
         return False, f"read-back end {read_back.get('end')!r} does not match the approved {expected_end!r}"
     if event.location and (read_back.get("location") or "") != event.location:
         return False, "read-back location does not match the approved proposal"
-    if expected_timezone is not None and read_back.get("timezone") != expected_timezone:
-        return False, f"read-back timezone {read_back.get('timezone')!r} does not match the approved {expected_timezone!r}"
     if expected_account and (read_back.get("account") or "") != expected_account:
         return False, "read-back is on a different Google account than the connected one — NOT verified"
     return True, "read-back matched the approved proposal"
@@ -547,7 +568,6 @@ async def execute_and_verify(
     source_message_id: str | None = None,
     attachment_digest: str | None = None,
     expected_account: str | None = None,
-    expected_timezone: str | None = None,
 ) -> VerificationResult:
     """Create the event exactly once, then PROVE it exists by reading it back.
 
@@ -591,8 +611,7 @@ async def execute_and_verify(
             html_link=html_link,
         )
 
-    ok, reason = _matches(event, read_back, expected_timezone=expected_timezone,
-                          expected_account=expected_account)
+    ok, reason = _matches(event, read_back, expected_account=expected_account)
     return VerificationResult(
         verified=ok,
         event_id=event_id,

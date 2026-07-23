@@ -272,6 +272,7 @@ class CalendarEvent(BaseModel):
     start: str = Field(description="ISO 8601 start datetime")
     end: str | None = None
     location: str | None = None
+    timezone: str | None = None            # IANA tz for a timed event (None for all-day)
     prep_minutes: int | None = None
     tentative: bool = True
     source: str | None = None
