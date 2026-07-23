@@ -66,3 +66,62 @@ def test_bare_hour_is_low_confidence_and_flags_am_pm():
 def test_no_time_info_returns_none():
     assert r("this looks cool") is None
     assert r("") is None
+
+
+# --- relative offsets from the send time (the "4 days from now" fix) ------------------------------
+
+def test_n_days_from_now_anchors_on_send_time():
+    assert r("basketball tourney 4 days from now at 2pm").start == "2026-07-27T14:00:00"
+    assert r("in 3 days at 10am").start == "2026-07-26T10:00:00"
+    assert r("dentist in 5 days").start == "2026-07-28"
+
+
+def test_word_number_offsets():
+    assert r("couple days from now").start == "2026-07-25"
+    assert r("in two weeks").start == "2026-08-06"
+    assert r("in a week at noon").start == "2026-07-30T12:00:00"
+
+
+def test_next_week_is_seven_days():
+    assert r("next week").start == "2026-07-30"
+
+
+def test_relative_offset_beats_bare_time_fallthrough():
+    # THE regression: with an offset present it must NOT collapse to today at the stated time
+    assert not r("4 days from now at 2pm").start.startswith("2026-07-23")
+
+
+# --- adversarial hardening (findings from the temporal audit) -------------------------------------
+
+def test_colon_time_no_ampm_is_ambiguous_not_24h():
+    res = r("dentist at 3:30")
+    assert res.start == "2026-07-23T15:30:00"           # afternoon heuristic, NOT 03:30
+    assert res.confidence < 1.0 and "am_pm" in res.needs
+
+
+def test_unanchored_colon_number_is_not_a_time():
+    assert r("we're up 3:15 in the fourth quarter") is None
+    assert r("mix it 1:30 with water") is None
+
+
+def test_iso_datetime_offset_is_honored():
+    assert r("2026-08-01T14:00:00Z").start == "2026-08-01T14:00:00+00:00"
+    assert r("call 2026-08-01T18:00:00+05:30").start == "2026-08-01T18:00:00+05:30"
+
+
+def test_month_day_near_year_boundary_goes_to_next_year():
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    dec = dt.datetime(2026, 12, 28, 10, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+    assert temporal.resolve("party on jan 2", now=dec).start == "2027-01-02"
+
+
+def test_time_range_keeps_both_ends():
+    a = r("study group from 2 to 4pm")
+    assert a.start == "2026-07-23T14:00:00" and a.end == "2026-07-23T16:00:00"
+    b = r("practice 3:00-4:30pm")
+    assert b.start == "2026-07-23T15:00:00" and b.end == "2026-07-23T16:30:00"
+
+
+def test_tonight_at_12_is_midnight_not_noon():
+    assert r("party tonight at 12").start == "2026-07-23T00:00:00"

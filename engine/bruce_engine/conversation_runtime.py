@@ -212,7 +212,7 @@ class _Runtime:
                 integ = None
             if integ is not None and integ.status == "connected" and integ.revoked_at is None:
                 log.info("capability_claim_override pmid=%s cap=calendar_connected", pmid)
-                reply_out = capability_truth.grounded_calendar_correction()
+                reply_out = capability_truth.grounded_calendar_correction(msg.text)
 
         await self._finalize(user_id, ch, ident, pmid, reply_out, reply_target,
                              decision=decision, event_candidate_id=outcome.event_candidate_id)

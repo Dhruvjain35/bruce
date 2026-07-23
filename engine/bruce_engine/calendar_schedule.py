@@ -225,8 +225,13 @@ def build_calendar_event(
     from .conversation_outcomes import _event_fields
 
     title, _when, where, _prov = _event_fields(decision)
+    # Anchor relative expressions ("4 days from now", "today") on the SEND time in the user's local zone,
+    # not the server clock — a UTC now would slip the day near midnight. (tz still DEFAULT_TZ until the
+    # per-user UserWorldState timezone lands; the anchor instant is already correct.)
     if now is None:
         now = _dt.datetime.now(ZoneInfo(DEFAULT_TZ))
+    elif now.tzinfo is not None:
+        now = now.astimezone(ZoneInfo(DEFAULT_TZ))
 
     # A year seen in the title/summary anchors a date phrase that omits it (a flyer's "Aug 1-2").
     year_ctx = ""
@@ -263,8 +268,14 @@ def build_calendar_event(
             day_lasts.append(_dt.date.fromisoformat(res.end) - _dt.timedelta(days=1))   # inclusive last
 
     if timed is not None:
+        # An offset-aware start (from a UTC/offset ISO the model normalized) carries its own zone in the
+        # string — don't override it with DEFAULT_TZ; only a naive local wall-clock gets stamped.
+        try:
+            offset_aware = _dt.datetime.fromisoformat(timed.start).tzinfo is not None
+        except ValueError:
+            offset_aware = False
         return CalendarEvent(title=title, start=timed.start, end=timed.end, location=where or None,
-                             timezone=DEFAULT_TZ, source=source, tentative=False)
+                             timezone=None if offset_aware else DEFAULT_TZ, source=source, tentative=False)
     if day_starts:
         start = min(day_starts)
         end_excl = max(day_lasts) + _dt.timedelta(days=1)     # Google exclusive end
