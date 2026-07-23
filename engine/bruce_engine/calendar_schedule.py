@@ -268,8 +268,14 @@ def build_calendar_event(
             day_lasts.append(_dt.date.fromisoformat(res.end) - _dt.timedelta(days=1))   # inclusive last
 
     if timed is not None:
+        # An offset-aware start (from a UTC/offset ISO the model normalized) carries its own zone in the
+        # string — don't override it with DEFAULT_TZ; only a naive local wall-clock gets stamped.
+        try:
+            offset_aware = _dt.datetime.fromisoformat(timed.start).tzinfo is not None
+        except ValueError:
+            offset_aware = False
         return CalendarEvent(title=title, start=timed.start, end=timed.end, location=where or None,
-                             timezone=DEFAULT_TZ, source=source, tentative=False)
+                             timezone=None if offset_aware else DEFAULT_TZ, source=source, tentative=False)
     if day_starts:
         start = min(day_starts)
         end_excl = max(day_lasts) + _dt.timedelta(days=1)     # Google exclusive end
