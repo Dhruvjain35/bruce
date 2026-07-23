@@ -25,16 +25,18 @@ from .db import user_session, worker_session
 from .messaging import Attachment, AttachmentKind, ChannelKind, InboundMessage, MessagingChannel, OutboundMessage
 from .models import IntakeSourceKind
 
-ACK_TEXT = "Got it — I'm understanding this now. I'll message you when it needs review."
+# Bruce-voiced copy (casual, honest, no em dash, no corporate tone). Also gated at enqueue as a backstop.
+# This is the UN-enrolled fallback ack — an enrolled user gets the conversation runtime, never this.
+ACK_TEXT = "gotchu, i've got it. give me a sec to look and i'll get back to u 👀"
 # PRIVATE-ALPHA linking copy. No iPhone app or profile screen exists yet, so we NEVER reference one.
 # A code is issued out of band by the Bruce team (operator CLI: scripts/create_link_code). Failure
 # replies are deliberately generic — they never reveal whether a given number/account exists.
-LINK_PROMPT = ("This is Bruce (private alpha). To connect this number, reply with the 6-character "
-               "invite code the Bruce team gave you. Codes expire quickly and are single-use.")
-LINKED_TEXT = "You're linked. Text me a flyer, screenshot, PDF, link, or a note and I'll track it."
-BAD_CODE_TEXT = ("That invite code isn't valid or has expired. Invite codes are single-use and short-"
-                 "lived — reply with a current one, or ask the Bruce team for a fresh code.")
-RATE_LIMITED_TEXT = "Too many attempts. Please wait a few minutes before trying another invite code."
+LINK_PROMPT = ("hey, this is bruce (private alpha). reply with the 6-char invite code the team gave u "
+               "to connect this number. codes are single-use and expire quick.")
+LINKED_TEXT = "you're in 🎉 text me a flyer, screenshot, pdf, link, or just a note and i'll track it."
+BAD_CODE_TEXT = ("that code isn't valid or it expired. reply with a current one, or grab a fresh code "
+                 "from the bruce team.")
+RATE_LIMITED_TEXT = "too many tries, give it a few mins before trying another code."
 _CODE_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 
 
