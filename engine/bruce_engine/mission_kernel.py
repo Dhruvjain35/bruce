@@ -52,6 +52,7 @@ async def create_handoff_mission(
     user_id: UUID, *, capability: str, source_message_id: str, proposed_goal: str,
     short_status: str, autonomy: str = "A0", risk: str = "low",
     attachment_refs: list[dict] | None = None, evidence: dict | None = None,
+    extracted_facts: dict | None = None,
 ) -> MissionCreation:
     """Create (or reference, if it already exists) the durable handoff mission + its first phase event in
     ONE transaction. Returns which happened. Performs NO external action."""
@@ -62,6 +63,7 @@ async def create_handoff_mission(
         "source_message_ids": [source_message_id],
         "source_attachment_refs": attachment_refs or [],   # metadata refs only, never bytes
         "evidence": evidence or {},
+        "extracted_facts": extracted_facts or {},          # grounded flyer facts (name/date/location/…)
         "autonomy": autonomy,
         "risk": risk,
     }

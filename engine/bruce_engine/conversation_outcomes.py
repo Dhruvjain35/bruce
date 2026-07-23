@@ -175,13 +175,13 @@ class StatusQueryHandler:
                               reason="active_mission", telemetry={"mission_phase": state["phase"]})
 
     async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        from . import mission_presentation
         state = await mission_kernel.latest_active_handoff_mission(octx.user_id)
         if state is None:              # raced to closed between evaluate and execute -> honest fallback
             return HandlerOutput(text=octx.style.template("mission_status_none"), styled=False)
-        what = (state.get("goal") or {}).get("proposed_goal") or "that"
-        reply = octx.style.template("mission_status_report", what=what,
-                                    phase=_FRIENDLY_PHASE.get(state["phase"], state["phase"]))
-        return HandlerOutput(text=reply, styled=False)
+        # useful status from PERSISTED state + grounded facts: what's checked vs pending, and the honest
+        # 'nothing external yet' — never a raw db phase label.
+        return HandlerOutput(text=mission_presentation.render_status(state), styled=False)
 
 
 class MissionHandoffHandler:
@@ -224,10 +224,12 @@ class MissionHandoffHandler:
                               reason=decision.reason, telemetry=tel)
 
     async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        from . import mission_presentation
         decision = self._decide(octx)
         assert decision.authorizes_mutation, "execute() reached without authorization"   # defense in depth
         d = octx.decision
         goal_text = (d.proposed_goal or (octx.msg.text or "").strip() or "this")[:120]
+        facts = mission_presentation.extract_flyer_facts(d)         # grounded flyer facts, never invented
         attachment_refs = [{"media_type": getattr(a, "media_type", None),
                             "filename": getattr(a, "filename", None)} for a in octx.msg.attachments]
         evidence = {"reply_to_message_id": getattr(octx.msg, "reply_to_message_id", None),
@@ -239,9 +241,14 @@ class MissionHandoffHandler:
             octx.user_id, capability=self._CAPTURE_CAPABILITY, source_message_id=octx.pmid,
             proposed_goal=goal_text, short_status=f"tracking: {goal_text}",
             autonomy=str(getattr(d, "autonomy", "A0") or "A0"), risk="low",
-            attachment_refs=attachment_refs, evidence=evidence)
-        # fact-locked ack: says WHAT Bruce is taking on + WHEN it will interrupt; never claims it acted.
-        reply = octx.style.template("mission_handoff_ack", what=goal_text)
+            attachment_refs=attachment_refs, evidence=evidence, extracted_facts=facts)
+        # CONTEXT-AWARE ack generated from the created mission + grounded facts — never a canned line, and
+        # never claims registration/booking/completion (A1 takes no external action).
+        pres = mission_presentation.MissionStartPresentation(
+            mission_id=str(result.mission_id), user_goal=goal_text, capability=self._CAPTURE_CAPABILITY,
+            source_summary=("flyer/attachment" if attachment_refs else "message"), extracted_facts=facts,
+            current_phase=result.phase, evidence_count=len(attachment_refs), external_action_attempted=False)
+        reply = mission_presentation.render_start(pres)
         return HandlerOutput(text=reply, styled=False, mission_id=result.mission_id)
 
 
