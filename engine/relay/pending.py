@@ -13,6 +13,8 @@ import json
 import os
 from collections import OrderedDict
 
+from .durable import write_json_durable
+
 
 class PendingStore:
     def __init__(self, path: str, *, max_records: int = 500) -> None:
@@ -57,7 +59,4 @@ class PendingStore:
             self._save()
 
     def _save(self) -> None:
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"pending": self._records}, f)
-        os.replace(tmp, self.path)                             # atomic -> restart-safe
+        write_json_durable(self.path, {"pending": self._records})   # fsync file+dir: crash-durable

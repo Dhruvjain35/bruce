@@ -135,8 +135,12 @@ class SubprocessImsg:
         return json.loads(line.decode() or "{}")
 
     async def watch(self) -> AsyncIterator[ImsgEvent]:
+        # stderr=DEVNULL: the long-lived watch child must NOT inherit stderr — the supervisor/LaunchAgent
+        # routes the tree's stderr to a plist log file, and imsg can emit message content there (would
+        # break content-free logging). The one-shot RPC spawn below already sets this.
         self._proc = await asyncio.create_subprocess_exec(
-            self.binary, "rpc", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+            self.binary, "rpc", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
         # attachments:True == imsg's --attachments: watch pushes then carry the attachments array
         # (mime_type/original_path/missing/…). Without it the array never populates and images are lost.
         await self._rpc("watch.subscribe", {"attachments": True})
