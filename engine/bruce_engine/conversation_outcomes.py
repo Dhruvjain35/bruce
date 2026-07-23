@@ -296,6 +296,33 @@ class CalendarScheduleHandler:
                              mission_id=creation.mission_id)
 
 
+class WorldStateHandler:
+    """Capture a user-stated world fact into UserWorldState (R3). Today: the timezone — "yo i'm in cst" ->
+    America/Chicago (stored canonically, never "CST"), so every later temporal op uses the student's real
+    zone instead of a default. Claims ONLY when the user states THEIR OWN timezone (first-person), so an
+    event-tz mention never hijacks the user's zone. evaluate() is pure (a deterministic detector)."""
+    name = "world_state"
+    priority = 75                      # above scheduling: a stated preference is captured, not scheduled
+
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+        from . import world_state
+        tz = world_state.detect_user_timezone_statement(octx.msg.text)
+        if tz:
+            return HandlerVerdict(disposition=Disposition.claim, priority=self.priority,
+                                  reason="user_timezone_statement")
+        return HandlerVerdict(disposition=Disposition.decline, priority=self.priority, reason="no_world_fact")
+
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        from . import world_state
+        tz = world_state.detect_user_timezone_statement(octx.msg.text)
+        await world_state.set_timezone(octx.user_id, tz, source="user_stated")
+        log.info("world_state_timezone_set user=%s", octx.user_id)
+        # honest: applies to NEW events (updating events already on the calendar isn't live yet)
+        return HandlerOutput(
+            text=f"got it, ur on {world_state.friendly_name(tz)} ({tz}). i'll use it for new events from now on 👍",
+            styled=False)
+
+
 class CalendarApprovalHandler:
     """Resolve a PENDING calendar decision — the fix for the live loop where "ya"/"add it"/"YES ADD IT"
     kept re-triggering the same offer because authorization never carried forward.
@@ -459,9 +486,11 @@ class EventCandidateHandler:
                 integ = None
             connected = integ is not None and integ.status == "connected" and integ.revoked_at is None
             if connected:
+                from . import world_state
+                _tz = await world_state.resolve_timezone(octx.user_id, default=calendar_schedule.DEFAULT_TZ)
                 event = calendar_schedule.build_calendar_event(
                     d, source="flyer/attachment" if octx.msg.attachments else "message",
-                    message_text=octx.msg.text, now=getattr(octx.msg, "timestamp", None))
+                    message_text=octx.msg.text, now=getattr(octx.msg, "timestamp", None), tz=_tz)
                 if event is not None:
                     attachment_refs = [{"media_type": getattr(a, "media_type", None),
                                         "filename": getattr(a, "filename", None),
@@ -497,7 +526,7 @@ class DefaultReplyHandler:
 def default_handlers() -> list[OutcomeHandler]:
     """Claim-candidate handlers, evaluated every turn (pure). Ordering is by explicit priority, not list
     position. A workstream inserts its handler here with a stable priority."""
-    return [CalendarApprovalHandler(), CalendarScheduleHandler(), StatusQueryHandler(),
+    return [CalendarApprovalHandler(), WorldStateHandler(), CalendarScheduleHandler(), StatusQueryHandler(),
             MissionHandoffHandler(), EventCandidateHandler()]
 
 

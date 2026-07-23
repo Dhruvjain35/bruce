@@ -138,14 +138,15 @@ def test_select_tie_at_top_priority_fails_loudly():
 
 def test_default_pipeline_shape():
     hs = co.default_handlers()
-    assert [h.name for h in hs] == ["calendar_approval", "calendar_schedule", "mission_status",
-                                    "mission_handoff", "event_candidate"]
+    assert [h.name for h in hs] == ["calendar_approval", "world_state", "calendar_schedule",
+                                    "mission_status", "mission_handoff", "event_candidate"]
     assert co.default_fallback().name == "default_reply"
     # explicit, DISTINCT priorities: decision resolve > calendar execute > status read > handoff > event > fallback
-    prios = [co.CalendarApprovalHandler().priority, co.CalendarScheduleHandler().priority,
-             co.StatusQueryHandler().priority, co.MissionHandoffHandler().priority,
-             co.EventCandidateHandler().priority, co.DefaultReplyHandler().priority]
-    assert prios == sorted(prios, reverse=True) and len(set(prios)) == 6
+    prios = [co.CalendarApprovalHandler().priority, co.WorldStateHandler().priority,
+             co.CalendarScheduleHandler().priority, co.StatusQueryHandler().priority,
+             co.MissionHandoffHandler().priority, co.EventCandidateHandler().priority,
+             co.DefaultReplyHandler().priority]
+    assert prios == sorted(prios, reverse=True) and len(set(prios)) == 7
 
 
 def test_status_query_handler_declines_without_status_language():

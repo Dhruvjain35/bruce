@@ -287,6 +287,21 @@ class OAuthState(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class UserWorldState(Base, TSV):
+    """Per-user world state for the general agent runtime (R3) — starts with the ONE fact the calendar
+    needs: the user's IANA timezone. Stored canonically (America/Chicago), never the abbreviation ("CST"),
+    with the evidence for how it was inferred so the user can inspect/clear it. One row per user."""
+
+    __tablename__ = "user_world_state"
+    id = _pk()
+    user_id = _owner()
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)          # IANA, e.g. America/Chicago
+    timezone_source: Mapped[str | None] = mapped_column(String(32), nullable=True)   # user_stated | device | calendar | inferred
+    locale: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    preferences: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    __table_args__ = (UniqueConstraint("user_id", name="uq_user_world_state_user"),)
+
+
 class ModelCost(Base):
     __tablename__ = "model_costs"
     id = _pk()
@@ -1185,4 +1200,6 @@ RLS_TABLES: tuple[str, ...] = (
     # registration audit (worker-only, same FORCE-RLS guarantee).
     "relay_bootstrap_tokens",
     "relay_registration_audit",
+    # added 0022 — runtime lane: per-user world state (timezone/preferences). tenant_isolation.
+    "user_world_state",
 )
