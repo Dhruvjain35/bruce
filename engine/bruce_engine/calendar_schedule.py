@@ -26,6 +26,7 @@ have it before any write.
 
 from __future__ import annotations
 
+import calendar as _calmod
 import datetime as _dt
 import hashlib
 import logging
@@ -50,6 +51,23 @@ _CAPABILITY = "calendar.create_event"
 
 _ISO_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?")
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# Natural-language dates the executor must handle when the model DIDN'T normalize to ISO — a flyer says
+# "July 25-26", not "2026-07-25". The runtime is the hands: it parses deterministically rather than
+# depending on the model emitting perfect ISO (the live bug that made "schedule this for me" fall through
+# to an offer). Month name/abbrev + day (+ optional range end) + optional 4-digit year.
+_MONTHS: dict[str, int] = {}
+for _i in range(1, 13):
+    _MONTHS[_calmod.month_name[_i].lower()] = _i
+    _MONTHS[_calmod.month_abbr[_i].lower()] = _i
+_MONTHS["sept"] = 9
+_MONTH_ALT = "|".join(sorted((re.escape(m) for m in _MONTHS), key=len, reverse=True))
+_NL_DATE_RE = re.compile(
+    rf"\b(?P<month>{_MONTH_ALT})\.?\s+(?P<d1>\d{{1,2}})(?:st|nd|rd|th)?"
+    rf"(?:\s*(?:-|–|—|to|through|thru|&|and|\+)\s*(?P<d2>\d{{1,2}})(?:st|nd|rd|th)?)?"
+    rf"(?:,?\s*(?P<year>\d{{4}}))?",
+    re.IGNORECASE)
+_YEAR_RE = re.compile(r"\b(20\d{2})\b")
 
 
 class ScheduleState(str, Enum):
@@ -119,6 +137,60 @@ def _extract_times(decision: "ConversationDecision") -> tuple[list[str], list[st
     return sorted(datetimes), sorted(dates)
 
 
+def _date_context_strings(decision: "ConversationDecision") -> list[str]:
+    """Every place a year or a date phrase might live — so a flyer whose date entity is just
+    "July 25-26" can still borrow the "2026" from its title/summary."""
+    out = [decision.attachment_summary, decision.proposed_goal, decision.user_visible_response]
+    for e in decision.extracted_entities:
+        out.append(e.value)
+        out.append(e.normalized)
+    return [s for s in out if s]
+
+
+def _year_hint(decision: "ConversationDecision") -> int | None:
+    for src in _date_context_strings(decision):
+        m = _YEAR_RE.search(src)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _extract_natural_dates(decision: "ConversationDecision") -> list[str]:
+    """Parse natural-language dates ("July 25-26", "Sept 3", "Aug 1 through 3") into ISO dates when the
+    model didn't normalize them. Year comes from the date phrase itself or a context hint (flyer title/
+    summary); with NO year anywhere we cannot safely place the event, so we return nothing (ask, never
+    guess a year). De-duplicated + sorted."""
+    yhint = _year_hint(decision)
+    isos: list[str] = []
+    # date-typed entities first; fall back to ALL entity values + the flyer summary if none carry a date
+    date_sources = [(e.normalized, e.value) for e in decision.extracted_entities
+                    if any(k in (e.type or "").lower() for k in ("date", "time", "day", "when"))]
+    if not date_sources:
+        date_sources = [(e.normalized, e.value) for e in decision.extracted_entities]
+        date_sources.append((decision.attachment_summary, decision.user_visible_response))
+    for normalized, value in date_sources:
+        for src in (normalized, value):
+            if not src:
+                continue
+            for m in _NL_DATE_RE.finditer(src):
+                mon = _MONTHS.get(m.group("month").lower())
+                if not mon:
+                    continue
+                year = int(m.group("year")) if m.group("year") else yhint
+                if not year:
+                    continue
+                for day in (m.group("d1"), m.group("d2")):
+                    if not day:
+                        continue
+                    try:
+                        iso = _dt.date(year, mon, int(day)).isoformat()   # validates the day
+                    except ValueError:
+                        continue
+                    if iso not in isos:
+                        isos.append(iso)
+    return sorted(isos)
+
+
 def _plus_day(iso_date: str) -> str:
     return (_dt.date.fromisoformat(iso_date) + _dt.timedelta(days=1)).isoformat()
 
@@ -154,6 +226,8 @@ def build_calendar_event(
         end = datetimes[1] if len(datetimes) > 1 else _plus_hour(start)
         return CalendarEvent(title=title, start=start, end=end, location=where or None,
                              source=source, tentative=False)
+    if not dates:
+        dates = _extract_natural_dates(decision)     # model gave no ISO -> parse the flyer's own words
     if dates:
         start = dates[0]
         end = _plus_day(dates[-1])          # exclusive end = day after the last inclusive day

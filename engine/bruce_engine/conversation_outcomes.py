@@ -292,6 +292,67 @@ class CalendarScheduleHandler:
                              mission_id=creation.mission_id)
 
 
+class CalendarApprovalHandler:
+    """Resolve a PENDING calendar decision — the fix for the live loop where "ya"/"add it"/"YES ADD IT"
+    kept re-triggering the same offer because authorization never carried forward.
+
+    When Bruce has an open awaiting_approval calendar mission and the student's reply resolves it, THIS
+    handler (highest priority — an answer to an open question outranks starting anything new) continues
+    the SAME run: approved -> execute the EXACT offered event on that mission + read-back verify; rejected
+    -> close it honestly; ambiguous -> ask ONE precise question. It never re-asks the same offer, and it
+    claims ONLY when a pending decision actually exists (so a stray "ya" with nothing open is ignored).
+    evaluate() is pure: it reads the deterministic resolver + the pending mission, mutating nothing."""
+    name = "calendar_approval"
+    priority = 80
+
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+        from . import decision_resolver
+        res = decision_resolver.resolve_approval(octx.msg.text)
+        if res is decision_resolver.Resolution.unrelated:   # cheap gate first -> no DB read for chatter
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="not_a_decision_reply")
+        try:
+            pending = await mission_kernel.latest_pending_calendar_mission(octx.user_id)
+        except Exception:                                   # unreadable -> conservatively no pending
+            pending = None
+        if pending is None:
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="no_pending_decision")
+        return HandlerVerdict(disposition=Disposition.claim, priority=self.priority,
+                              reason=f"resolve_{res.value}")
+
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        from . import calendar_schedule, decision_resolver
+        from .models import CalendarEvent
+        res = decision_resolver.resolve_approval(octx.msg.text)
+        pending = await mission_kernel.latest_pending_calendar_mission(octx.user_id)
+        if pending is None:                        # resolved by a concurrent turn between evaluate + execute
+            return HandlerOutput(text="nothing pending on my end right now.", styled=False)
+        mid = UUID(pending["mission_id"])
+        goal = pending["goal"] or {}
+        pe = goal.get("pending_event") or {}
+        if not pe.get("start"):                    # malformed pending event -> don't claim success
+            return HandlerOutput(text="i lost the details for that one, mind resending the flyer?", styled=False,
+                                 mission_id=mid)
+        event = CalendarEvent(title=pe.get("title") or "your event", start=pe["start"], end=pe.get("end"),
+                              location=pe.get("location"), source=pe.get("source"))
+        if res is decision_resolver.Resolution.rejected:
+            await mission_kernel.record_phase(octx.user_id, mid, "blocked", "approval_rejected",
+                                              status="cancelled")
+            return HandlerOutput(text="ok, i'll leave it off ur calendar.", styled=False, mission_id=mid)
+        if res is decision_resolver.Resolution.ambiguous:
+            return HandlerOutput(
+                text=f"just to confirm, do u want {(event.title or 'it').lower()} on ur google calendar? yes or no",
+                styled=False, mission_id=mid)
+        # approved -> execute the EXACT offered event on the SAME mission (stable id -> no duplicate)
+        src = (goal.get("source_message_ids") or [octx.pmid])[0]
+        digest = goal.get("attachment_digest") or ""
+        result = await calendar_schedule.schedule_event(
+            octx.user_id, mid, event, source_message_id=src, attachment_digest=digest)
+        log.info("calendar_approval_executed state=%s mission_id=%s", result.state.value, mid)
+        return HandlerOutput(text=_calendar_reply(result, event), styled=False, mission_id=mid)
+
+
 class MissionHandoffHandler:
     """A1: on an AUTHORIZED handoff, CLAIM the outcome and create ONE durable Mission (capture/track only —
     no external action), then acknowledge. Otherwise DECLINE (telemetry only), leaving the normal reply
@@ -383,16 +444,34 @@ class EventCandidateHandler:
             provenance={**provenance, "inbound_provider_message_id": octx.pmid})
         if _wants_calendar(d, octx.msg.text):
             # fact-locked copy -> runtime must NOT voice-style it (styled=False). If the calendar IS
-            # connected, don't lie that it's "unavailable" — offer to add it (the student hasn't handed
-            # it off yet, so Bruce must not write without that explicit go-ahead).
-            from . import oauth_google
+            # connected AND the event is resolvable, OFFER + create a durable PENDING decision so the
+            # student's "ya" later actually executes it (carries authorization forward). If not connected,
+            # be honest that it's unavailable. Bruce still doesn't WRITE here — this is a flyer with no
+            # scheduling verb, so it waits for the explicit go-ahead.
+            from . import calendar_schedule, mission_presentation, oauth_google
             try:
                 integ = await oauth_google.get_integration(octx.user_id)
             except Exception:                          # unknowable -> conservatively 'not connected'
                 integ = None
             connected = integ is not None and integ.status == "connected" and integ.revoked_at is None
-            tmpl = "event_saved_offer_calendar" if connected else "event_saved_calendar_unavailable"
-            reply = octx.style.template(tmpl, title=title, when=when, where=where)
+            if connected:
+                event = calendar_schedule.build_calendar_event(
+                    d, source="flyer/attachment" if octx.msg.attachments else "message")
+                if event is not None:
+                    attachment_refs = [{"media_type": getattr(a, "media_type", None),
+                                        "filename": getattr(a, "filename", None),
+                                        "sha256": getattr(a, "sha256", None)} for a in octx.msg.attachments]
+                    creation = await mission_kernel.create_pending_calendar_approval(
+                        octx.user_id, source_message_id=octx.pmid, event=event,
+                        attachment_digest=calendar_schedule.attachment_digest(attachment_refs),
+                        facts=mission_presentation.extract_flyer_facts(d), attachment_refs=attachment_refs)
+                    reply = octx.style.template("event_saved_offer_calendar", title=title, when=when, where=where)
+                    return HandlerOutput(text=reply, styled=False, event_candidate_id=ec_id,
+                                         mission_id=creation.mission_id)
+                # connected but no resolvable date -> offer still, but nothing to execute yet
+                reply = octx.style.template("event_saved_offer_calendar", title=title, when=when, where=where)
+                return HandlerOutput(text=reply, styled=False, event_candidate_id=ec_id)
+            reply = octx.style.template("event_saved_calendar_unavailable", title=title, when=when, where=where)
             return HandlerOutput(text=reply, styled=False, event_candidate_id=ec_id)
         return HandlerOutput(text=d.user_visible_response, styled=True, event_candidate_id=ec_id)
 
@@ -413,7 +492,8 @@ class DefaultReplyHandler:
 def default_handlers() -> list[OutcomeHandler]:
     """Claim-candidate handlers, evaluated every turn (pure). Ordering is by explicit priority, not list
     position. A workstream inserts its handler here with a stable priority."""
-    return [StatusQueryHandler(), CalendarScheduleHandler(), MissionHandoffHandler(), EventCandidateHandler()]
+    return [CalendarApprovalHandler(), CalendarScheduleHandler(), StatusQueryHandler(),
+            MissionHandoffHandler(), EventCandidateHandler()]
 
 
 def default_fallback() -> OutcomeHandler:
