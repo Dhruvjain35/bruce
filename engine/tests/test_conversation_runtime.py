@@ -557,3 +557,88 @@ def test_schedule_ts_disconnected_gives_connect_required_not_fake_add(clean_db, 
     assert out.status == "processed"
     reply = _run(_outbound(uid))[-1].text.lower()
     assert "✅" not in reply                                   # nothing was scheduled -> no done marker
+
+
+def _actionable_flyer_decision():
+    # an event flyer classified actionable but WITHOUT a scheduling verb -> Bruce OFFERS (creates a
+    # pending decision) rather than executing; the student's later "ya" must continue THAT decision.
+    return _decision(IntentKind.actionable, ResponseType.extraction_result, text="yo check this out",
+                     entities=[ExtractedEntity(type="event_title", value="Startup School 2026"),
+                               ExtractedEntity(type="date", value="July 25-26", normalized="July 25-26"),
+                               ExtractedEntity(type="location", value="Chase Center, SF")])
+
+
+def test_offer_then_ya_executes_same_run_no_loop(clean_db, monkeypatch):
+    # THE loop regression: flyer -> "want me to add it?" -> "ya" MUST execute, not re-ask.
+    from bruce_engine import calendar_adapter
+    monkeypatch.setattr(calendar_adapter, "GoogleCalendarAdapter",
+                        lambda *a, **kw: calendar_adapter.FakeCalendarAdapter(account="founder@example.com"))
+    uid = uuid4(); _run(_ensure_user(uid)); _seed_connected_calendar(uid)
+    flyer = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG, filename="flyer.png")
+    # turn 1: offer + pending decision
+    _run(conversation_runtime.handle(FakeChannel(), _msg("m1", text="yo check this out", attachments=[flyer]),
+                                     user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(_actionable_flyer_decision())))
+    ob1 = _run(_outbound(uid))
+    assert "want me to add it" in ob1[-1].text.lower()          # offered once
+    missions = _run(_missions(uid))
+    assert len(missions) == 1 and missions[0].phase == "awaiting_approval"
+
+    # turn 2: "ya" resolves the pending decision -> real execution, NOT another offer
+    _run(conversation_runtime.handle(FakeChannel(), _msg("m2", text="ya"),
+                                     user_id=uid, reply_target=PHONE,
+                                     reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="ya"))))
+    ob2 = _run(_outbound(uid))
+    assert len(ob2) == 2                                        # exactly one new outbound
+    reply = ob2[-1].text.lower()
+    assert "want me to add it" not in reply                     # NOT the repeated offer
+    assert "✅" in ob2[-1].text or "on ur calendar" in reply    # executed + verified
+    missions = _run(_missions(uid))
+    assert len(missions) == 1 and missions[0].status == "succeeded"   # SAME run, no duplicate mission
+
+    # loop guard: another "ya" with nothing pending must NOT re-execute or duplicate
+    _run(conversation_runtime.handle(FakeChannel(), _msg("m3", text="ya"),
+                                     user_id=uid, reply_target=PHONE,
+                                     reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="ok"))))
+    assert len(_run(_missions(uid))) == 1                       # still one mission
+
+
+def test_offer_then_no_cancels_without_creating_event(clean_db, monkeypatch):
+    from bruce_engine import calendar_adapter
+    seen = {"inserts": 0}
+    class _Spy(calendar_adapter.FakeCalendarAdapter):
+        async def insert(self, *a, **kw):
+            seen["inserts"] += 1
+            return await super().insert(*a, **kw)
+    monkeypatch.setattr(calendar_adapter, "GoogleCalendarAdapter", lambda *a, **kw: _Spy(account="x@y.com"))
+    uid = uuid4(); _run(_ensure_user(uid)); _seed_connected_calendar(uid)
+    flyer = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG, filename="flyer.png")
+    _run(conversation_runtime.handle(FakeChannel(), _msg("n1", text="yo check this out", attachments=[flyer]),
+                                     user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(_actionable_flyer_decision())))
+    _run(conversation_runtime.handle(FakeChannel(), _msg("n2", text="nah"),
+                                     user_id=uid, reply_target=PHONE,
+                                     reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="nah"))))
+    assert seen["inserts"] == 0                                 # rejection -> no event created
+    reply = _run(_outbound(uid))[-1].text.lower()
+    assert "✅" not in reply and "leave it off" in reply
+
+
+def test_schedule_this_for_me_with_natural_language_date_executes_directly(clean_db, monkeypatch):
+    # THE exact screenshot scenario: "schedule this for me" + a flyer whose date is "July 25-26" (NOT ISO).
+    # Robust parsing must build the event so it EXECUTES directly, never falling through to an offer/loop.
+    from bruce_engine import calendar_adapter
+    monkeypatch.setattr(calendar_adapter, "GoogleCalendarAdapter",
+                        lambda *a, **kw: calendar_adapter.FakeCalendarAdapter(account="founder@example.com"))
+    uid = uuid4(); _run(_ensure_user(uid)); _seed_connected_calendar(uid)
+    flyer = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG, filename="flyer.png")
+    d = _decision(IntentKind.image_understanding, ResponseType.extraction_result,
+                  text="got it, saved this event",
+                  entities=[ExtractedEntity(type="event_title", value="Y Combinator Startup School 2026"),
+                            ExtractedEntity(type="date", value="July 25-26", normalized="July 25-26"),
+                            ExtractedEntity(type="location", value="Chase Center, SF")])
+    _run(conversation_runtime.handle(FakeChannel(), _msg("s1", text="schedule this for me", attachments=[flyer]),
+                                     user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(d)))
+    reply = _run(_outbound(uid))[-1].text.lower()
+    assert "want me to add it" not in reply                     # NOT the offer -> executed directly
+    assert "✅" in _run(_outbound(uid))[-1].text or "on ur calendar" in reply
+    ms = _run(_missions(uid))
+    assert len(ms) == 1 and ms[0].status == "succeeded" and ms[0].goal["capability"] == "calendar.create_event"

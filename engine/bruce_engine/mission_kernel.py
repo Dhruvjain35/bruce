@@ -116,6 +116,76 @@ async def latest_active_handoff_mission(user_id: UUID) -> dict | None:
                 "short_status": m.short_status, "goal": m.goal}
 
 
+CALENDAR_CAPABILITY = "calendar.create_event"
+
+
+async def create_pending_calendar_approval(
+    user_id: UUID, *, source_message_id: str, event, attachment_digest: str = "",
+    facts: dict | None = None, attachment_refs: list[dict] | None = None,
+) -> "MissionCreation":
+    """Create a durable mission holding a PENDING calendar-create decision + the exact event to run on
+    approval. This is the state that carries authorization forward: when Bruce offers "add it to ur
+    calendar?", the offer becomes a real awaiting_approval mission, so the student's later "ya" resolves
+    THIS decision and continues the same run — instead of re-asking from scratch (the live loop bug).
+
+    Idempotent on (owner, source message, capability): re-offering the same flyer references the existing
+    pending decision rather than stacking duplicates."""
+    key = handoff_idempotency_key(source_message_id, CALENDAR_CAPABILITY)
+    goal = {
+        "capability": CALENDAR_CAPABILITY,
+        "proposed_goal": f"add {event.title} to calendar"[:200],
+        "source_message_ids": [source_message_id],
+        "source_attachment_refs": attachment_refs or [],
+        "attachment_digest": attachment_digest,
+        "extracted_facts": facts or {},
+        # the EXACT event to create on approval — so approval executes what was offered, not a re-parse
+        "pending_event": {"title": event.title, "start": event.start, "end": event.end,
+                          "location": event.location, "source": event.source},
+        "decision": {"type": "approve_calendar_create", "status": "pending"},
+    }
+    phase = MissionPhase.awaiting_approval.value
+    async with user_session(user_id) as s:
+        existing = (await s.execute(select(schema.Mission).where(
+            schema.Mission.user_id == user_id,
+            schema.Mission.idempotency_key == key))).scalar_one_or_none()
+        if existing is not None:
+            return MissionCreation(mission_id=existing.id, created=False, phase=existing.phase)
+        mission = schema.Mission(
+            user_id=user_id, kind=HANDOFF_KIND, status="running", phase=phase,
+            short_status=f"awaiting ok: add {event.title} to calendar"[:200], goal=goal, idempotency_key=key)
+        s.add(mission)
+        try:
+            await s.flush()
+        except IntegrityError:
+            async with user_session(user_id) as s2:
+                ex = (await s2.execute(select(schema.Mission).where(
+                    schema.Mission.user_id == user_id,
+                    schema.Mission.idempotency_key == key))).scalar_one_or_none()
+                if ex is not None:
+                    return MissionCreation(mission_id=ex.id, created=False, phase=ex.phase)
+            raise
+        s.add(schema.MissionPhaseEvent(
+            user_id=user_id, mission_id=mission.id, phase=phase, short_status="awaiting_approval"))
+        await s.flush()
+        return MissionCreation(mission_id=mission.id, created=True, phase=phase)
+
+
+async def latest_pending_calendar_mission(user_id: UUID) -> dict | None:
+    """The most recent OPEN calendar-create decision awaiting the student's ok. Owner-scoped; None if
+    there is nothing pending. Backs 'ya' / 'add it' continuing the exact offered event."""
+    async with user_session(user_id) as s:
+        m = (await s.execute(select(schema.Mission).where(
+            schema.Mission.user_id == user_id,
+            schema.Mission.kind == HANDOFF_KIND,
+            schema.Mission.status == "running",
+            schema.Mission.phase == MissionPhase.awaiting_approval.value,
+            schema.Mission.goal["capability"].astext == CALENDAR_CAPABILITY).order_by(
+            schema.Mission.created_at.desc()).limit(1))).scalar_one_or_none()
+        if m is None:
+            return None
+        return {"mission_id": str(m.id), "goal": m.goal}
+
+
 async def record_phase(
     user_id: UUID, mission_id: UUID, phase: str, short_status: str, *, status: str | None = None,
 ) -> bool:
