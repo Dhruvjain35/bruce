@@ -1,0 +1,347 @@
+# Bruce integration registry (I0.1) — the CANONICAL provider registry + honest per-ACTION status.
+#
+# Two hard rules (product correction):
+#   1. Status is per ACTION, never one vague provider-level "supported" boolean. A provider row with an
+#      official API is NOT proof any specific operation works.
+#   2. Nothing is marked `implemented`/`live_verified` because an interface, adapter, fake, OAuth stub, or
+#      logo exists — only after a real authorized round-trip against the provider with a real user.
+#
+# The IntegrationCapabilityGraph (I0.3) reads THIS file to answer "which connected provider can do X, is it
+# reversible, how is it verified, what's the safest fallback". Keep it honest or the graph plans fictions.
+
+meta:
+  version: 1
+  spec: bruce_complete_capability_universe_voice_life_finance_v2(3).md
+  repo_commit_at_audit: 1ce39d3
+  note: >
+    No provider is CONNECTED in any environment yet. Google OAuth is credential-blocked (GOOGLE_CLIENT_ID/
+    SECRET unset) and BRUCE_ENCRYPTION_KEY is unset, so no provider token can be stored. Existing code
+    (oauth_google.py = google_calendar OAuth+PKCE; calendar_adapter.py = Calendar write+verify;
+    school_connector.py = provider-neutral ConnectorResult; canvas_fake.py = fake) is real but unreachable
+    from the live runtime. This registry records the HONEST target state + what unblocks each action.
+
+  # Connection status a user-facing "Connect" surface may show (item 13). Exactly one per integration.
+  connection_status_vocab:
+    - connected                # a live, health-checked authorization exists for this user+account
+    - connect                  # supported + credentialed, user just needs to authorize
+    - reconnect                # token expired/revoked; re-auth needed
+    - requires_school_approval # needs an institution developer key / LTI / admin approval
+    - partner_required         # needs a provider partnership/agreement before any real use
+    - import_only              # one-way import (export/feed), no live connection
+    - browser_beta             # no sufficient API; controlled browser adapter only
+    - planned                  # designed/next, not built
+    - unsupported              # intentionally not built (policy / platform limit)
+    - credential_blocked       # code exists but the OAuth app / API key isn't configured yet (founder STOP)
+
+  # Per-ACTION capability status (recorded independently). The HONEST lifecycle — a fake is never a
+  # milestone, and the terminal states require a real provider round-trip (there is deliberately no vague
+  # "implemented"; "implemented" == a live_*_verified state).
+  action_status_vocab:
+    - planned                  # designed/next, no code
+    - fake_tested              # a fake/contract test exists ONLY (CI). NOT a real integration, NOT progress
+    - credential_blocked       # real adapter written; blocked solely on the OAuth app / API key (founder STOP)
+    - real_connected           # a real account is authorized; no verified operation yet
+    - live_read_verified       # a real READ round-trip, verified from the provider
+    - live_write_verified      # a real WRITE, verified by fetching it back from the provider
+    - live_execution_verified  # a real multi-step execution, verified end-to-end from the provider
+    - school_approval_required # needs institution approval before it can run
+    - partner_required         # needs a provider partnership
+    - browser_beta             # via a controlled browser adapter, not an API
+    - unsupported              # not offered
+
+  # A per-action capability MAY also carry these operation-class flags (product correction list):
+  operation_classes: [read, write, execute, verify, subscribe]
+
+  # Founder STOPs that gate LIVE connection (nothing below is live until these exist):
+  blocking_credentials:
+    - GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET (+ consent screen + redirect https://bruce-api-.../v1/integrations/google/callback)
+    - BRUCE_ENCRYPTION_KEY (Fernet, secret) — required before ANY provider token is stored
+    - MICROSOFT (Azure app) client_id/secret/tenant
+    - CANVAS developer key or personal token (per-institution; often needs school approval)
+
+integrations:
+
+  # ---------------- WAVE I1: STUDENT CORE (Google) ----------------
+  - integration_id: google_calendar
+    display_name: Google Calendar
+    category: calendar
+    provider: google
+    official_api_available: true
+    auth_type: oauth2_pkce
+    supported_account_types: [personal, workspace_edu]
+    scopes: ["https://www.googleapis.com/auth/calendar.events"]
+    connection_status: credential_blocked        # oauth_google + calendar_adapter exist; GOOGLE_* unset
+    autonomy_ceiling: A2                          # create/update with a confirmation gate for new invitees
+    risk: medium
+    reversibility: reversible                     # events can be updated/deleted
+    idempotency_support: true                     # calendar_adapter.deterministic_event_id + mission_marker
+    verification_methods: [provider_readback]     # get(event_id) after insert; provider is source of truth
+    webhook_or_polling: [push_channels, polling]
+    credential_requirements: [GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, BRUCE_ENCRYPTION_KEY]
+    institutional_approval_requirements: none     # personal accounts; edu workspace may restrict
+    partner_requirements: none
+    browser_fallback_status: not_needed
+    normalized_entities: [Event, ScheduleEvent]
+    events: [event_changed]
+    privacy_notes: "narrow calendar.events scope only; no full-account read"
+    retention_notes: "store provider event id + url + evidence, not the full event body"
+    test_coverage: [engine/tests/test_calendar_adapter*.py]
+    deployed_commit: null
+    live_verification: false
+    actions:
+      - {id: search_events,        status: credential_blocked, classes: [read]}
+      - {id: check_availability,   status: credential_blocked, classes: [read]}
+      - {id: create_event,         status: credential_blocked, classes: [write, execute, verify]}
+      - {id: update_event,         status: credential_blocked, classes: [write, execute, verify]}
+      - {id: delete_event,         status: credential_blocked, classes: [write, execute, verify]}
+      - {id: detect_conflicts,     status: planned, classes: [read]}
+      - {id: invite_attendees,     status: planned, classes: [write], note: "new-recipient approval gate"}
+      - {id: recurring_events,     status: planned, classes: [write]}
+      - {id: provider_confirmation,status: credential_blocked, classes: [verify]}
+    known_limitations: "edu workspace admins can disable third-party calendar API; per-account"
+
+  - integration_id: gmail
+    display_name: Gmail
+    category: email
+    provider: google
+    official_api_available: true
+    auth_type: oauth2_pkce
+    supported_account_types: [personal, workspace_edu]
+    scopes: ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"]
+    connection_status: planned
+    autonomy_ceiling: A2                          # draft freely; SEND is approval-gated (new recipient/high risk)
+    risk: high
+    reversibility: irreversible                   # a sent email cannot be unsent
+    idempotency_support: true                     # dedup on a per-mission send key
+    verification_methods: [provider_readback]     # confirm the sent message id exists in Sent
+    webhook_or_polling: [pubsub_watch, polling]
+    credential_requirements: [GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, BRUCE_ENCRYPTION_KEY]
+    normalized_entities: [Communication, Thread, Person, Draft, DeliveryReceipt, Attachment]
+    events: [new_message, reply_received]
+    privacy_notes: "read scope reads inbox — surface only what a query needs; never bulk-export"
+    retention_notes: "store message ids + evidence, not full bodies"
+    test_coverage: []
+    live_verification: false
+    actions:
+      - {id: search_messages,   status: planned, classes: [read]}
+      - {id: read_thread,       status: planned, classes: [read]}
+      - {id: draft_reply,       status: planned, classes: [write]}
+      - {id: send_in_thread,    status: planned, classes: [write, execute, verify], note: "approval-gated; verify sent state"}
+      - {id: attach_file,       status: planned, classes: [write]}
+      - {id: track_reply,       status: planned, classes: [read, subscribe]}
+    known_limitations: "send is irreversible -> always approval-gated + verified; never claim delivered without readback"
+
+  - integration_id: google_drive
+    display_name: Google Drive
+    category: files
+    provider: google
+    official_api_available: true
+    auth_type: oauth2_pkce
+    scopes: ["https://www.googleapis.com/auth/drive.file"]
+    connection_status: planned
+    autonomy_ceiling: A2
+    risk: medium
+    reversibility: reversible
+    idempotency_support: true
+    verification_methods: [provider_readback]
+    credential_requirements: [GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, BRUCE_ENCRYPTION_KEY]
+    normalized_entities: [Attachment, Material]
+    live_verification: false
+    actions:
+      - {id: search_files,   status: planned, classes: [read]}
+      - {id: read_file,      status: planned, classes: [read]}
+      - {id: upload_file,    status: planned, classes: [write, verify]}
+      - {id: pick_current_version, status: planned, classes: [read], note: "'send the right file' -> latest resume"}
+      - {id: share_under_policy, status: planned, classes: [write], note: "permission-check + approval gate"}
+    known_limitations: "drive.file scope only sees files Bruce created/opened — no full-drive read"
+
+  - integration_id: google_docs
+    display_name: Google Docs
+    category: files
+    provider: google
+    official_api_available: true
+    auth_type: oauth2_pkce
+    scopes: ["https://www.googleapis.com/auth/documents"]
+    connection_status: planned
+    autonomy_ceiling: A2
+    risk: medium
+    reversibility: reversible
+    credential_requirements: [GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, BRUCE_ENCRYPTION_KEY]
+    normalized_entities: [Material]
+    live_verification: false
+    actions:
+      - {id: read_doc,   status: planned, classes: [read]}
+      - {id: create_doc, status: planned, classes: [write, verify]}
+      - {id: edit_doc,   status: planned, classes: [write, verify]}
+
+  # ---------------- WAVE I1/I3: SCHOOL ----------------
+  - integration_id: canvas
+    display_name: Canvas LMS
+    category: school
+    provider: instructure
+    official_api_available: true
+    auth_type: oauth2_or_developer_key
+    supported_account_types: [student]
+    scopes: [url:GET|/api/v1/courses, url:GET|/api/v1/courses/:id/assignments, url:GET|/api/v1/announcements]
+    connection_status: requires_school_approval    # per-institution developer key; canvas_fake is the only adapter today
+    autonomy_ceiling: A0                            # READ-only first; any mutation is a later, gated wave
+    risk: medium
+    reversibility: read_only
+    idempotency_support: true
+    verification_methods: [content_hash, connector_change_record]  # school_store two-layer change detection
+    webhook_or_polling: [polling_cursor]
+    credential_requirements: [canvas_developer_key_or_personal_token]
+    institutional_approval_requirements: "per-institution developer key OR LTI 1.3 registration"
+    partner_requirements: none
+    browser_fallback_status: not_needed
+    normalized_entities: [Institution, Term, Course, Assignment, Submission, Grade, Material, Announcement, ScheduleEvent]
+    events: [assignment_changed, announcement_posted, grade_posted]
+    privacy_notes: "student-scope only; own courses/submissions/grades, never a class gradebook"
+    test_coverage: [engine/tests/test_school_connector_contract.py, engine/tests/test_school_queries.py]
+    live_verification: false
+    actions:
+      - {id: list_courses,      status: fake_tested, classes: [read]}       # real vs fake: canvas_fake only
+      - {id: list_assignments,  status: fake_tested, classes: [read]}
+      - {id: submission_state,  status: fake_tested, classes: [read]}
+      - {id: did_i_submit,      status: fake_tested, classes: [read]}       # school_queries.did_i_submit_this
+      - {id: what_changed,      status: fake_tested, classes: [read]}
+      - {id: grades_feedback,   status: fake_tested, classes: [read], note: "student-scope 'limited'"}
+      - {id: submit_assignment, status: school_approval_required, classes: [write, execute, verify]}
+    known_limitations: "no real Canvas adapter yet (canvas_fake only); per-institution auth; whole school domain currently dead in prod"
+
+  - integration_id: google_classroom
+    display_name: Google Classroom
+    category: school
+    provider: google
+    official_api_available: true
+    auth_type: oauth2_pkce
+    scopes: ["https://www.googleapis.com/auth/classroom.courses.readonly", "https://www.googleapis.com/auth/classroom.coursework.me.readonly"]
+    connection_status: planned
+    autonomy_ceiling: A0
+    risk: medium
+    reversibility: read_only
+    credential_requirements: [GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, BRUCE_ENCRYPTION_KEY]
+    institutional_approval_requirements: "some edu domains gate the Classroom API"
+    normalized_entities: [Course, Assignment, Submission, Material, Announcement]
+    live_verification: false
+    actions:
+      - {id: list_courses,     status: planned, classes: [read]}
+      - {id: list_coursework,  status: planned, classes: [read]}
+      - {id: submission_state, status: planned, classes: [read]}
+
+  # ---------------- WAVE I2: MICROSOFT + PRODUCTIVITY ----------------
+  - integration_id: outlook_mail
+    display_name: Outlook Mail
+    category: email
+    provider: microsoft
+    official_api_available: true
+    auth_type: oauth2_pkce
+    scopes: [Mail.Read, Mail.Send]
+    connection_status: planned
+    autonomy_ceiling: A2
+    risk: high
+    reversibility: irreversible
+    credential_requirements: [MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, MICROSOFT_TENANT, BRUCE_ENCRYPTION_KEY]
+    normalized_entities: [Communication, Thread, Person, Draft, DeliveryReceipt]
+    live_verification: false
+    actions:
+      - {id: search_messages, status: planned, classes: [read]}
+      - {id: draft_reply,     status: planned, classes: [write]}
+      - {id: send_in_thread,  status: planned, classes: [write, execute, verify]}
+
+  - integration_id: outlook_calendar
+    display_name: Outlook Calendar
+    category: calendar
+    provider: microsoft
+    official_api_available: true
+    auth_type: oauth2_pkce
+    scopes: [Calendars.ReadWrite]
+    connection_status: planned
+    autonomy_ceiling: A2
+    risk: medium
+    reversibility: reversible
+    credential_requirements: [MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, MICROSOFT_TENANT, BRUCE_ENCRYPTION_KEY]
+    normalized_entities: [Event, ScheduleEvent]
+    live_verification: false
+    actions:
+      - {id: check_availability, status: planned, classes: [read]}
+      - {id: create_event,       status: planned, classes: [write, execute, verify]}
+      - {id: update_event,       status: planned, classes: [write, execute, verify]}
+
+  - integration_id: notion
+    display_name: Notion
+    category: productivity
+    provider: notion
+    official_api_available: true
+    auth_type: oauth2
+    scopes: [read_content, insert_content, update_content]
+    connection_status: planned
+    autonomy_ceiling: A2
+    risk: low
+    reversibility: reversible
+    credential_requirements: [NOTION_CLIENT_ID, NOTION_CLIENT_SECRET, BRUCE_ENCRYPTION_KEY]
+    normalized_entities: [Material, Task]
+    live_verification: false
+    actions:
+      - {id: search,      status: planned, classes: [read]}
+      - {id: create_page, status: planned, classes: [write, verify]}
+      - {id: update_page, status: planned, classes: [write, verify]}
+
+  - integration_id: todoist
+    display_name: Todoist
+    category: tasks
+    provider: todoist
+    official_api_available: true
+    auth_type: oauth2
+    scopes: [data:read_write]
+    connection_status: planned
+    autonomy_ceiling: A2
+    risk: low
+    reversibility: reversible
+    idempotency_support: true
+    credential_requirements: [TODOIST_CLIENT_ID, TODOIST_CLIENT_SECRET, BRUCE_ENCRYPTION_KEY]
+    normalized_entities: [Task]
+    live_verification: false
+    actions:
+      - {id: create_task,   status: planned, classes: [write, verify]}
+      - {id: complete_task, status: planned, classes: [write, verify]}
+      - {id: search,        status: planned, classes: [read]}
+
+  # ---------------- WAVE I6: DEVELOPER PARITY (student builders) ----------------
+  - integration_id: github
+    display_name: GitHub
+    category: developer
+    provider: github
+    official_api_available: true
+    auth_type: oauth2_or_app
+    scopes: [repo, read:org]
+    connection_status: planned
+    autonomy_ceiling: A2
+    risk: medium
+    reversibility: partial
+    credential_requirements: [GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, BRUCE_ENCRYPTION_KEY]
+    normalized_entities: [Task]
+    live_verification: false
+    actions:
+      - {id: list_issues,  status: planned, classes: [read]}
+      - {id: read_repo,    status: planned, classes: [read]}
+      - {id: create_issue, status: planned, classes: [write, verify]}
+
+  # ---------------- WAVE I7/I8: LIFE + FINANCE (later, gated) ----------------
+  - integration_id: payments
+    display_name: Payments (provider-hosted)
+    category: finance
+    provider: partner
+    official_api_available: false
+    auth_type: provider_hosted_sheet
+    connection_status: partner_required
+    autonomy_ceiling: A0                             # NEVER autonomous; provider-hosted sheet + owner authorization
+    risk: critical
+    reversibility: varies
+    credential_requirements: [payment_partner_agreement]
+    partner_requirements: "provider partnership; minors need guardian/account-owner authorization + merchant/amount/category/time limits"
+    normalized_entities: [PaymentAuthorization, Order, Return, Receipt, Subscription]
+    live_verification: false
+    actions:
+      - {id: authorize_payment, status: partner_required, classes: [execute], note: "provider-tokenized only; NEVER store raw credentials"}
+    known_limitations: "policy STOP: payment/identity/legal/guardian gates apply; not built"
