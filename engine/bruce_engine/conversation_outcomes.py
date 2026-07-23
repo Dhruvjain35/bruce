@@ -184,6 +184,105 @@ class StatusQueryHandler:
         return HandlerOutput(text=mission_presentation.render_status(state), styled=False)
 
 
+def _calendar_reply(result, event) -> str:
+    """The honest, fact-locked reply for a calendar outcome. NEVER says 'done' unless the read-back
+    verified. All copy is lowercase Bruce voice; the only dash is the numeric date range the outbound
+    gate preserves as a fact."""
+    from .calendar_schedule import ScheduleState, human_when
+    when = human_when(event)
+    title = (event.title or "that").lower()
+    if result.state is ScheduleState.verified:
+        base = f"done, {title} is on ur calendar for {when} ✅"
+        if result.all_day:
+            base += "\ni saved it as an all-day event since there's no time on the flyer."
+        return base
+    if result.state is ScheduleState.not_connected:
+        return (f"i've got {title} ready to add, but ur google calendar isn't connected yet. "
+                f"connect it and i'll put it on there for {when}.")
+    if result.state is ScheduleState.verification_inconclusive:
+        return (f"i added {title} to ur calendar but couldn't confirm it stuck when i checked back, "
+                f"so i'm not calling it done. want me to recheck?")
+    return (f"i tried to add {title} to ur calendar for {when} but it didn't go through, so nothing's "
+            f"on there. want me to try again?")
+
+
+class CalendarScheduleHandler:
+    """Real Google Calendar execution. On an AUTHORIZED handoff of an EVENT with a resolvable date to the
+    calendar capability, CLAIM and actually create + read-back-verify the event on the student's connected
+    Google Calendar — then reply only after that verification. Outranks generic capture (70 > 60) because
+    it completes the action rather than merely tracking it; when the calendar isn't connected it still owns
+    the outcome and replies honestly (never a fake 'added'). evaluate() is PURE: deterministic handoff
+    policy + grounded entities + a read-only buildability check, no mutation."""
+    name = "calendar_schedule"
+    priority = 70
+
+    def _decide(self, octx: OutcomeContext) -> handoff.HandoffDecision:
+        d = octx.decision
+        inp = handoff.HandoffInputs(
+            user_text=octx.msg.text,
+            model_needs_mission=getattr(d, "needs_mission", False),
+            model_proposed_goal=getattr(d, "proposed_goal", None),
+            model_suggested_capability=(d.required_capabilities[0] if d.required_capabilities else None),
+            capability_supported=True, risk="low", reversible=True, confidence=d.confidence)
+        return handoff.decide_handoff(inp)
+
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+        from . import calendar_schedule, oauth_google
+        d = octx.decision
+        decision = self._decide(octx)
+        # cheap, pure gates first — only a real, dated, calendar-bound event handoff is a candidate
+        if not decision.authorizes_mutation:
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="not_authorized_handoff")
+        if not (_is_event(d) and _wants_calendar(d, octx.msg.text)):
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="not_a_calendar_event")
+        if calendar_schedule.build_calendar_event(d) is None:
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="no_resolvable_date")
+        # only NOW read the connection (read-only, so evaluate stays pure). If the calendar isn't
+        # connected, DECLINE so the generic capture path (MissionHandoffHandler) owns it exactly as it
+        # did before calendar execution existed — Bruce captures + tracks the handoff, no nag, no write.
+        try:
+            integ = await oauth_google.get_integration(octx.user_id)
+        except Exception:
+            integ = None
+        connected = (integ is not None and integ.status == "connected"
+                     and integ.revoked_at is None and bool(integ.refresh_token_encrypted))
+        if not connected:
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="calendar_not_connected")
+        return HandlerVerdict(disposition=Disposition.claim, priority=self.priority,
+                              reason="calendar_event_handoff", telemetry=decision.telemetry())
+
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        from . import calendar_schedule, mission_presentation
+        d = octx.decision
+        source = "flyer/attachment" if octx.msg.attachments else "message"
+        event = calendar_schedule.build_calendar_event(d, source=source)
+        if event is None:                              # defense in depth (evaluate already gated it)
+            return HandlerOutput(text="i couldn't pin down the date for that, when is it?", styled=False)
+        goal_text = (d.proposed_goal or event.title or "add this to your calendar")[:120]
+        facts = mission_presentation.extract_flyer_facts(d)
+        attachment_refs = [{"media_type": getattr(a, "media_type", None),
+                            "filename": getattr(a, "filename", None),
+                            "sha256": getattr(a, "sha256", None)} for a in octx.msg.attachments]
+        creation = await mission_kernel.create_handoff_mission(
+            octx.user_id, capability=calendar_schedule._CAPABILITY, source_message_id=octx.pmid,
+            proposed_goal=goal_text, short_status=f"add to calendar: {event.title}"[:120],
+            autonomy=str(getattr(d, "autonomy", "A0") or "A0"), risk="low",
+            attachment_refs=attachment_refs,
+            evidence={"reply_to_message_id": getattr(octx.msg, "reply_to_message_id", None)},
+            extracted_facts=facts)
+        digest = calendar_schedule.attachment_digest(attachment_refs)
+        result = await calendar_schedule.schedule_event(
+            octx.user_id, creation.mission_id, event,
+            source_message_id=octx.pmid, attachment_digest=digest)
+        log.info("calendar_schedule state=%s mission_id=%s", result.state.value, creation.mission_id)
+        return HandlerOutput(text=_calendar_reply(result, event), styled=False,
+                             mission_id=creation.mission_id)
+
+
 class MissionHandoffHandler:
     """A1: on an AUTHORIZED handoff, CLAIM the outcome and create ONE durable Mission (capture/track only —
     no external action), then acknowledge. Otherwise DECLINE (telemetry only), leaving the normal reply
@@ -274,8 +373,17 @@ class EventCandidateHandler:
             missing_fields=[f for f in ("date",) if not when] or None,
             provenance={**provenance, "inbound_provider_message_id": octx.pmid})
         if _wants_calendar(d, octx.msg.text):
-            # fact-locked copy -> runtime must NOT voice-style it (styled=False)
-            reply = octx.style.template("event_saved_calendar_unavailable", title=title, when=when, where=where)
+            # fact-locked copy -> runtime must NOT voice-style it (styled=False). If the calendar IS
+            # connected, don't lie that it's "unavailable" — offer to add it (the student hasn't handed
+            # it off yet, so Bruce must not write without that explicit go-ahead).
+            from . import oauth_google
+            try:
+                integ = await oauth_google.get_integration(octx.user_id)
+            except Exception:                          # unknowable -> conservatively 'not connected'
+                integ = None
+            connected = integ is not None and integ.status == "connected" and integ.revoked_at is None
+            tmpl = "event_saved_offer_calendar" if connected else "event_saved_calendar_unavailable"
+            reply = octx.style.template(tmpl, title=title, when=when, where=where)
             return HandlerOutput(text=reply, styled=False, event_candidate_id=ec_id)
         return HandlerOutput(text=d.user_visible_response, styled=True, event_candidate_id=ec_id)
 
@@ -296,7 +404,7 @@ class DefaultReplyHandler:
 def default_handlers() -> list[OutcomeHandler]:
     """Claim-candidate handlers, evaluated every turn (pure). Ordering is by explicit priority, not list
     position. A workstream inserts its handler here with a stable priority."""
-    return [StatusQueryHandler(), MissionHandoffHandler(), EventCandidateHandler()]
+    return [StatusQueryHandler(), CalendarScheduleHandler(), MissionHandoffHandler(), EventCandidateHandler()]
 
 
 def default_fallback() -> OutcomeHandler:

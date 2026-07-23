@@ -160,7 +160,8 @@ def test_read_back_with_wrong_title_is_not_verified():
 def test_provider_failure_propagates_rather_than_reporting_success():
     """A broken calendar must surface as an error, never as a quiet unverified 'done'."""
     class Broken(FakeCalendarAdapter):
-        async def insert(self, event, event_id, *, mission_id=None):
+        async def insert(self, event, event_id, *, mission_id=None, source_message_id=None,
+                         attachment_digest=None):
             raise CalendarError("Google events.insert failed: HTTP 503")
 
     async def run():

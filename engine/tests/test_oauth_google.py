@@ -39,7 +39,7 @@ from bruce_engine.repositories import PostgresUserRepository
 
 users = PostgresUserRepository()
 KEY = crypto.generate_key()
-SCOPE = "https://www.googleapis.com/auth/calendar.events"
+SCOPE = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/calendar.events"
 
 
 @pytest.fixture(autouse=True)
@@ -257,7 +257,9 @@ def test_refresh_token_is_encrypted_at_rest(clean_db):
         assert "rt-live-secret" not in row.refresh_token_encrypted
         assert crypto.decrypt(row.refresh_token_encrypted) == "rt-live-secret"
         assert row.provider_account_id == "student@school.edu"
-        assert SCOPE in row.scopes
+        # scopes are stored as the individual granted scopes (space-split), calendar.events among them
+        assert "https://www.googleapis.com/auth/calendar.events" in row.scopes
+        assert "https://www.googleapis.com/auth/userinfo.email" in row.scopes
 
     asyncio.run(run())
 

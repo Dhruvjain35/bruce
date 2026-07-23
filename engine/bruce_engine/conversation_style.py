@@ -135,6 +135,9 @@ DEFAULT_TEMPLATES: dict[str, str] = {
         "got it, saved this event:\n{title}\n{when}{where}\n"
         "heads up: i can't add it to your calendar yet (not connected). "
         "i've kept it so you don't have to resend."),
+    "event_saved_offer_calendar": (
+        "got it, saved this event:\n{title}\n{when}{where}\n"
+        "want me to add it to ur google calendar? just say the word and i'll put it on there."),
     "could_not_read_attachment": "couldn't open that one 😕 can you resend it? (a clearer photo or the file works)",
     "reply_attachment_pending": "i can see which pic ur replying to, but the file isn't downloaded on the Bruce Mac yet. give it a sec and try again",
     "reply_target_unavailable": "i can tell u replied to an earlier msg but i can't pull that exact one up anymore. mind resending it so i'm looking at the right thing?",

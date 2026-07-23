@@ -515,7 +515,13 @@ async def google_status(user: AuthenticatedUser = Depends(current_user)) -> dict
         return {"provider": "google_calendar", "connection_status": "connect", "account": None}
     if getattr(integ, "revoked_at", None) is not None:
         return {"provider": "google_calendar", "connection_status": "reconnect", "account": integ.provider_account_id}
-    return {"provider": "google_calendar", "connection_status": "connected", "account": integ.provider_account_id}
+    return {
+        "provider": "google_calendar",
+        "connection_status": "connected",
+        "account": integ.provider_account_id,               # the exact Google account every op is bound to
+        "calendar_id": integ.selected_calendar_id or "primary",
+        "scopes": integ.scopes or [],
+    }
 
 
 # ------------------------------------------------------- Relay boundary (self-hosted iMessage — Alpha)

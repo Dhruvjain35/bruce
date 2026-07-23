@@ -51,9 +51,14 @@ REVOKE_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 PROVIDER = "google_calendar"
-# Least privilege: events only. NOT `calendar`, which would let Bruce delete whole calendars — it
-# has no reason to, and a scope you don't request is one you can't be exploited through.
-SCOPES = ("https://www.googleapis.com/auth/calendar.events",)
+# Least privilege on the WRITE surface: events only. NOT `calendar`, which would let Bruce delete
+# whole calendars — it has no reason to, and a scope you don't request is one you can't be exploited
+# through. `openid`+`userinfo.email` are READ-ONLY identity scopes: they let the callback learn WHICH
+# Google account connected (shown in Settings, and bound to every calendar op) — a real safety
+# property. Proven necessary: with calendar.events alone, every identity endpoint returns 401/403, so
+# Bruce cannot even name the account it is writing to.
+CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+SCOPES = ("openid", "https://www.googleapis.com/auth/userinfo.email", CALENDAR_SCOPE)
 STATE_TTL = datetime.timedelta(minutes=30)  # a real connect flow (read msg -> click -> Google sign-in ->
 #                                             consent -> redirect) easily exceeds 10 min; 30 is the balance.
 
@@ -243,7 +248,8 @@ async def handle_callback(
         payload = r.json()
 
         granted = tuple((payload.get("scope") or "").split())
-        if not any(s in granted for s in SCOPES):
+        # calendar.events is the ONLY mandatory scope — the identity scopes are best-effort niceties.
+        if CALENDAR_SCOPE not in granted:
             raise InsufficientScope(
                 "the Google account did not grant calendar access, so Bruce cannot add events"
             )
@@ -292,10 +298,36 @@ async def _store_integration(*, user_id: UUID, refresh_token: str, scopes: list[
             s.add(row)
         row.refresh_token_encrypted = ciphertext
         row.scopes = scopes
-        row.provider_account_id = account
+        # Don't wipe a previously-learned account with a None from a connect that lacked the identity
+        # scope — identity, once known, stays known.
+        if account:
+            row.provider_account_id = account
+        row.selected_calendar_id = row.selected_calendar_id or "primary"
         row.status = "connected"
         row.revoked_at = None
         await s.flush()
+
+
+async def backfill_account(user_id: UUID, account: str) -> bool:
+    """Record the connected account learned from an AUTHORITATIVE source (the organizer/creator email
+    Google returns on a created event), for a connection made without the identity scope. Only sets it
+    when currently unknown, so a re-consent that DID carry identity is never overwritten. Returns True
+    if it wrote. Owner-scoped."""
+    if not account:
+        return False
+    async with user_session(user_id) as s:
+        row = (
+            await s.execute(
+                select(schema.Integration).where(
+                    schema.Integration.user_id == user_id, schema.Integration.provider == PROVIDER
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None or row.provider_account_id:
+            return False
+        row.provider_account_id = account
+        await s.flush()
+        return True
 
 
 async def get_integration(user_id: UUID) -> schema.Integration | None:

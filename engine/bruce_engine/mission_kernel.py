@@ -116,6 +116,32 @@ async def latest_active_handoff_mission(user_id: UUID) -> dict | None:
                 "short_status": m.short_status, "goal": m.goal}
 
 
+async def record_phase(
+    user_id: UUID, mission_id: UUID, phase: str, short_status: str, *, status: str | None = None,
+) -> bool:
+    """Append ONE durable phase event to an existing mission and move its live phase/short_status
+    (optionally its status). Owner-scoped; a no-op returning False if the mission isn't the caller's.
+
+    This is how an EXECUTING capability (e.g. the real calendar write) records the honest states the
+    product must never skip — creation_attempted -> created -> fetched_back -> verified / failed /
+    verification_inconclusive — each as a persisted event, never merely a log line. The mission is
+    only marked ``succeeded`` by the caller AFTER an independent read-back verified the result."""
+    async with user_session(user_id) as s:
+        m = (await s.execute(select(schema.Mission).where(
+            schema.Mission.id == mission_id, schema.Mission.user_id == user_id))).scalar_one_or_none()
+        if m is None:
+            return False
+        m.phase = phase
+        m.short_status = short_status[:200]
+        if status is not None:
+            m.status = status
+        s.add(schema.MissionPhaseEvent(
+            user_id=user_id, mission_id=mission_id, phase=phase, short_status=short_status[:200]))
+        await s.flush()
+        log.info("mission_phase mission_id=%s phase=%s status=%s", mission_id, phase, status or m.status)
+        return True
+
+
 async def get_mission_state(user_id: UUID, mission_id: UUID) -> dict | None:
     """Owner-scoped read of a mission's persisted state — backs 'what are u doing with that?'. Content-safe
     (returns the durable goal/phase/status, never chain-of-thought). None if not found / not the owner."""
