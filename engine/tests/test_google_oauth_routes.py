@@ -66,3 +66,28 @@ def test_callback_missing_state_is_honest_error_no_leak():
 def test_callback_consent_denied_is_honest_error():
     r = client.get("/v1/integrations/google/callback", params={"error": "access_denied"})
     assert r.status_code == 400 and "couldn't connect" in r.text.lower()
+
+
+def test_callback_unexpected_error_never_500_branded_page_with_ref(monkeypatch):
+    # the exact live failure: an owner-connection RuntimeError (NOT an OAuthError) must NOT escape as a 500
+    async def boom(**kw):
+        raise RuntimeError("BRUCE_DATABASE_URL not set — owner connection required for retention sweeps.")
+    monkeypatch.setattr(api.oauth_google, "handle_callback", boom)
+    r = client.get("/v1/integrations/google/callback", params={"state": "xx", "code": "yy"})
+    assert r.status_code == 400                                   # branded, NEVER 500
+    body = r.text.lower()
+    assert "couldn't connect google" in body and "nothing was saved" in body
+    assert "ref:" in body                                         # privacy-safe error reference
+    # no exception detail / oauth data leaked into the page
+    for leak in ("bruce_database_url", "runtimeerror", "traceback", "retention", "state=", "code="):
+        assert leak not in body
+
+
+def test_callback_success_page_copy(monkeypatch):
+    async def ok(**kw):
+        return None
+    monkeypatch.setattr(api.oauth_google, "handle_callback", ok)
+    r = client.get("/v1/integrations/google/callback", params={"state": "xx", "code": "yy"})
+    assert r.status_code == 200
+    body = r.text.lower()
+    assert "google connected" in body and "close this tab" in body

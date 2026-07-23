@@ -20,7 +20,7 @@ import logging
 import os
 from datetime import date, datetime, timezone
 from enum import Enum
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -439,13 +439,13 @@ async def google_callback(state: str | None = None, code: str | None = None, err
     stored. Never leaks state/code/token; failures render an honest, content-free page."""
     try:
         await oauth_google.handle_callback(state=state, code=code, error=error)
-    except oauth_google.OAuthError:
-        _log.info("google_oauth_callback_failed")            # content-free: no state/code/reason
+    except Exception as exc:            # NEVER a raw 500 — ANY failure renders the branded page (item: no
+        ref = uuid4().hex[:8]           # raw Internal Server Error). ref correlates to the log; page carries no OAuth data.
+        _log.warning("google_oauth_callback_failed ref=%s exc=%s", ref, type(exc).__name__)  # type only: no code/state/token
         return HTMLResponse(_oauth_page("couldn't connect google",
-                            "something went wrong connecting your google account. head back to bruce and try again."),
+                            f"nothing was saved. go back to Bruce and try again.<br><br><small>ref: {ref}</small>"),
                             status_code=400)
-    return HTMLResponse(_oauth_page("google connected ✅",
-                        "you're connected. head back to imessage — bruce can add events to your calendar now."))
+    return HTMLResponse(_oauth_page("google connected ✅", "u can close this tab and go back to Bruce."))
 
 
 @app.post("/v1/integrations/google/revoke")
