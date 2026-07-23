@@ -437,15 +437,40 @@ async def google_callback(state: str | None = None, code: str | None = None, err
     """Google redirects the browser here. NO user auth by design — the single-use `state` row (validated +
     consumed inside handle_callback) IS the identity binding. On success the encrypted refresh token is
     stored. Never leaks state/code/token; failures render an honest, content-free page."""
+    ref = uuid4().hex[:8]
     try:
         await oauth_google.handle_callback(state=state, code=code, error=error)
-    except Exception as exc:            # NEVER a raw 500 — ANY failure renders the branded page (item: no
-        ref = uuid4().hex[:8]           # raw Internal Server Error). ref correlates to the log; page carries no OAuth data.
-        _log.warning("google_oauth_callback_failed ref=%s exc=%s", ref, type(exc).__name__)  # type only: no code/state/token
+    except Exception as exc:            # NEVER a raw 500 — ANY failure renders the branded page.
+        stage, category, retryable = _oauth_error_category(exc)
+        # STRUCTURED stage telemetry: ref + stage + outcome + error_category + retryable + provider. NO
+        # code/state/pkce/token/secret/decrypted credential ever — categories are a fixed allowlist.
+        _log.warning("google_oauth_callback ref=%s provider=google_calendar stage=%s success=false "
+                     "error_category=%s retryable=%s", ref, stage, category, retryable)
         return HTMLResponse(_oauth_page("couldn't connect google",
                             f"nothing was saved. go back to Bruce and try again.<br><br><small>ref: {ref}</small>"),
                             status_code=400)
+    _log.info("google_oauth_callback ref=%s provider=google_calendar stage=complete success=true", ref)
     return HTMLResponse(_oauth_page("google connected ✅", "u can close this tab and go back to Bruce."))
+
+
+def _oauth_error_category(exc: Exception) -> tuple[str, str, bool]:
+    """(stage, error_category, retryable) for callback telemetry — distinguishable, allowlisted categories,
+    and NEVER any OAuth value. Maps the typed oauth_google + storage exceptions to the failure taxonomy."""
+    import sqlalchemy.exc as _sae
+
+    from .crypto import EncryptionUnavailable
+    og = oauth_google
+    if isinstance(exc, og.InvalidState):        return "state", "invalid_or_expired_state", True
+    if isinstance(exc, og.MissingCode):         return "callback_params", "invalid_or_expired_state", True
+    if isinstance(exc, og.ConsentDenied):       return "consent", "consent_denied", True
+    if isinstance(exc, og.InsufficientScope):   return "token_exchange", "insufficient_scope", True
+    if isinstance(exc, og.TokenExchangeFailed): return "token_exchange", "token_exchange_rejected", False
+    if isinstance(exc, EncryptionUnavailable):  return "encryption", "encryption_failed", False
+    if isinstance(exc, _sae.IntegrityError):    return "integration_write", "duplicate_connection_conflict", False
+    if isinstance(exc, (_sae.ProgrammingError, _sae.InternalError)):
+        return "integration_write", "integration_schema_mismatch", False
+    if isinstance(exc, _sae.OperationalError):  return "commit", "database_commit_failed", True
+    return "unknown", "unknown", False
 
 
 @app.post("/v1/integrations/google/revoke")

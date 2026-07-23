@@ -91,3 +91,21 @@ def test_callback_success_page_copy(monkeypatch):
     assert r.status_code == 200
     body = r.text.lower()
     assert "google connected" in body and "close this tab" in body
+
+
+def test_oauth_error_category_mapping():
+    import sqlalchemy.exc as sae
+    from bruce_engine import oauth_google as og
+    from bruce_engine.crypto import EncryptionUnavailable
+    cat = lambda e: api._oauth_error_category(e)[1]
+    assert cat(og.InvalidState("x")) == "invalid_or_expired_state"
+    assert cat(og.TokenExchangeFailed("x")) == "token_exchange_rejected"
+    assert cat(og.InsufficientScope("x")) == "insufficient_scope"
+    assert cat(og.ConsentDenied("x")) == "consent_denied"
+    assert cat(EncryptionUnavailable("x")) == "encryption_failed"
+    assert cat(sae.IntegrityError("s", {}, Exception("o"))) == "duplicate_connection_conflict"
+    assert cat(sae.ProgrammingError("s", {}, Exception("o"))) == "integration_schema_mismatch"
+    assert cat(RuntimeError("x")) == "unknown"
+    # invalid_or_expired_state is retryable; token_exchange_rejected is not
+    assert api._oauth_error_category(og.InvalidState("x"))[2] is True
+    assert api._oauth_error_category(og.TokenExchangeFailed("x"))[2] is False
