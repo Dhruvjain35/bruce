@@ -54,7 +54,8 @@ PROVIDER = "google_calendar"
 # Least privilege: events only. NOT `calendar`, which would let Bruce delete whole calendars — it
 # has no reason to, and a scope you don't request is one you can't be exploited through.
 SCOPES = ("https://www.googleapis.com/auth/calendar.events",)
-STATE_TTL = datetime.timedelta(minutes=10)
+STATE_TTL = datetime.timedelta(minutes=30)  # a real connect flow (read msg -> click -> Google sign-in ->
+#                                             consent -> redirect) easily exceeds 10 min; 30 is the balance.
 
 
 class OAuthError(Exception):
