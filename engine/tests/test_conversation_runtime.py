@@ -443,7 +443,7 @@ def test_a1_1_status_query_reports_persisted_mission_state(clean_db):
         reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="model freeform"))))
     assert out.status == "processed"
     ob = _run(_outbound(uid))
-    assert "external action" in ob[-1].text.lower()      # honest persisted state, not the model freeform
+    assert "haven't submitted or registered" in ob[-1].text.lower()   # honest: no external action
     assert "model freeform" not in ob[-1].text
     assert len(_run(_missions(uid))) == 1                 # a status READ creates no new mission
 
@@ -457,3 +457,44 @@ def test_a1_1_status_query_with_no_active_mission_is_a_normal_reply(clean_db):
     ob = _run(_outbound(uid))
     assert "nothing rn" in ob[-1].text.lower()           # declined -> normal model reply
     assert len(_run(_missions(uid))) == 0
+
+
+def test_p0_exact_live_flyer_handoff_regression(clean_db):
+    # THE exact live failure: an event flyer + "handle ts for me gng". Expected: handoff authorized, ONE
+    # durable mission, exact attachment linked, one phase event, ZERO external action, one CONTEXT-AWARE
+    # ack that reflects the extracted facts + states the interruption condition, no em dash, no canned line.
+    uid = uuid4(); _run(_ensure_user(uid))
+    flyer = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG, filename="flyer.png")
+    d = _decision(IntentKind.actionable, ResponseType.extraction_result,
+                  text="Got it — I'm understanding this now.",   # the model might even echo corporate junk...
+                  entities=[ExtractedEntity(type="event_title", value="Startup School 2026"),
+                            ExtractedEntity(type="date", value="July 25-26", normalized="2026-07-25"),
+                            ExtractedEntity(type="location", value="Chase Center, SF")],
+                  needs_mission=True)
+    out = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("flyerX", text="handle ts for me gng", attachments=[flyer]),
+        user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(d)))
+    assert out.status == "processed"
+    missions = _run(_missions(uid))
+    assert len(missions) == 1                                   # exactly one durable mission
+    m = missions[0]
+    assert m.kind == "handoff" and m.goal["source_attachment_refs"][0]["filename"] == "flyer.png"
+    assert m.goal["extracted_facts"]["event"] == "Startup School 2026"
+    assert _run(_phase_events(uid, m.id)) == 1
+    ob = _run(_outbound(uid))
+    assert len(ob) == 1                                         # exactly one outbound
+    reply = ob[-1].text
+    assert "—" not in reply                                     # NO em dash
+    assert "understanding this now" not in reply.lower()        # NOT the canned legacy line
+    assert "Startup School 2026" in reply and "Chase Center, SF" in reply   # CONTEXT-AWARE (extracted facts)
+    assert "ping u" in reply.lower()                            # states the interruption condition
+    for fake in ("registered", "submitted", "booked", "signed you up"):
+        assert fake not in reply.lower()                        # never claims an external action
+
+    # follow-up: "what are u doing with that?" -> useful persisted status, one outbound, no new mission
+    out2 = _run(conversation_runtime.handle(
+        FakeChannel(), _msg("sX", text="what are u doing with that?"), user_id=uid, reply_target=PHONE,
+        reasoner=FakeReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="ignored"))))
+    assert out2.status == "processed" and len(_run(_missions(uid))) == 1
+    ob2 = _run(_outbound(uid))
+    assert "haven't submitted or registered" in ob2[-1].text.lower() and "Startup School" in ob2[-1].text
