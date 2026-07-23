@@ -183,7 +183,7 @@ def test_full_chain_upgrades_and_seeds_as_nonsuperuser_owner(migrated_db):
         return heads, owner, forced, admin_seed, worker_seed
 
     heads, owner, forced, admin_seed, worker_seed = asyncio.run(_check())
-    assert heads == ["0018_conversation_context_graph"], f"expected exactly one head at 0018, got {heads}"
+    assert heads == ["0019_oauth_states_worker_rls"], f"expected exactly one head at 0019, got {heads}"
     assert owner == MIGRATOR, f"migration role must OWN the tables, owner={owner}"  # req 2
     assert forced is True, "capability_global_state must have FORCE ROW LEVEL SECURITY"  # req 3
     assert admin_seed >= 1, "0013 capability_global_state seed missing (app_is_admin path)"  # req 5
@@ -298,7 +298,7 @@ def test_downgrade_and_reupgrade_roundtrip(migrated_db):
         finally:
             await c.close()
 
-    assert asyncio.run(_head()) == ["0018_conversation_context_graph"], "round-trip must return to head 0018"
+    assert asyncio.run(_head()) == ["0019_oauth_states_worker_rls"], "round-trip must return to head 0019"
 
 
 # (A3 rollback compatibility) a destructive 0018 downgrade must FAIL CLOSED once the graph is populated,
@@ -322,11 +322,11 @@ def test_downgrade_blocked_when_graph_populated(migrated_db, monkeypatch):
 
     asyncio.run(_seed())
     monkeypatch.delenv("BRUCE_ALLOW_GRAPH_DROP", raising=False)
-    blocked = _run_alembic("downgrade", "-1", dsn=dsn)
+    blocked = _run_alembic("downgrade", "0017_magic_link_single_use", dsn=dsn)
     assert blocked.returncode != 0, "downgrade must be blocked when the graph is populated"
     out = (blocked.stderr + blocked.stdout).lower()
     assert "populated" in out or "refusing" in out
 
     monkeypatch.setenv("BRUCE_ALLOW_GRAPH_DROP", "1")
-    allowed = _run_alembic("downgrade", "-1", dsn=dsn)
+    allowed = _run_alembic("downgrade", "0017_magic_link_single_use", dsn=dsn)
     assert allowed.returncode == 0, "explicit authorization must let the downgrade proceed:\n" + allowed.stderr[-1500:]

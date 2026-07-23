@@ -14,7 +14,7 @@ Rules:
 
 # reserved next-migration number -> owning workstream lane (off head 0018)
 MIGRATION_LANES: dict[str, str] = {
-    "0019": "mission-kernel",
+    "0019": "integration-oauth",   # oauth_states tenant_or_worker RLS (real Google callback fix)
     "0020": "school-command",
     "0021": "humanity",
 }

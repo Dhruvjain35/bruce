@@ -179,32 +179,28 @@ async def start_authorization(user_id: UUID, *, redirect_uri: str | None = None)
     return str(httpx.URL(AUTH_ENDPOINT, params=params))
 
 
-async def _consume_state(state: str) -> schema.OAuthState:
-    """Atomically claim a state row. Single-use, unexpired — else InvalidState.
+async def _consume_state(state: str) -> dict:
+    """Atomically claim a state row PRE-IDENTITY. Single-use, unexpired — else InvalidState.
 
-    Runs with the OWNER connection deliberately: at this moment we do not yet know which user this
-    callback belongs to, so we cannot open an RLS session. The lookup is by an unguessable 48-byte
-    random token, and the row it returns is what establishes identity. This is the ONLY place that
-    reads across users, and it reads exactly one row by secret.
+    Runs under a WORKER session (app.worker='on'): at this moment we do not yet know which user the
+    callback belongs to, and oauth_states is tenant_or_worker RLS, so the worker may read the row by its
+    unguessable 48-byte token before identity is known — the row it returns IS what establishes identity.
+    (It must NOT use a raw 'owner' connection: on managed Cloud SQL the owner role is not BYPASSRLS, so
+    that connection saw ZERO rows and every real callback failed with InvalidState.) The single-statement
+    claim (consumed_at IS NULL) means two concurrent replays cannot both win; expiry is in the same predicate.
     """
-    from .retention import _owner_conn  # privileged connection helper
+    from sqlalchemy import text as _text
 
-    conn = await _owner_conn()
-    try:
-        # Claim in a single statement: consumed_at IS NULL is the guard, so two concurrent replays
-        # cannot both win. Expiry is enforced in the same predicate.
-        row = await conn.fetchrow(
+    from .db import worker_session
+    async with worker_session() as s:
+        row = (await s.execute(_text(
             "UPDATE oauth_states SET consumed_at = now() "
-            "WHERE state = $1 AND consumed_at IS NULL AND expires_at > now() "
-            "RETURNING id, user_id, provider, code_verifier, redirect_uri",
-            state,
-        )
-    finally:
-        await conn.close()
+            "WHERE state = :st AND consumed_at IS NULL AND expires_at > now() "
+            "RETURNING id, user_id, provider, code_verifier, redirect_uri"), {"st": state})).mappings().first()
     if row is None:
         # Unknown, expired, or already used — one message for all three, so probing learns nothing.
         raise InvalidState("this authorization link is invalid, expired, or has already been used")
-    return row
+    return dict(row)
 
 
 async def handle_callback(
