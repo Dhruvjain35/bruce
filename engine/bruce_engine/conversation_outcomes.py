@@ -229,14 +229,23 @@ class CalendarScheduleHandler:
     async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
         from . import calendar_schedule, oauth_google
         d = octx.decision
+        # DETERMINISTIC authorization to schedule: either explicit scheduling verbs ("schedule this",
+        # "put this on my calendar", "add this to my cal", "block this off") OR a generic handoff. The
+        # model proposes (entities/intent); this policy authorizes the write. This is the CASE-2 fix:
+        # "schedule ts" was never authorized before because it isn't generic-handoff language.
+        sched_intent = handoff.has_scheduling_execution_intent(octx.msg.text)
         decision = self._decide(octx)
-        # cheap, pure gates first — only a real, dated, calendar-bound event handoff is a candidate
-        if not decision.authorizes_mutation:
+        authorized = sched_intent or decision.authorizes_mutation
+        if not authorized:
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
-                                  reason="not_authorized_handoff")
-        if not (_is_event(d) and _wants_calendar(d, octx.msg.text)):
+                                  reason="not_authorized_to_schedule")
+        # a real dated event must be present; scheduling intent already implies the calendar is wanted
+        if not _is_event(d):
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
-                                  reason="not_a_calendar_event")
+                                  reason="not_an_event")
+        if not (sched_intent or _wants_calendar(d, octx.msg.text)):
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="not_a_calendar_intent")
         if calendar_schedule.build_calendar_event(d) is None:
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="no_resolvable_date")

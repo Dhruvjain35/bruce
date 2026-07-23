@@ -106,6 +106,49 @@ _SELF_HANDLING_RE = re.compile(
 _MIN_MISSION_CONFIDENCE = 0.55
 
 
+# --- Scheduling EXECUTION intent (calendar-specific authorizer) -----------------------------------
+# The generic handoff verbs ("handle it") authorize a durable CAPTURE. Scheduling has its own explicit
+# verbs a student actually uses — "schedule this", "put/add this on/to my calendar", "calendar this",
+# "save these dates", "block this off" — that authorize a REAL calendar write. Deterministic, tolerant
+# of slang/abbreviations ("ts"=this) and filler ("yo", "rq", "for me", "bro"). This is an AUTHORIZATION
+# gate, so — like handoff language — it is never derived from a model flag, and it is suppressed when the
+# user is asking ABOUT scheduling ("how do i schedule this?") or saying THEY will do it ("i'll schedule
+# this myself"). The CalendarScheduleHandler additionally requires a real dated event + a connected
+# calendar, so a bare "add this" only ever schedules when an event is genuinely present.
+_S_OBJ = r"(?:this|that|it|ts|tis|these|those|the\s+dates?|these\s+dates?|those\s+dates?)"
+_SCHED_PATTERNS = (
+    rf"\bschedule\s+{_S_OBJ}\b",
+    rf"\b(?:put|add|throw|pop|stick|slot|drop|chuck|get)\s+{_S_OBJ}\s+(?:on|in|to|onto|into)\s+(?:my\s+|the\s+)?cal(?:endar)?\b",
+    rf"\b(?:add|save)\s+{_S_OBJ}\s+to\s+(?:my\s+|the\s+)?cal(?:endar)?\b",
+    rf"\bcalendar\s+{_S_OBJ}\b",
+    r"\bsave\s+(?:the|these|those)\s+dates?\b",
+    r"\bsave\s+the\s+date\b",
+    rf"\bblock\s+(?:{_S_OBJ}\s+)?off\b",
+    rf"\bblock\s+off\s+{_S_OBJ}\b",
+    rf"\b(?:add|save)\s+{_S_OBJ}\b",          # broad — safe: handler still requires a real dated event
+)
+_SCHED_RE = re.compile("|".join(_SCHED_PATTERNS), re.IGNORECASE)
+# Questions / self-handling: "how do i schedule this", "should i schedule this", "what would i put on
+# my calendar", "i'll schedule this myself". 2nd person ("can u schedule this") is NOT suppressed.
+_SCHED_SUPPRESS = re.compile(
+    r"\b(?:how|when|where|what|why|whether)\b[^.?!]*\b(?:do|should|would|can|could|will|shall)\s+i\b|"
+    r"\b(?:should|would|could|shall|do|can)\s+i\b[^.?!]*\b(?:schedule|calendar|add|put|block|save)\b|"
+    r"\bi\s?(?:'?ll| will| can| am|'?m| a?m| gonna| finna)\s+(?:schedule|add|put|calendar|block|save|do|handle)\b|"
+    r"\bimma\s+(?:schedule|add|put|calendar|block|save)\b",
+    re.IGNORECASE)
+
+
+def has_scheduling_execution_intent(text: str | None) -> bool:
+    """True iff the user's own words explicitly tell Bruce to put an event ON their calendar (a real
+    write authorization). Deterministic; suppressed for questions-about-scheduling and self-handling."""
+    t = (text or "").lower()
+    if not t:
+        return False
+    if _SCHED_SUPPRESS.search(t):
+        return False
+    return bool(_SCHED_RE.search(t))
+
+
 def has_explicit_handoff_language(text: str | None) -> bool:
     """True iff the user's own words explicitly DELEGATE to Bruce (take this on / handle it / follow up).
     Deterministic pattern match tolerant of slang, abbreviations ('ts'=this), and filler; suppressed when

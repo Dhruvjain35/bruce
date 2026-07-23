@@ -206,3 +206,40 @@ def test_reply_pointer_part_prefix_is_normalized(clean_db):
         cap = await resolve(uid, _current(uid, h, reply_to="p:0/t1"))
         assert cap.resolution_source == "server_graph" and cap.referenced_text == "the worksheet says 0.40"
     _run(go())
+
+
+# --------------------------------------------------------------- P0.2 fail-closed on unfetchable bytes
+
+def test_referenced_attachment_available_but_unfetchable_is_load_failed(clean_db):
+    """A reply target whose attachment is 'available' but whose staged bytes can't be fetched must set
+    attachment_load_failed (retry won't help) — NOT pending, and NOT a silent empty that falls through
+    to the newest image. The runtime turns this into the honest 'couldn't load that exact file'."""
+    async def run():
+        uid, h = await _user("+1ctxlf")
+        env = {"referenced_attachment_refs": [{"available": True, "upload_ref": str(uuid4())}]}  # ref not staged
+        cap = await resolve(uid, _current(uid, h, reply_to="ghost", reply_context=env))
+        assert cap.referenced_images == []
+        assert cap.attachment_load_failed is True
+        assert cap.attachment_pending is False
+    _run(run())
+
+
+def test_referenced_attachment_staged_bytes_resolve_first(clean_db):
+    """The exact referenced attachment resolves to a real image and is authoritative (load_failed False)."""
+    async def run():
+        uid, h = await _user("+1ctxok")
+        up = await _stage_upload(_png())
+        env = {"referenced_attachment_refs": [{"available": True, "upload_ref": str(up)}]}
+        cap = await resolve(uid, _current(uid, h, reply_to="x", reply_context=env))
+        assert len(cap.referenced_images) == 1 and cap.attachment_load_failed is False
+    _run(run())
+
+
+def test_not_downloaded_ref_is_pending_not_load_failed(clean_db):
+    """A ref the relay hasn't downloaded yet is pending (retry may help), distinct from load_failed."""
+    async def run():
+        uid, h = await _user("+1ctxpd")
+        env = {"referenced_attachment_refs": [{"available": False, "unavailable_reason": "not_downloaded"}]}
+        cap = await resolve(uid, _current(uid, h, reply_to="x", reply_context=env))
+        assert cap.attachment_pending is True and cap.attachment_load_failed is False
+    _run(run())

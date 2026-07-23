@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from . import (conversation_context, conversation_outcomes, conversation_store, messaging_outbound,
-               technical_render)
+from . import (capability_truth, conversation_context, conversation_outcomes, conversation_store,
+               messaging_outbound, technical_render)
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
@@ -142,6 +142,14 @@ class _Runtime:
                 await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
                                      decision=None, intent="image_understanding")
                 return InboundOutcome(status="processed", user_id=user_id)
+            if capsule.attachment_load_failed:                  # the exact file EXISTS but we couldn't load
+                # P0.2: fail closed honestly — we KNOW which image, we just couldn't load its bytes. Never
+                # tell the user to resend a file that is genuinely there, and never fall through to answer
+                # from the newest/nearest image.
+                reply = self.style.template("reply_image_unavailable")
+                await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                                     decision=None, intent="image_understanding")
+                return InboundOutcome(status="processed", user_id=user_id)
             if explicit_ref and not (capsule.referenced_text or capsule.prior_answer):
                 reply = self.style.template("reply_target_unavailable")        # target lost / nothing to show
                 await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
@@ -193,7 +201,20 @@ class _Runtime:
                                  decision=None, intent="unsupported")
             return InboundOutcome(status="outcome_collision", user_id=user_id)
 
-        await self._finalize(user_id, ch, ident, pmid, outcome.reply, reply_target,
+        # P0.5 capability-truth guard: never let a model reply DENY a capability that is actually live.
+        # Cheap regex first; only pay for the connection lookup when the reply reads like a calendar denial.
+        reply_out = outcome.reply
+        if capability_truth.mentions_calendar_denial(reply_out):
+            from . import oauth_google
+            try:
+                integ = await oauth_google.get_integration(user_id)
+            except Exception:
+                integ = None
+            if integ is not None and integ.status == "connected" and integ.revoked_at is None:
+                log.info("capability_claim_override pmid=%s cap=calendar_connected", pmid)
+                reply_out = capability_truth.grounded_calendar_correction()
+
+        await self._finalize(user_id, ch, ident, pmid, reply_out, reply_target,
                              decision=decision, event_candidate_id=outcome.event_candidate_id)
         log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s mission=%s handler=%s", pmid, decision.intent.value,
                  decision.response_type.value, outcome.event_candidate_id is not None,

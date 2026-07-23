@@ -49,6 +49,11 @@ class ContextCapsule:
     referenced_direction: str | None = None       # inbound | outbound
     referenced_images: list[VisionInput] = field(default_factory=list)   # referenced attachments, normalized
     attachment_pending: bool = False              # target known but its attachment isn't downloaded yet
+    attachment_load_failed: bool = False          # a referenced attachment EXISTED but its bytes couldn't be
+    #                                               loaded/decoded (staged-but-unfetchable or unreadable) —
+    #                                               distinct from pending: retrying won't help, so fail closed
+    #                                               honestly ("couldn't load that exact file"), never blame
+    #                                               the user for a file that is genuinely there.
     unavailable_reason: str | None = None
 
     @property
@@ -74,11 +79,16 @@ def evidence_text(c: ContextCapsule) -> str:
     return "\n".join(lines)
 
 
-async def _fetch_referenced_images(env: dict) -> tuple[list[VisionInput], bool]:
+async def _fetch_referenced_images(env: dict) -> tuple[list[VisionInput], bool, bool]:
     """Pull the staged referenced attachment bytes and normalize them (reuse the generic pipeline).
-    Returns (images, pending) where pending=True means a referenced attachment isn't downloaded yet."""
+    Returns (images, pending, load_failed):
+      * pending=True  -> a referenced attachment isn't downloaded on the relay yet (retry may help).
+      * load_failed=True -> a referenced attachment was staged/available but its bytes could not be
+        fetched or decoded here (retry won't help) — so the runtime fails closed honestly instead of
+        telling the user to resend a file that genuinely exists."""
     images: list[VisionInput] = []
     pending = False
+    load_failed = False
     for a in (env.get("referenced_attachment_refs") or []):
         if a.get("available") and a.get("upload_ref"):
             try:
@@ -86,7 +96,7 @@ async def _fetch_referenced_images(env: dict) -> tuple[list[VisionInput], bool]:
             except (ValueError, Exception):
                 fetched = None
             if fetched is None:
-                pending = True
+                load_failed = True                # was 'available' but the staged bytes aren't fetchable
                 continue
             data, media = fetched
             if (media or "").lower() == "application/pdf":
@@ -96,10 +106,11 @@ async def _fetch_referenced_images(env: dict) -> tuple[list[VisionInput], bool]:
                 norm = normalize_image(data, media)
                 images.append(VisionInput(data=norm.data, media_type=norm.media_type))
             except UnreadableAttachment:
+                load_failed = True                # bytes present but not a decodable image
                 log.info("referenced_attachment_unreadable")   # content-free
         elif not a.get("available"):
             pending = True
-    return images, pending
+    return images, pending, load_failed
 
 
 async def resolve(user_id: UUID, msg: InboundMessage) -> ContextCapsule:
@@ -140,15 +151,16 @@ async def resolve(user_id: UUID, msg: InboundMessage) -> ContextCapsule:
     # 2. relay envelope: referenced attachment BYTES + out-of-graph target metadata
     images: list[VisionInput] = []
     pending = False
+    load_failed = False
     unavailable = None
     if env:
         unavailable = env.get("unavailable_reason")
         if source == UNRESOLVED and env.get("resolution_source") == RELAY_EXACT:
             direction = env.get("referenced_direction")
             source = RELAY_EXACT
-        images, pending = await _fetch_referenced_images(env)
+        images, pending, load_failed = await _fetch_referenced_images(env)
 
     return ContextCapsule(
         resolution_source=source, referenced_text=referenced_text, prior_answer=prior_answer,
         referenced_direction=direction, referenced_images=images, attachment_pending=pending,
-        unavailable_reason=unavailable)
+        attachment_load_failed=load_failed, unavailable_reason=unavailable)
