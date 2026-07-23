@@ -1,0 +1,14 @@
+# Keep secrets + local venv + noise OUT of the Cloud Build context upload.
+.venv
+.venv/
+.env
+.env.*
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+eval/
+relay/
+scripts/
+*.md
+.gcloudignore

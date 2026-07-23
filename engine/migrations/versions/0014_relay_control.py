@@ -102,11 +102,17 @@ def upgrade() -> None:
         if "agent_commit" not in have:
             b.add_column(sa.Column("agent_commit", sa.String(64), nullable=True))
 
-    # UPSERT-seed the singleton for the running BRUCE_ENV without clobbering a live pause.
-    op.get_bind().execute(
+    # UPSERT-seed the singleton for the running BRUCE_ENV without clobbering a live pause. The seed is
+    # subject to FORCE RLS; on a non-superuser migration role (e.g. Cloud SQL's `postgres`) the
+    # worker_only WITH CHECK (app_is_worker()) would reject it, so set app.worker='on' transaction-locally
+    # around the seed, then reset. (On a superuser role — local/CI — RLS is bypassed, so this is a no-op.)
+    bind = op.get_bind()
+    bind.execute(sa.text("SELECT set_config('app.worker', 'on', true)"))
+    bind.execute(
         sa.text("INSERT INTO relay_control (environment, outbound_paused) VALUES (:env, false) "
                 "ON CONFLICT (environment) DO NOTHING"),
         {"env": _env()})
+    bind.execute(sa.text("SELECT set_config('app.worker', '', true)"))
 
 
 def downgrade() -> None:
