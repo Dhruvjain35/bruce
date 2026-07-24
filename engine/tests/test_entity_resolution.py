@@ -55,3 +55,15 @@ def test_most_recent_for_correction(monkeypatch):
     monkeypatch.setattr(entity_store, "active_events", _stub([BBALL, CHESS]))
     r = _run(er.resolve_most_recent(uuid4()))
     assert r.status == "resolved" and r.entity["id"] == "2"
+
+
+def test_bare_pronoun_does_not_select_an_event(monkeypatch):
+    # THE critical fix: "it"/"that" alone must NOT resolve the only event
+    monkeypatch.setattr(entity_store, "active_events", _stub([CHESS]))
+    assert _run(er.resolve(uuid4(), "cancel that plan with mike, i can't make it")).status == "not_found"
+    assert _run(er.resolve(uuid4(), "make it an hour")).status == "not_found"
+
+
+def test_explicit_generic_noun_resolves(monkeypatch):
+    monkeypatch.setattr(entity_store, "active_events", _stub([CHESS]))
+    assert _run(er.resolve(uuid4(), "delete that event")).status == "resolved"

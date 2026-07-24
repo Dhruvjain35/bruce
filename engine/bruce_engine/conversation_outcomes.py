@@ -306,7 +306,7 @@ class CalendarMutationHandler:
     priority = 72
 
     async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
-        from . import calendar_mutation, oauth_google
+        from . import calendar_mutation, entity_resolution, oauth_google
         kind = calendar_mutation.classify(octx.msg.text)
         if kind is None:
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
@@ -318,6 +318,23 @@ class CalendarMutationHandler:
         if not (integ is not None and integ.status == "connected" and integ.revoked_at is None):
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="calendar_not_connected")
+        # A mutation verb alone is NOT enough — require a CONCRETE referent (a title/generic-noun resolved
+        # entity, or, for a title-less correction, a most-recent event). This stops "cancel that plan with
+        # mike" from deleting the only event, and stops "add chess class, make it 5pm" from hijacking create.
+        try:
+            res = await entity_resolution.resolve(octx.user_id, octx.msg.text)
+        except Exception:
+            res = None
+        has_referent = res is not None and res.status in ("resolved", "ambiguous")
+        if not has_referent and kind == "repair":
+            try:
+                recent = await entity_resolution.resolve_most_recent(octx.user_id)
+                has_referent = recent is not None and recent.status == "resolved"
+            except Exception:
+                pass
+        if not has_referent:
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="no_referent")
         return HandlerVerdict(disposition=Disposition.claim, priority=self.priority,
                               reason=f"calendar_{kind}")
 

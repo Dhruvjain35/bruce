@@ -12,9 +12,11 @@ from uuid import UUID
 
 from . import entity_store
 
-# A generic pointer with no title ("that event", "it", "the one", "that thing").
-_GENERIC_REF = re.compile(r"\b(that|this|it|the)\s+(event|one|thing|meeting|class|appointment)\b|\b(it|that)\b",
-                          re.IGNORECASE)
+# A generic pointer must be an explicit noun phrase ("that event", "the one", "this meeting") — NEVER a
+# lone "it"/"that", which appears in almost any sentence and would silently select the user's only event.
+_GENERIC_REF = re.compile(
+    r"\b(?:that|this|the)\s+(?:event|one|thing|meeting|appointment|calendar\s+(?:event|thing))\b",
+    re.IGNORECASE)
 
 
 @dataclass

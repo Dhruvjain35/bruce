@@ -17,8 +17,10 @@ from . import calendar_tools, entity_resolution, temporal, world_state
 from .calendar_schedule import DEFAULT_TZ
 from .runtime_contracts import ToolOutcome
 
-_DELETE_RE = re.compile(r"\b(delete|remove|cancel|get\s+rid\s+of|take\s+off|clear)\b", re.IGNORECASE)
-_UPDATE_RE = re.compile(r"\b(move|reschedul\w*|change|update|push|shift|make\s+it|set\s+it|switch|bump)\b",
+_DELETE_RE = re.compile(r"\b(delete|remove|cancel|get\s+rid\s+of|take\s+off)\b", re.IGNORECASE)
+# Unambiguous mutate verbs only. "make it"/"set it"/"clear" are excluded — they co-occur with CREATE
+# ("add chess class and make it 5pm") and would hijack it.
+_UPDATE_RE = re.compile(r"\b(move|reschedul\w*|change|update|push\s+back|push\s+it|shift|switch|bump)\b",
                         re.IGNORECASE)
 # corrections: "not today", "i meant", "i said", "actually ... not", "no i said", "that's wrong"
 _CORRECTION_RE = re.compile(
@@ -52,12 +54,24 @@ def recompute(entity: dict, text: str, *, now: _dt.datetime) -> tuple[str, str |
     date. Returns (start_iso, end_iso, timezone) or None if nothing temporal was stated."""
     base_date, base_time = _parse(entity["start"])
     base_tz = entity.get("timezone") or DEFAULT_TZ
+    # duration to PRESERVE when only the start moves (never silently shrink a 2h event to 1h)
+    duration = _dt.timedelta(hours=1)
+    if base_time is not None and entity.get("end") and len(entity["end"]) > 10:
+        try:
+            duration = (_dt.datetime.fromisoformat(entity["end"].replace("Z", "+00:00"))
+                        - _dt.datetime.fromisoformat(entity["start"].replace("Z", "+00:00")))
+        except ValueError:
+            pass
+    if duration <= _dt.timedelta(0):
+        duration = _dt.timedelta(hours=1)
+
     date_part = temporal._resolve_date(text, now)                 # (date, end_date) | None
     rng = temporal._resolve_time_range(text)
     time_part = temporal._resolve_time(text) if rng is None else None
     if date_part is None and time_part is None and rng is None:
         return None
     new_date = date_part[0] if date_part else base_date
+
     if rng is not None:
         sh, sm, eh, em, _c, _n = rng
         start = _dt.datetime.combine(new_date, _dt.time(sh, sm))
@@ -68,12 +82,13 @@ def recompute(entity: dict, text: str, *, now: _dt.datetime) -> tuple[str, str |
     if time_part is not None:
         h, mn, _c, _n = time_part
         start = _dt.datetime.combine(new_date, _dt.time(h, mn))
-        return start.isoformat(timespec="seconds"), (start + _dt.timedelta(hours=1)).isoformat(timespec="seconds"), base_tz
-    if base_time is not None:                                     # date changed, keep the timed clock
+        return start.isoformat(timespec="seconds"), (start + duration).isoformat(timespec="seconds"), base_tz
+    if base_time is not None:                                     # date changed, keep clock + duration
         start = _dt.datetime.combine(new_date, base_time)
-        return start.isoformat(timespec="seconds"), (start + _dt.timedelta(hours=1)).isoformat(timespec="seconds"), base_tz
-    # all-day: date changed only
-    return new_date.isoformat(), (new_date + _dt.timedelta(days=1)).isoformat(), None
+        return start.isoformat(timespec="seconds"), (start + duration).isoformat(timespec="seconds"), base_tz
+    # all-day: date changed (keep a multi-day span if the correction gave a range)
+    last = date_part[1] if (date_part and date_part[1]) else new_date
+    return new_date.isoformat(), (last + _dt.timedelta(days=1)).isoformat(), None
 
 
 def _human(iso: str, *, now: _dt.datetime) -> str:
@@ -88,10 +103,11 @@ async def handle(user_id: UUID, kind: str, text: str, *, adapter=None) -> str:
     tz = await world_state.resolve_timezone(user_id, default=DEFAULT_TZ)
     now = _dt.datetime.now(ZoneInfo(tz))
 
-    if kind == "repair":
+    # A correction may NAME the event ("actually move chess club to friday"); resolve by title first, and
+    # fall back to the most-recent event only for a genuinely title-less correction ("not today, ...").
+    res = await entity_resolution.resolve(user_id, text)
+    if kind == "repair" and res.status == "not_found":
         res = await entity_resolution.resolve_most_recent(user_id)
-    else:
-        res = await entity_resolution.resolve(user_id, text)
     if res.status == "not_found":
         return "i don't see that one on ur calendar. which event do u mean?"
     if res.status == "ambiguous":

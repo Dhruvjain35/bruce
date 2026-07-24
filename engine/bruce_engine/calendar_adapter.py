@@ -388,7 +388,8 @@ class GoogleCalendarAdapter:
         return _normalize(body)
 
     async def update(
-        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None
+        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None,
+        source_message_id: str | None = None, attachment_digest: str | None = None,
     ) -> CalendarEventRef:
         cal = await self._calendar()
         token = await self._access_token()
@@ -396,7 +397,8 @@ class GoogleCalendarAdapter:
         r = await client.put(
             f"{GOOGLE_CALENDAR_API}/calendars/{cal}/events/{event_id}",
             headers={"Authorization": f"Bearer {token}"},
-            json=_to_google_body(event, event_id, mission_id=mission_id),
+            json=_to_google_body(event, event_id, mission_id=mission_id,
+                                 source_message_id=source_message_id, attachment_digest=attachment_digest),
         )
         if r.status_code not in (200, 201):
             self._classify(r, "events.update")
@@ -466,11 +468,13 @@ class FakeCalendarAdapter:
         return _normalize(raw) if raw is not None else None
 
     async def update(
-        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None
+        self, event: CalendarEvent, event_id: str, *, mission_id: UUID | None = None,
+        source_message_id: str | None = None, attachment_digest: str | None = None,
     ) -> CalendarEventRef:
         if event_id not in self.events:
             raise CalendarNotFound(event_id)
-        body = _to_google_body(event, event_id, mission_id=mission_id)
+        body = _to_google_body(event, event_id, mission_id=mission_id,
+                               source_message_id=source_message_id, attachment_digest=attachment_digest)
         if self.account:                              # provider re-stamps the account on update, like Google
             body["organizer"] = {"email": self.account}
             body["creator"] = {"email": self.account}

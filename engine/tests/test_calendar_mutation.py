@@ -42,3 +42,15 @@ def test_recompute_date_only_keeps_time():
 def test_recompute_none_when_no_temporal():
     entity = {"start": "2026-07-24T20:00:00", "timezone": "America/Chicago"}
     assert cm.recompute(entity, "move chess class", now=NOW) is None
+
+
+def test_classify_ignores_create_with_make_it():
+    assert cm.classify("add chess class friday, make it 5pm") is None      # create, not a mutation
+    assert cm.classify("put lunch on my calendar and make it an hour") is None
+    assert cm.classify("cancel that plan with mike") == "delete"           # verb present (referent gate handles it)
+
+
+def test_recompute_preserves_duration():
+    entity = {"start": "2026-07-24T15:00:00", "end": "2026-07-24T17:00:00", "timezone": "America/Chicago"}
+    start, end, _tz = cm.recompute(entity, "move it to 9pm", now=NOW)
+    assert start == "2026-07-24T21:00:00" and end == "2026-07-24T23:00:00"  # 2h duration kept

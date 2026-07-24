@@ -28,6 +28,7 @@ def _to_dict(e: "schema.CalendarEventEntity") -> dict:
         "start": e.start, "end": e.end, "timezone": e.timezone, "location": e.location,
         "provider": e.provider, "provider_account_id": e.provider_account_id,
         "provider_event_id": e.provider_event_id, "calendar_id": e.calendar_id,
+        "source_message_ids": e.source_message_ids or [],
         "agent_run_id": str(e.agent_run_id) if e.agent_run_id else None,
         "provider_version": e.provider_version, "deleted": e.deleted_at is not None,
         "created_at": e.created_at.isoformat() if e.created_at else None,

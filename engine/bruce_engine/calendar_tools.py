@@ -60,8 +60,9 @@ async def update_event(
     eid = entity["provider_event_id"]
     ev = CalendarEvent(title=entity["title"], start=new_start, end=new_end,
                        location=entity.get("location"), timezone=new_timezone)
+    src = (entity.get('source_message_ids') or [None])[0]
     try:
-        await a.update(ev, eid)
+        await a.update(ev, eid, source_message_id=src)
     except calendar_adapter.CalendarError as exc:
         return ToolResult(ToolOutcome.provider_error, _CAP_UPDATE, _PROVIDER, "update_event",
                           reason=str(exc)[:200])
