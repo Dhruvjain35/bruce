@@ -302,6 +302,74 @@ class UserWorldState(Base, TSV):
     __table_args__ = (UniqueConstraint("user_id", name="uq_user_world_state_user"),)
 
 
+class AgentRun(Base, TSV):
+    """A durable agent run (R2) — the general runtime's working state across messages / restarts /
+    corrections. Holds the GoalSpec + plan + last tool result + active decision so execution state is
+    NEVER reconstructed from recent chat text. tenant_or_worker RLS (a resuming worker writes it)."""
+
+    __tablename__ = "agent_runs"
+    id = _pk()
+    user_id = _owner()
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    mission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("missions.id", ondelete="SET NULL"), nullable=True, index=True)
+    domain: Mapped[str] = mapped_column(String(32), nullable=False, server_default="calendar")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="understanding")
+    goal: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))          # GoalSpec
+    temporal: Mapped[dict | None] = mapped_column(JSONB, nullable=True)                                     # TemporalSpec
+    selected_entity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)         # CalendarEventEntity
+    selected_provider_account: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    current_action: Mapped[dict | None] = mapped_column(JSONB, nullable=True)                               # NextAction
+    last_tool_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)                             # ToolResult
+    verification_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    active_decision: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    recovery_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    blocked_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "idempotency_key", name="uq_agent_run_idem"),)
+
+
+class AgentRunEvent(Base):
+    """Append-only transition log for an AgentRun (status changes, tool calls, verifications)."""
+
+    __tablename__ = "agent_run_events"
+    id = _pk()
+    user_id = _owner()
+    agent_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CalendarEventEntity(Base, TSV):
+    """A canonical calendar event (R7) — one row per VERIFIED provider event, so "move guitar class" /
+    "delete that" resolve to a real entity instead of re-parsing. Owner-scoped; unique per provider event."""
+
+    __tablename__ = "calendar_event_entities"
+    id = _pk()
+    user_id = _owner()
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    normalized_title: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
+    start: Mapped[str] = mapped_column(String(40), nullable=False)          # ISO (date or datetime)
+    end: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, server_default="google_calendar")
+    provider_account_id: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    provider_event_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    calendar_id: Mapped[str] = mapped_column(String(255), nullable=False, server_default="primary")
+    source_message_ids: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    receipt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("receipts.id", ondelete="SET NULL"), nullable=True)
+    provider_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("user_id", "provider", "provider_event_id", name="uq_cal_entity_provider_event"),)
+
+
 class ModelCost(Base):
     __tablename__ = "model_costs"
     id = _pk()
@@ -1202,4 +1270,9 @@ RLS_TABLES: tuple[str, ...] = (
     "relay_registration_audit",
     # added 0022 — runtime lane: per-user world state (timezone/preferences). tenant_isolation.
     "user_world_state",
+    # added 0023/0024 — general agent runtime: durable run state (tenant_or_worker) + append-only events,
+    # and canonical verified calendar-event entities (tenant_isolation).
+    "agent_runs",
+    "agent_run_events",
+    "calendar_event_entities",
 )

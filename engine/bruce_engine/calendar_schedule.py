@@ -401,6 +401,15 @@ async def schedule_event(
         await mission_kernel.record_phase(
             user_id, mission_id, MissionPhase.succeeded.value, "verified", status="succeeded")
         await _write_receipt(user_id, mission_id, "verified", evidence)
+        # R7: record the canonical entity so this event can later be moved / deleted / corrected.
+        try:
+            from . import calendar_tools
+            await calendar_tools.record_created(
+                user_id, event=event, provider_event_id=result.event_id,
+                provider_account_id=read_account, calendar_id=calendar_id,
+                source_message_id=source_message_id)
+        except Exception:                            # entity memory is best-effort; never fail a verified write
+            log.info("entity_record_failed user=%s", user_id)
         return ScheduleResult(state=ScheduleState.verified, mission_id=mission_id, title=event.title,
                               all_day=all_day, event_id=result.event_id, account=read_account,
                               html_link=result.html_link, reason=result.reason)
