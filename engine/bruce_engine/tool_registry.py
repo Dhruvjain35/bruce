@@ -48,6 +48,13 @@ def get(capability: str) -> ToolSpec | None:
     return _BY_CAP.get(capability)
 
 
+def specs(domain: str | None = None) -> list[ToolSpec]:
+    """Read-only view of the declared tools, optionally filtered to a domain ('calendar'). The ToolBroker
+    shortlists from this instead of reaching into the private table — so brokering never sees a tool the
+    registry didn't declare."""
+    return [t for t in _TOOLS if domain is None or t.capability.startswith(f"{domain}.")]
+
+
 def is_live(capability: str) -> bool:
     """Declared live (implemented + wired). Does NOT check the user's connection — see is_available."""
     t = _BY_CAP.get(capability)
