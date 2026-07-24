@@ -198,4 +198,4 @@ def test_runner_gives_up_after_max_attempts():
     r = BackgroundRunner(worker_id="w1", advancer=Boom())
     assert _run(r.run_once()) is True
     row = _run(_row(run["id"]))
-    assert row["status"] == "failed"                      # attempt_count(1) >= max_attempts(1) -> terminal
+    assert row["status"] == "dead_letter"                 # attempt_count(1) >= max_attempts(1) -> dead-letter (Phase E)

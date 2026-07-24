@@ -1,15 +1,22 @@
-"""Background mission runner (G0.5) — durably advance background_mission AgentRuns off the request path.
+"""Background mission runner (G0.5 substrate + Phase E real advancer) — durably advance background_mission
+AgentRuns off the request path, for real.
 
-A durable background run (a follow-up, a monitor, a long "stay on top of X til friday" handoff) can't run
-inside the inbound turn. This runner is the substrate: it CLAIMS one due run at a time via the AgentRun
-lease (FOR UPDATE SKIP LOCKED, worker session) so N workers never double-execute, advances it one step
-through a pluggable MissionAdvancer, and commits or reschedules from the result. A crash just drops the
-lease — the next poll reclaims the run (resumable), and attempts are bounded so nothing retries forever.
+The worker CLAIMS one due run at a time via the AgentRun lease (FOR UPDATE SKIP LOCKED, worker session), then
+drives the mission through its plan STEPS under that one lease: each step is a verified provider call (via the
+MissionExecutor) or a WAIT; progress is CHECKPOINTED (fenced to the lease owner) after every step, the lease
+is HEARTBEAT-renewed between consecutive steps, and the run yields only on a wait, completion, cancellation,
+or failure. So it survives a worker restart (resume from the checkpoint, redo nothing), never double-writes or
+double-notifies (idempotent steps + a notified flag), makes NO model call while merely waiting, and dead-
+letters after the attempt budget instead of retrying forever.
 
-The claim/lease/resume machinery is the deliverable here. Real mission WORK plugs in as a MissionAdvancer
-when the first multi-step mission exists (there is none yet — the default advancer is an honest no-op, not
-a fabricated success). This mirrors the router's Stage-1 and the loop's Tier-1 seams: infrastructure first,
-handlers as they land.
+Exactly-once for NON-idempotent side effects: a step executes before its checkpoint is durable, so a crash or
+a lease-expiry can re-run it. Calendar ops are idempotent by read-back, but a Gmail send is not — so the
+runner hands every step (and the notify) a stable per-step IDEMPOTENCY KEY (run_id:stepN); a non-idempotent
+hand dedupes on it at the provider boundary. That is the contract for adding Gmail (Phase G) — the executor
+must honor the key; the runner already supplies it.
+
+The default advancer is still the honest NoopAdvancer; PlanMissionAdvancer is the REAL one, driving a plan of
+steps. The first genuine end-user mission (send an email, wait for the reply, notify once) plugs in at Phase G.
 """
 
 from __future__ import annotations
@@ -20,33 +27,81 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 from uuid import UUID
 
-from . import agent_run_store
+from . import agent_run_store, mission_executor
 
 log = logging.getLogger("bruce.background_runner")   # content-free: run ids / statuses only
 
 _DEFAULT_BACKOFF_SECONDS = 300
+_MAX_STEPS_PER_CLAIM = 16            # bound one claim's work so a runaway plan can't starve other missions
 
 
 @dataclass(frozen=True)
 class AdvanceOutcome:
-    """What one advance step decided. `done` -> commit the terminal `status`; otherwise the run is
-    rescheduled `retry_after_seconds` out (or the runner's default backoff)."""
+    """What one advance step decided. `done` -> commit the terminal `status`. Otherwise the run is
+    rescheduled `retry_after_seconds` out (0 = continue to the next step immediately, under the same lease).
+    `checkpoint` is the mission's recovery_state to persist BEFORE acting (restart-safe)."""
     done: bool = True
-    status: str = "completed"          # terminal status when done: completed | failed | cancelled
+    status: str = "completed"          # terminal: completed | failed | cancelled | dead_letter
     note: str | None = None
     retry_after_seconds: int | None = None
+    checkpoint: dict | None = None
 
 
 class MissionAdvancer(Protocol):
     async def advance(self, run: dict) -> AdvanceOutcome: ...
 
 
+class MissionStepFailed(Exception):
+    """A plan step did not verify — surfaced so the runner's retry/dead-letter policy handles it."""
+
+
 class NoopAdvancer:
-    """No multi-step mission handlers exist yet, so a claimed run is completed as an explicit no-op — never
-    a fabricated 'i did the mission'. Replaced by real advancers when the first mission lands."""
+    """No plan -> completed as an explicit no-op, never a fabricated 'i did the mission'."""
 
     async def advance(self, run: dict) -> AdvanceOutcome:
         return AdvanceOutcome(done=True, status="completed", note="no background mission handler registered")
+
+
+class PlanMissionAdvancer:
+    """The REAL advancer — drives a mission's stored plan ONE step per call. A run's goal carries
+    {"steps": [{"kind": "action", "action": {...}} | {"kind": "wait", "seconds": N}], "notify": bool};
+    recovery_state carries the checkpoint {"step_index", "notified", "results"}. Idempotent by construction:
+    a completed step's index is checkpointed, so a resume never re-runs it."""
+
+    def __init__(self, *, executor=None, notifier=None) -> None:
+        self.executor = executor or mission_executor.MissionExecutor()
+        self.notifier = notifier          # async notify(user_id, run) -> None ; sends exactly one message
+
+    async def advance(self, run: dict) -> AdvanceOutcome:
+        uid = UUID(run["user_id"])
+        rid = run.get("id")
+        goal = run.get("goal") or {}
+        steps = list(goal.get("steps") or [])
+        cp = dict(run.get("recovery_state") or {})
+        idx = int(cp.get("step_index", 0))
+
+        if idx >= len(steps):                                   # all steps done -> notify ONCE, then complete
+            if goal.get("notify") and self.notifier is not None and not cp.get("notified"):
+                await self.notifier(uid, run, idempotency_key=f"{rid}:notify")   # dedup key -> never double
+                cp["notified"] = True
+            return AdvanceOutcome(done=True, status="completed", note="mission complete", checkpoint=cp)
+
+        step = steps[idx] or {}
+        kind = step.get("kind")
+        if kind == "wait":                                      # yield WITHOUT any work/model call
+            cp["step_index"] = idx + 1
+            return AdvanceOutcome(done=False, retry_after_seconds=int(step.get("seconds", 300)), checkpoint=cp)
+        if kind == "action":
+            # a stable per-step key: a non-idempotent hand (Gmail send) dedupes on it, so a crash-resume or a
+            # lease-expiry re-run never doubles the side effect. Calendar ignores it (idempotent by read-back).
+            tr = await self.executor.execute(uid, mission_executor.action_from_dict(step.get("action") or {}),
+                                             idempotency_key=f"{rid}:step{idx}")
+            if not tr.verified:
+                raise MissionStepFailed(f"step {idx} unverified: {tr.reason}")   # -> runner retry/dead-letter
+            cp["step_index"] = idx + 1
+            cp.setdefault("results", {})[str(idx)] = {"verified": True, "op": tr.operation}
+            return AdvanceOutcome(done=False, retry_after_seconds=0, checkpoint=cp)   # continue to next step
+        raise MissionStepFailed(f"unknown step kind {kind!r}")
 
 
 def _soon(seconds: int) -> datetime:
@@ -62,49 +117,58 @@ class BackgroundRunner:
         self.backoff_seconds = backoff_seconds
 
     async def run_once(self) -> bool:
-        """Claim + advance ONE due run. Returns False when nothing is due (drain complete).
-
-        Every owner write below is FENCED by self.worker_id, so if the lease expired mid-advance and another
-        worker reclaimed the run, this worker's write is a no-op instead of clobbering the new owner. NOTE:
-        an advancer MUST finish well within lease_seconds (or renew via renew_background_lease); otherwise the
-        run can be reclaimed and advanced by two workers — real advancers with external side effects must
-        also be idempotent. The instant NoopAdvancer trivially satisfies this."""
+        """Claim ONE due run and drive it through consecutive ready steps under one lease. Returns False when
+        nothing is due."""
         w = self.worker_id
         claimed = await agent_run_store.claim_background(w, lease_seconds=self.lease_seconds)
         if claimed is None:
             return False
         uid, rid = UUID(claimed["user_id"]), UUID(claimed["id"])
 
-        # give up cleanly once the attempt budget is spent (the claim just incremented attempt_count).
-        if claimed["attempt_count"] > claimed["max_attempts"]:
-            await agent_run_store.complete_background(uid, rid, status="failed",
+        if claimed["attempt_count"] > claimed["max_attempts"]:  # budget spent -> DEAD-LETTER (not a retry)
+            await agent_run_store.complete_background(uid, rid, status="dead_letter",
                                                       note="max_attempts_exceeded", worker_id=w)
             return True
 
-        try:
-            run = await agent_run_store.get_run(uid, rid) or claimed
-            outcome = await self.advancer.advance(run)
-        except Exception:
-            log.info("bg_advance_error run=%s attempt=%s", rid, claimed["attempt_count"])
-            if claimed["attempt_count"] >= claimed["max_attempts"]:
-                await agent_run_store.complete_background(uid, rid, status="failed",
-                                                          note="advance_error", worker_id=w)
-            else:                                             # a FAILURE reschedule — keep the failure count
-                await agent_run_store.reschedule_background(uid, rid, next_run_at=_soon(self.backoff_seconds),
-                                                            worker_id=w, reset_attempts=False)
-            return True
+        for _ in range(_MAX_STEPS_PER_CLAIM):
+            run = await agent_run_store.get_run(uid, rid)
+            if run is None:                                     # transient invisibility -> reschedule; NEVER
+                await agent_run_store.reschedule_background(   # advance a goal-less skeleton (would complete early)
+                    uid, rid, next_run_at=_soon(self.backoff_seconds), worker_id=w, reset_attempts=False)
+                return True
+            if run.get("status") == "cancelled":                # cancelled while we held it -> stop, no advance
+                return True
+            try:
+                outcome = await self.advancer.advance(run)
+            except Exception:
+                log.info("bg_advance_error run=%s attempt=%s", rid, claimed["attempt_count"])
+                if claimed["attempt_count"] >= claimed["max_attempts"]:
+                    await agent_run_store.complete_background(uid, rid, status="dead_letter",
+                                                              note="advance_error", worker_id=w)
+                else:
+                    await agent_run_store.reschedule_background(uid, rid, next_run_at=_soon(self.backoff_seconds),
+                                                               worker_id=w, reset_attempts=False)
+                return True
 
-        if outcome.done:
-            await agent_run_store.complete_background(uid, rid, status=outcome.status,
-                                                      note=outcome.note, worker_id=w)
-        else:                                                 # a HEALTHY recurring check — reset the budget
+            if outcome.checkpoint is not None:                  # persist progress BEFORE acting (restart-safe)
+                await agent_run_store.checkpoint_background(uid, rid, recovery_state=outcome.checkpoint, worker_id=w)
+
+            if outcome.done:
+                await agent_run_store.complete_background(uid, rid, status=outcome.status,
+                                                          note=outcome.note, worker_id=w)
+                return True
             secs = outcome.retry_after_seconds if outcome.retry_after_seconds is not None else self.backoff_seconds
-            await agent_run_store.reschedule_background(uid, rid, next_run_at=_soon(secs),
-                                                        worker_id=w, reset_attempts=True)
+            if secs > 0:                                        # a WAIT -> reschedule and yield (no work while waiting)
+                await agent_run_store.reschedule_background(uid, rid, next_run_at=_soon(secs),
+                                                           worker_id=w, reset_attempts=True)
+                return True
+            if not await agent_run_store.renew_background_lease(w, rid, lease_seconds=self.lease_seconds):
+                return True                                     # lost the lease -> another worker owns it; stop
+        # hit the per-claim step bound -> reschedule to continue promptly, fair to other missions
+        await agent_run_store.reschedule_background(uid, rid, next_run_at=_soon(1), worker_id=w, reset_attempts=True)
         return True
 
     async def drain(self, *, max_runs: int = 25) -> int:
-        """Advance up to `max_runs` due runs this invocation; a crash mid-run just leaves the lease to expire."""
         n = 0
         while n < max_runs and await self.run_once():
             n += 1
