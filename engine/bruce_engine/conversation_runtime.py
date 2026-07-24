@@ -12,7 +12,7 @@ import logging
 from uuid import UUID
 
 from . import (capability_truth, context_compiler, conversation_context, conversation_outcomes,
-               conversation_store, messaging_outbound, technical_render)
+               conversation_store, messaging_outbound, response_composer, technical_render)
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
@@ -256,6 +256,14 @@ class _Runtime:
             if integ is not None and integ.status == "connected" and integ.revoked_at is None:
                 log.info("capability_claim_override pmid=%s cap=calendar_connected", pmid)
                 reply_out = capability_truth.grounded_calendar_correction(msg.text)
+
+        # G0.6 response-experience guard: the dual of the capability-truth check. Never let a reply that no
+        # verified action handler produced fabricate that a calendar change LANDED ("added it ✅"). A real
+        # action handler's success copy (only emitted after a read-back) passes through untouched.
+        pre_guard = reply_out
+        reply_out = response_composer.no_false_completion(reply_out, handler=outcome.handler)
+        if reply_out is not pre_guard:
+            log.info("false_completion_downgraded pmid=%s handler=%s", pmid, outcome.handler)
 
         await self._finalize(user_id, ch, ident, pmid, reply_out, reply_target,
                              decision=decision, event_candidate_id=outcome.event_candidate_id)
