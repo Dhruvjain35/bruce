@@ -164,9 +164,12 @@ class _Runtime:
             if skip and rd.domain == "calendar":
                 # the calendar handlers CLAIM only when connected; if not, defer to the reasoner so the honest
                 # "not connected" reply is still generated instead of an empty synthetic one (keeps parity).
-                # All calendar ops share ONE google connection, so a known-live cap is the connection proxy —
-                # this also sidesteps the router mislabeling a repair's candidate as calendar.repair_event.
-                skip = await tool_registry.is_available("calendar.update_event", user_id)
+                # Phase B: the ToolBroker is the single capability-truth authority (live+connected+scoped);
+                # a known-live cap is the shared-connection proxy. Kill switch falls back to the registry.
+                if tool_broker.authority_enabled():
+                    skip = (await tool_broker.availability(user_id, "calendar.update_event")).ok
+                else:
+                    skip = await tool_registry.is_available("calendar.update_event", user_id)
             if skip:
                 authoritative_decision = router_authority.synthetic_decision(rd)
         except Exception:
