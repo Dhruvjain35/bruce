@@ -77,6 +77,8 @@ def _user():
 
 def test_router_picks_the_cheapest_correct_path():
     uid = _user()
+    _run(fast_router.route(uid, "warmup"))     # pay the one-time lazy import (pydantic_ai) that a live
+                                               # process has already paid at startup; then time the hot path
     d_chat, t_chat = _run(fast_router.route(uid, "lmaooo thats so real"))
     d_sched, t_sched = _run(fast_router.route(uid, "add dentist appt tmr at 3pm"))
     d_hand, t_hand = _run(fast_router.route(uid, "stay on top of the bio group project til friday"))
