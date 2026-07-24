@@ -21,6 +21,7 @@ MIGRATION_LANES: dict[str, str] = {
     "0023": "runtime",             # agent_runs + agent_run_events (R2)
     "0024": "runtime",             # calendar_event_entities (R7)
     "0025": "runtime",             # agent_runs background-mission lease columns (G0.5)
+    "0026": "runtime",             # gmail_sent_ledger — Gmail exactly-once send ledger (Phase G)
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the

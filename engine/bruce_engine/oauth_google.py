@@ -58,7 +58,14 @@ PROVIDER = "google_calendar"
 # property. Proven necessary: with calendar.events alone, every identity endpoint returns 401/403, so
 # Bruce cannot even name the account it is writing to.
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
-SCOPES = ("openid", "https://www.googleapis.com/auth/userinfo.email", CALENDAR_SCOPE)
+# Gmail is an INHERITED hand on the SAME Google connection (Option A): one refresh token, one consent. We
+# request gmail.send (write, least-privilege — NOT full gmail, which could read/delete everything) and
+# gmail.readonly (the read-back that PROVES a send + detects a reply). include_granted_scopes below means a
+# user who already connected calendar can add these by re-consenting, and the token keeps calendar too.
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+SCOPES = ("openid", "https://www.googleapis.com/auth/userinfo.email", CALENDAR_SCOPE,
+          GMAIL_SEND_SCOPE, GMAIL_READ_SCOPE)
 STATE_TTL = datetime.timedelta(minutes=30)  # a real connect flow (read msg -> click -> Google sign-in ->
 #                                             consent -> redirect) easily exceeds 10 min; 30 is the balance.
 

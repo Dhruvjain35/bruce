@@ -18,6 +18,12 @@ from dataclasses import dataclass, field
 from uuid import UUID
 
 _CAL_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+_GMAIL_SEND = "https://www.googleapis.com/auth/gmail.send"
+_GMAIL_READ = "https://www.googleapis.com/auth/gmail.readonly"
+# Gmail is an INHERITED hand: it reuses the ONE Google integration (same refresh token). These providers
+# both resolve to that single integration row; the SCOPE check is what separates "can send mail" from
+# "can only touch the calendar". No second connect flow, no Gmail-specific handler.
+_GOOGLE_PROVIDERS = ("google_calendar", "gmail")
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,38 @@ _TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("calendar.search_events", "google_calendar", "search_events", write=False, live=False,
              requires_scope=_CAL_SCOPE,
              arg_schema={"query": "str", "time_min": "datetime?", "time_max": "datetime?"}),
+    # --- Gmail (Phase G) — the first inherited hand. `live` is liveness (implemented + reachable via the
+    # SAME generic route calendar mutations use), NOT permission: a user who hasn't granted gmail.send sees
+    # INSUFFICIENT_SCOPE from the broker, never a fake "sent". Send + reply + the reads the runtime needs to
+    # verify a send and detect a reply are live; recipient-resolution / drafts / search / standalone monitor
+    # are honest live=False until a route reaches them.
+    ToolSpec("gmail.send_message", "gmail", "send_message", write=True, live=True, reversible=False,
+             requires_scope=_GMAIL_SEND,
+             arg_schema={"to": "str", "subject": "str", "body": "str", "thread_id": "str?"}),
+    ToolSpec("gmail.reply_to_thread", "gmail", "reply_to_thread", write=True, live=True, reversible=False,
+             requires_scope=_GMAIL_SEND,
+             arg_schema={"thread_id": "str", "body": "str", "to": "str?", "subject": "str?"}),
+    ToolSpec("gmail.get_message", "gmail", "get_message", write=False, live=True,
+             requires_scope=_GMAIL_READ, arg_schema={"message_id": "str"}),
+    ToolSpec("gmail.get_thread", "gmail", "get_thread", write=False, live=True,
+             requires_scope=_GMAIL_READ, arg_schema={"thread_id": "str"}),
+    ToolSpec("gmail.find_reply", "gmail", "find_reply", write=False, live=True,
+             requires_scope=_GMAIL_READ,
+             arg_schema={"thread_id": "str", "after_message_id": "str"}),
+    ToolSpec("gmail.verify_sent", "gmail", "verify_sent", write=False, live=True,
+             requires_scope=_GMAIL_READ,
+             arg_schema={"message_id": "str", "to": "str", "subject": "str"}),
+    ToolSpec("gmail.search_messages", "gmail", "search_messages", write=False, live=False,
+             requires_scope=_GMAIL_READ,
+             arg_schema={"query": "str", "max_results": "int?"}),
+    ToolSpec("gmail.resolve_recipient", "gmail", "resolve_recipient", write=False, live=False,
+             requires_scope=_GMAIL_READ, arg_schema={"name": "str"}),
+    ToolSpec("gmail.create_draft", "gmail", "create_draft", write=True, live=False,
+             requires_scope=_GMAIL_SEND,
+             arg_schema={"to": "str", "subject": "str", "body": "str", "thread_id": "str?"}),
+    ToolSpec("gmail.monitor_thread", "gmail", "monitor_thread", write=False, live=False,
+             requires_scope=_GMAIL_READ,
+             arg_schema={"thread_id": "str", "after_message_id": "str?"}),
 )
 _BY_CAP: dict[str, ToolSpec] = {t.capability: t for t in _TOOLS}
 
@@ -83,21 +121,26 @@ async def is_available(capability: str, user_id: UUID) -> bool:
     t = _BY_CAP.get(capability)
     if t is None or not t.live:
         return False
-    if t.provider == "google_calendar":
+    if t.provider in _GOOGLE_PROVIDERS:
         from . import oauth_google
         try:
             integ = await oauth_google.get_integration(user_id)
         except Exception:
             return False
-        return (integ is not None and integ.status == "connected"
-                and integ.revoked_at is None and bool(integ.refresh_token_encrypted))
+        connected = (integ is not None and integ.status == "connected"
+                     and integ.revoked_at is None and bool(integ.refresh_token_encrypted))
+        # connected is necessary but not sufficient — the capability's scope must actually be granted, else a
+        # calendar-only connection would falsely report Gmail as available. Availability = connected AND scoped.
+        if not connected:
+            return False
+        return (t.requires_scope is None) or (t.requires_scope in tuple(integ.scopes or ()))
     return False
 
 
 async def granted_scopes(user_id: UUID, provider: str) -> tuple[str, ...]:
     """The scopes the user's CONNECTED integration actually granted for a provider (empty if not connected).
     Lets the broker distinguish 'connected but missing the scope' (insufficient_scope) from disconnected."""
-    if provider == "google_calendar":
+    if provider in _GOOGLE_PROVIDERS:
         from . import oauth_google
         try:
             integ = await oauth_google.get_integration(user_id)

@@ -377,6 +377,26 @@ class CalendarEventEntity(Base, TSV):
     __table_args__ = (UniqueConstraint("user_id", "provider", "provider_event_id", name="uq_cal_entity_provider_event"),)
 
 
+class GmailSentLedger(Base):
+    """The exactly-once ledger for Gmail sends (Phase G) — one row per (user, marker), written after a
+    verified send. Google assigns the message id and Gmail can't be searched by a custom header, so this row
+    (not a client-set id) is what makes a retry resolve to the already-sent message instead of a duplicate.
+    Owner-scoped (tenant_isolation); UNIQUE(user_id, marker) is the concurrency guard."""
+
+    __tablename__ = "gmail_sent_ledger"
+    id = _pk()
+    user_id = _owner()
+    marker: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    to_addr: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    subject: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (UniqueConstraint("user_id", "marker", name="uq_gmail_ledger_user_marker"),)
+
+
 class ModelCost(Base):
     __tablename__ = "model_costs"
     id = _pk()
