@@ -13,7 +13,7 @@ import re
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from . import calendar_tools, entity_resolution, temporal, world_state
+from . import agent_loop, calendar_executor, entity_resolution, temporal, world_state
 from .calendar_schedule import DEFAULT_TZ
 from .runtime_contracts import ToolOutcome
 
@@ -116,21 +116,28 @@ async def handle(user_id: UUID, kind: str, text: str, *, adapter=None) -> str:
         return f"which one do u mean, {names}?"
     entity = res.entity
 
+    # G0.4: the verified provider write now runs THROUGH the general AgentRun loop (durable run + frozen
+    # contracts), which delegates to the SAME calendar_tools I/O — so behavior/verification are unchanged,
+    # the reply branches below are byte-identical, and every mutation leaves an auditable run.
     if kind == "delete":
-        tr = await calendar_tools.delete_event(user_id, entity, adapter=adapter)
+        result = await agent_loop.run_direct_action(
+            user_id, executor=calendar_executor.CalendarMutationExecutor("delete", entity, adapter=adapter))
+        tr = result.tool_result
         if tr.verified:
             return f"done, deleted {entity['title'].lower()} from ur calendar ✅"
         if tr.outcome is ToolOutcome.unauthorized:
             return "ur google calendar isn't connected, so i can't delete anything."
         return f"i tried to delete {entity['title'].lower()} but couldn't confirm it's gone, so i'm not calling it done."
 
-    # update / repair -> recompute the time and PUT
+    # update / repair -> recompute the time and PUT (through the loop)
     recomputed = recompute(entity, text, now=now)
     if recomputed is None:
         return f"what time should i move {entity['title'].lower()} to?"
     start, end, new_tz = recomputed
-    tr = await calendar_tools.update_event(user_id, entity, new_start=start, new_end=end,
-                                           new_timezone=new_tz, adapter=adapter)
+    result = await agent_loop.run_direct_action(
+        user_id, executor=calendar_executor.CalendarMutationExecutor(
+            kind, entity, new_start=start, new_end=end, new_timezone=new_tz, adapter=adapter))
+    tr = result.tool_result
     if tr.verified:
         when = _human(start, now=now)
         verb = "fixed" if kind == "repair" else "done"

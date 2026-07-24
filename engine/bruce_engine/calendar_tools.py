@@ -74,8 +74,11 @@ async def update_event(
     if not ok:
         return ToolResult(ToolOutcome.verification_failed, _CAP_UPDATE, _PROVIDER, "update_event",
                           provider_entity_id=eid, read_back=read_back, reason=reason)
-    await entity_store.mark_updated(user_id, UUID(entity["id"]), start=new_start, end=new_end,
-                                    timezone=new_timezone)
+    try:                                                  # entity memory is best-effort — a bookkeeping
+        await entity_store.mark_updated(user_id, UUID(entity["id"]), start=new_start, end=new_end,
+                                        timezone=new_timezone)
+    except Exception:                                     # hiccup must NEVER downgrade a verified write to a
+        log.info("calendar_update_bookkeeping_failed user=%s", user_id)   # false "google rejected" reply
     log.info("calendar_update_verified user=%s", user_id)
     return ToolResult(ToolOutcome.ok, _CAP_UPDATE, _PROVIDER, "update_event", verified=True,
                       provider_entity_id=eid, read_back=read_back, reason=reason)
@@ -101,7 +104,10 @@ async def delete_event(
         return ToolResult(ToolOutcome.verification_inconclusive, _CAP_DELETE, _PROVIDER, "delete_event",
                           provider_entity_id=eid, read_back=read_back,
                           reason="event still present after delete — NOT confirmed")
-    await entity_store.mark_deleted(user_id, UUID(entity["id"]))
+    try:                                                  # best-effort bookkeeping — see update_event
+        await entity_store.mark_deleted(user_id, UUID(entity["id"]))
+    except Exception:
+        log.info("calendar_delete_bookkeeping_failed user=%s", user_id)
     log.info("calendar_delete_verified user=%s", user_id)
     return ToolResult(ToolOutcome.ok, _CAP_DELETE, _PROVIDER, "delete_event", verified=True,
                       provider_entity_id=eid, reason="read-back confirmed the event is gone")
