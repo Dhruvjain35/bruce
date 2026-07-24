@@ -29,6 +29,8 @@ class GoalAction(str, Enum):
     follow_up = "follow_up"
     verify = "verify"
     repair = "repair"          # correct a prior operation ("not today, i said 4 days from now")
+    plan = "plan"              # a durable multi-step handoff ("take this from here")
+    coordinate = "coordinate"
 
 
 class Risk(str, Enum):
@@ -119,6 +121,34 @@ class ToolOutcome(str, Enum):
     provider_error = "provider_error"
     verification_failed = "verification_failed"
     verification_inconclusive = "verification_inconclusive"
+
+
+class ExecutionClass(str, Enum):
+    """The cheapest-correct path the router picks for a request. Bruce must NOT run a giant planning loop
+    for every text — most requests are fast chat or a single verified tool call."""
+    fast_conversation = "fast_conversation"   # casual/tutoring/ack -> one model call, no mission/plan
+    direct_action = "direct_action"           # one known op on one entity -> execute + verify, no planner
+    foreground_agent = "foreground_agent"     # ambiguous/multi-step the user is waiting on -> bounded TaskGraph
+    background_mission = "background_mission"  # follow-up/monitor/long-running -> durable async run
+
+
+@dataclass(frozen=True)
+class RouterDecision:
+    """What the FastRouter decides BEFORE any planning: which path, which domain, and whether this
+    continues/corrects an existing run. Produced by deterministic signals first, a compact router model
+    only when those are inconclusive, and the heavy planner only when genuinely needed."""
+    execution_class: ExecutionClass
+    action: GoalAction | None = None
+    domain: str | None = None                 # "calendar", "email", "school", … or None for chat
+    candidate_capabilities: tuple[str, ...] = ()
+    target_reference: str | None = None       # raw reference text for entity resolution ("chess class")
+    continuation_run_id: str | None = None    # resolves/continues this AgentRun
+    correction_of_run_id: str | None = None   # repairs this AgentRun's prior operation
+    decision_id: str | None = None            # resolves this pending Decision
+    confidence: float = 1.0
+    ambiguity: tuple[str, ...] = ()
+    needs_deeper_planning: bool = False
+    source: str = "deterministic"             # "deterministic" | "router_model" | "planner"
 
 
 @dataclass(frozen=True)

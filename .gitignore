@@ -35,3 +35,6 @@ ios/Bruce.xcodeproj/
 ios/*.png
 ios/shots/
 ios/**/xcuserdata/
+
+# local Claude Code agent config (never commit)
+.claude/

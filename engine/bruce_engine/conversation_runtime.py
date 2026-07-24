@@ -123,6 +123,26 @@ class _Runtime:
         await conversation_store.persist_user_turn(
             user_id, channel=ch, channel_identity=ident, provider_message_id=pmid, text=msg.text)
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
+
+        # G0.1 FastRouter: classify the cheapest-correct execution path (fast chat / single verified action /
+        # foreground agent / durable mission) BEFORE the heavy reasoner, and instrument its latency. This turn
+        # the decision is SHADOWED — recorded for the router-quality harness, latency telemetry, and the later
+        # execution lanes that will act on it; the proven conversation pipeline below still runs. A router
+        # glitch must never drop a turn, so classification is best-effort and content-free.
+        from . import fast_router
+        router_ec: str | None = None
+        router_ms: float | None = None
+        try:
+            rd, rt = await fast_router.route(
+                user_id, msg.text or "", has_attachments=bool(msg.attachments),
+                has_reply_ref=bool(msg.reply_to_message_id or msg.thread_root_message_id))
+            router_ec, router_ms = rd.execution_class.value, rt.total_ms
+            log.info("router pmid=%s ec=%s action=%s domain=%s conf=%.2f src=%s stage0_ms=%.1f "
+                     "stage1_ms=%.1f total_ms=%.1f", pmid, router_ec,
+                     rd.action.value if rd.action else None, rd.domain, rd.confidence, rd.source,
+                     rt.stage0_ms, rt.stage1_ms, rt.total_ms)
+        except Exception:
+            log.info("router_error pmid=%s", pmid)     # classification never blocks a reply
         # A3.2: resolve the EXPLICITLY-referenced message/attachment/prior-answer into a bounded capsule
         # the GENERIC reasoner consumes as evidence (no reply-specific branch).
         capsule = await conversation_context.resolve(user_id, msg)
@@ -216,10 +236,12 @@ class _Runtime:
 
         await self._finalize(user_id, ch, ident, pmid, reply_out, reply_target,
                              decision=decision, event_candidate_id=outcome.event_candidate_id)
-        log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s mission=%s handler=%s", pmid, decision.intent.value,
-                 decision.response_type.value, outcome.event_candidate_id is not None,
-                 outcome.mission_id is not None, outcome.handler)
-        return InboundOutcome(status="processed", user_id=user_id)
+        log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s mission=%s handler=%s route=%s route_ms=%s",
+                 pmid, decision.intent.value, decision.response_type.value,
+                 outcome.event_candidate_id is not None, outcome.mission_id is not None, outcome.handler,
+                 router_ec, None if router_ms is None else round(router_ms, 1))
+        return InboundOutcome(status="processed", user_id=user_id,
+                              execution_class=router_ec, router_ms=router_ms)
 
     def _present(self, text: str, *, decision: ConversationDecision, profile, channel: str) -> str:
         """Channel-aware presentation = humanity styling THEN trust safety gates (D-INT-2 seam).

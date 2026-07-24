@@ -177,6 +177,10 @@ def test_casual_reply(clean_db):
     ec, ij, at = _run(_counts(uid))
     assert out.status == "processed" and ec == 0 and ij == 0
     assert len(_run(_outbound(uid))) == 1
+    # G0.1: the FastRouter ran end-to-end through the runtime and classified this casual turn as fast chat,
+    # and its latency was instrumented onto the outcome (no scheduling/mutation/handoff signal -> Stage 1).
+    assert out.execution_class == "fast_conversation"
+    assert out.router_ms is not None and out.router_ms >= 0.0
 
 
 def test_model_failure_is_honest_fallback(clean_db):
