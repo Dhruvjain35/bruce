@@ -49,6 +49,8 @@ class InboundOutcome:
     # execution lanes can read the decision. Populated only for processed conversation turns; None otherwise.
     execution_class: str | None = None
     router_ms: float | None = None
+    # G0.3 observability: the ToolBroker's shortlisted capabilities for a tool-bearing path (None for chat).
+    shortlisted_capabilities: tuple[str, ...] | None = None
 
 
 def _content(msg: InboundMessage) -> tuple[IntakeSourceKind, str | None, bytes | None, str | None]:

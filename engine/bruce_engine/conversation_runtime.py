@@ -129,9 +129,11 @@ class _Runtime:
         # the decision is SHADOWED — recorded for the router-quality harness, latency telemetry, and the later
         # execution lanes that will act on it; the proven conversation pipeline below still runs. A router
         # glitch must never drop a turn, so classification is best-effort and content-free.
-        from . import fast_router
+        from . import fast_router, tool_broker
+        from .runtime_contracts import ExecutionClass
         router_ec: str | None = None
         router_ms: float | None = None
+        shortlisted: tuple[str, ...] | None = None
         try:
             rd, rt = await fast_router.route(
                 user_id, msg.text or "", has_attachments=bool(msg.attachments),
@@ -141,6 +143,17 @@ class _Runtime:
                      "stage1_ms=%.1f total_ms=%.1f", pmid, router_ec,
                      rd.action.value if rd.action else None, rd.domain, rd.confidence, rd.source,
                      rt.stage0_ms, rt.stage1_ms, rt.total_ms)
+            # G0.3 ToolBroker (SHADOW): for a tool-bearing path, shortlist the FEW relevant, live, connected
+            # tools the router→broker seam would hand a planner — never the whole registry. Recorded for
+            # telemetry + the G0.4 planner that will consume it; execution is unchanged this turn. Skipped for
+            # chat/plan paths (no provider tool), so pure conversation pays nothing.
+            if rd.domain and rd.action and rd.execution_class in (
+                    ExecutionClass.direct_action, ExecutionClass.foreground_agent):
+                sl = await tool_broker.shortlist(user_id, domain=rd.domain, action=rd.action,
+                                                 candidate_capabilities=rd.candidate_capabilities)
+                shortlisted = tuple(c.capability for c in sl.candidates)
+                log.info("broker pmid=%s caps=%s actionable=%s dead=%s unavailable=%s", pmid,
+                         list(shortlisted), sl.has_actionable, list(sl.excluded_dead), list(sl.unavailable))
         except Exception:
             log.info("router_error pmid=%s", pmid)     # classification never blocks a reply
         # A3.2: resolve the EXPLICITLY-referenced message/attachment/prior-answer into a bounded capsule
@@ -251,7 +264,8 @@ class _Runtime:
                  outcome.event_candidate_id is not None, outcome.mission_id is not None, outcome.handler,
                  router_ec, None if router_ms is None else round(router_ms, 1))
         return InboundOutcome(status="processed", user_id=user_id,
-                              execution_class=router_ec, router_ms=router_ms)
+                              execution_class=router_ec, router_ms=router_ms,
+                              shortlisted_capabilities=shortlisted)
 
     def _present(self, text: str, *, decision: ConversationDecision, profile, channel: str) -> str:
         """Channel-aware presentation = humanity styling THEN trust safety gates (D-INT-2 seam).

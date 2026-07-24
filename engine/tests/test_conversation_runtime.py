@@ -196,6 +196,18 @@ def test_g0_2_compiled_context_grounds_reasoner_with_world_layer(clean_db):
     assert "central time" in (rec.context or "")            # the WORLD layer reached the model
 
 
+def test_g0_3_scheduling_turn_shortlists_the_create_tool(clean_db):
+    """The router→ToolBroker seam runs end-to-end: a scheduling message shortlists exactly the calendar
+    create tool (never the whole registry), surfaced on the outcome for telemetry + the G0.4 planner."""
+    uid = uuid4(); _run(_ensure_user(uid))
+    d = _decision(IntentKind.casual, ResponseType.direct_answer, text="ok")
+    out = _run(conversation_runtime.handle(FakeChannel(), _msg("g3", text="add dentist appt tmr at 3pm"),
+                                           user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(d)))
+    assert out.status == "processed"
+    assert out.execution_class == "direct_action"
+    assert out.shortlisted_capabilities == ("calendar.create_event",)   # shortlist, not the universe
+
+
 def test_model_failure_is_honest_fallback(clean_db):
     uid = uuid4(); _run(_ensure_user(uid))
     img = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG)
