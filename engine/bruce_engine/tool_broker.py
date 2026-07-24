@@ -57,10 +57,15 @@ class _Conn:
     scopes: tuple[str, ...] = ()
 
 
+# calendar + gmail are the SAME Google integration (one refresh token, one scope list). The scope check in
+# availability() is what separates them, so both providers probe the one integration row.
+_GOOGLE_PROVIDERS = ("google_calendar", "gmail")
+
+
 async def _provider_connection(user_id: UUID, provider: str) -> _Conn:
     """THE connection probe (one integration fetch): connected + the scopes actually granted. Patchable seam
     so the whole broker's capability truth is tested without the DB/OAuth."""
-    if provider == "google_calendar":
+    if provider in _GOOGLE_PROVIDERS:
         from . import oauth_google
         try:
             integ = await oauth_google.get_integration(user_id)

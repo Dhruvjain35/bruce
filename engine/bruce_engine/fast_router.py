@@ -40,6 +40,17 @@ class RouterModel(Protocol):
 _COMMAND_VERB = re.compile(
     r"\b(add|put|schedule|block\s+off|save|create|set\s+up|pencil|throw|slot|book|remind\s+me|make\s+an?\s+event)\b",
     re.IGNORECASE)
+# A generic "send someone a message" intent — the SHARED router's send verb, NOT a Gmail-specific route. It
+# resolves to the provider-neutral send action on the send-capable hand (Gmail today); the broker + loop +
+# response handle it exactly like calendar. Deliberately tight so "send me the plan"/"message me" don't fire:
+# an email/message/note verb aimed outward.
+_SEND_INTENT = re.compile(
+    r"\b(e-?mail|send\s+(?:an?\s+|them\s+|him\s+|her\s+|over\s+)?(?:email|message|msg|note))\b", re.IGNORECASE)
+# A send that also asks to be TOLD about the reply is a durable monitor -> background mission (not a bare send).
+_FOLLOWUP = re.compile(
+    r"\b(let\s+me\s+know|tell\s+me|notify\s+me|ping\s+me|follow(?:\s|-)?up|"
+    r"when\s+they\s+(?:reply|respond|get\s+back|answer)|if\s+they\s+(?:don'?t|dont|haven'?t|havent))\b",
+    re.IGNORECASE)
 # An interrogative / non-command framing ("is it gonna rain tmr", "hru", "gimme a plan", "should i…").
 _INTERROGATIVE = re.compile(
     r"^\s*(?:is|are|am|do|does|did|can|could|would|should|will|what|whats|when|whens|where|why|who|how|hru|"
@@ -104,6 +115,15 @@ async def _stage0(user_id: UUID, text: str, *, has_attachments: bool, has_reply_
     # 3. a world-state statement ("i'm in cst") -> remember
     if world_state.detect_user_timezone_statement(t):
         return RouterDecision(ExecutionClass.direct_action, action=GoalAction.remember, domain="world")
+
+    # 3b. GENERIC send intent -> the send hand (Gmail). A plain send is a direct action; a send that also asks
+    # to be told about the reply is a durable monitor -> background mission (boundary-7 shape). Provider-neutral
+    # action; the broker resolves the concrete tool + capability truth. Placed before the handoff check so a
+    # "email X and let me know when they reply" is a Gmail mission, not a bare unrouted plan.
+    if _SEND_INTENT.search(t):
+        ec = ExecutionClass.background_mission if _FOLLOWUP.search(t) else ExecutionClass.direct_action
+        return RouterDecision(ec, action=GoalAction.send, domain="gmail", target_reference=t,
+                              candidate_capabilities=("gmail.send_message",))
 
     # 5. explicit handoff / long-running -> durable background mission (before the temporal check so
     # "handle this by friday" is a mission, not a bare create)

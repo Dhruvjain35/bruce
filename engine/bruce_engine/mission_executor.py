@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from . import calendar_tools, entity_store
+from . import calendar_tools, entity_store, gmail_adapter
 from .runtime_contracts import ActionType, NextAction, ToolOutcome, ToolResult
 
 
@@ -43,6 +43,25 @@ class MissionExecutor:
             return await calendar_tools.update_event(
                 user_id, entity, new_start=a.get("new_start"), new_end=a.get("new_end"),
                 new_timezone=a.get("new_timezone"), adapter=self._adapter)
-        # No other capability is background-executable yet (Gmail lands at Phase G).
+        if cap in ("gmail.send_message", "gmail.reply_to_thread"):
+            # The non-idempotent hand: the runner's per-step idempotency_key (run_id:stepN) is what makes a
+            # lease-retry send exactly once. A missing key would risk duplicate mail, so refuse rather than
+            # send blind — the runner always supplies one.
+            if not idempotency_key:
+                return ToolResult(ToolOutcome.provider_error, cap, "gmail", action.operation or "",
+                                  reason="gmail send requires an idempotency_key")
+            a = action.arguments or {}
+            adapter = self._adapter or gmail_adapter.real_adapter(user_id)
+            return await gmail_adapter.send_and_verify(
+                adapter, user_id, to=a.get("to"), subject=a.get("subject"), body=a.get("body"),
+                idempotency_key=idempotency_key, thread_id=a.get("thread_id"))
+        if cap == "gmail.find_reply":
+            # a READ: detect an inbound reply in the thread. No write, no idempotency — `read_back` carries the
+            # reply (or None), which the advancer inspects to decide continue-vs-keep-waiting.
+            a = action.arguments or {}
+            adapter = self._adapter or gmail_adapter.real_adapter(user_id)
+            reply = await adapter.find_reply(a.get("thread_id"), after_message_id=a.get("after_message_id"))
+            return ToolResult(ToolOutcome.ok, cap, "gmail", "find_reply", verified=False, read_back=reply)
+        # No other capability is background-executable yet.
         return ToolResult(ToolOutcome.provider_error, cap, action.provider or "", action.operation or "",
                           reason="capability not background-executable yet")

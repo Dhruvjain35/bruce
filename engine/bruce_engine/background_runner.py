@@ -28,6 +28,7 @@ from typing import Protocol
 from uuid import UUID
 
 from . import agent_run_store, mission_executor
+from .runtime_contracts import ActionType, NextAction
 
 log = logging.getLogger("bruce.background_runner")   # content-free: run ids / statuses only
 
@@ -99,8 +100,36 @@ class PlanMissionAdvancer:
             if not tr.verified:
                 raise MissionStepFailed(f"step {idx} unverified: {tr.reason}")   # -> runner retry/dead-letter
             cp["step_index"] = idx + 1
-            cp.setdefault("results", {})[str(idx)] = {"verified": True, "op": tr.operation}
+            # record the provider ids a later step needs (e.g. the thread to watch for a reply) — no user text
+            cp.setdefault("results", {})[str(idx)] = {
+                "verified": True, "op": tr.operation, "message_id": tr.provider_entity_id,
+                "thread_id": (tr.read_back or {}).get("threadId")}
             return AdvanceOutcome(done=False, retry_after_seconds=0, checkpoint=cp)   # continue to next step
+        if kind == "await_reply":
+            # WAIT for an inbound reply in the thread a prior send opened. This is a POLL, not a busy loop: each
+            # due tick does ONE cheap read (no model), and if no reply is in yet it reschedules and yields — so
+            # a run can sleep for hours across worker restarts without holding a lease or spending a model call.
+            src = str(step.get("from_step", idx - 1))
+            prior = (cp.get("results") or {}).get(src) or {}
+            thread_id, after_id = prior.get("thread_id"), prior.get("message_id")
+            if not thread_id:
+                raise MissionStepFailed("await_reply has no thread to watch")
+            polls = int(cp.get("polls", 0))
+            read = NextAction(type=ActionType.call_tool, capability="gmail.find_reply", provider="gmail",
+                              operation="find_reply",
+                              arguments={"thread_id": thread_id, "after_message_id": after_id})
+            tr = await self.executor.execute(uid, read, idempotency_key=f"{rid}:step{idx}:poll{polls}")
+            if tr.read_back:                                    # a reply arrived -> advance to the notify/next step
+                cp["polls"] = 0
+                cp["step_index"] = idx + 1
+                cp.setdefault("results", {})[str(idx)] = {"reply": True, "reply_id": tr.read_back.get("id")}
+                return AdvanceOutcome(done=False, retry_after_seconds=0, checkpoint=cp)
+            if polls + 1 >= int(step.get("max_polls", 288)):    # gave up waiting -> finish honestly (no reply)
+                cp["step_index"] = len(steps)
+                cp["no_reply"] = True
+                return AdvanceOutcome(done=False, retry_after_seconds=0, checkpoint=cp)
+            cp["polls"] = polls + 1                             # still no reply -> keep waiting, do NOT advance
+            return AdvanceOutcome(done=False, retry_after_seconds=int(step.get("poll_seconds", 300)), checkpoint=cp)
         raise MissionStepFailed(f"unknown step kind {kind!r}")
 
 

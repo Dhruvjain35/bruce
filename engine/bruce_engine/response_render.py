@@ -100,6 +100,45 @@ def render_deterministic(spec: ResponseSpec, *, profile: VoiceProfile | None = N
     return enforce_no_dashes(strip_redundant_offer((spec.freeform or "").strip()))
 
 
+# --- generic runtime → ResponseSpec mapping (provider-neutral) ------------------------------------
+# This is how ANY hand (calendar, gmail, …) turns its verified structured result into a reply — there is no
+# per-provider response engine. The runtime hands the outcome + a few provider-neutral words; the kind is
+# derived from the ToolResult's honest outcome so a reply can NEVER claim more than the runtime verified.
+
+_RECONNECT = {"unauthorized", "insufficient_scope"}          # a credential/scope gap -> reconnect, not failure
+_TRANSIENT = {"rate_limited"}                                # keep trying; nothing landed yet
+
+
+def spec_from_result(tool_result, *, action: str, subject: str | None = None, detail: str | None = None,
+                     provider: str | None = None, blocker: str | None = None) -> ResponseSpec:
+    """Map an executor ToolResult to the ONE ResponseSpec the renderer will voice. `verified` (and thus any
+    'done/✅') comes STRICTLY from tool_result.verified — a write that didn't read back clean is a failure, not
+    a success. `action`/`subject`/`detail` are the provider-neutral words ('sent', the recipient, …)."""
+    outcome = getattr(tool_result, "outcome", None)
+    ov = getattr(outcome, "value", outcome)
+    if getattr(tool_result, "verified", False):
+        # NOTE: the provider entity id is durable audit on the AgentRun — it is deliberately NOT surfaced as
+        # `proof` here, so a texting reply stays "sent ✅" and never leaks an internal id at the user.
+        return ResponseSpec(ResponseKind.verified_success, action=action, subject=subject, detail=detail,
+                            provider=provider, verified=True)
+    if ov in _RECONNECT:
+        return ResponseSpec(ResponseKind.disconnected, action=action, provider=provider)
+    if ov in _TRANSIENT:
+        return ResponseSpec(ResponseKind.retrying, action=action,
+                            blocker=blocker or f"{provider or 'that'} is rate limited")
+    # provider_error / not_found / verification_failed / verification_inconclusive -> honest terminal failure
+    return ResponseSpec(ResponseKind.terminal_failure, action=action,
+                        blocker=blocker or f"{provider or 'that'} didn't go through")
+
+
+def spec_from_unavailable(status: str, *, provider: str | None = None) -> ResponseSpec:
+    """Map a broker non-selection (disconnected / insufficient_scope / unsupported / no_tool) to an honest
+    reply BEFORE any provider call — so 'connect gmail' / 'not live yet' are the runtime's words, never faked."""
+    if status in ("disconnected", "insufficient_scope"):
+        return ResponseSpec(ResponseKind.disconnected, provider=provider)
+    return ResponseSpec(ResponseKind.unsupported, provider=provider)
+
+
 class ResponseModel(Protocol):
     """A CHEAP model that only rephrases the deterministic text in Bruce's voice — no new facts."""
     async def rephrase(self, *, deterministic: str, spec: ResponseSpec, profile: VoiceProfile | None) -> str: ...

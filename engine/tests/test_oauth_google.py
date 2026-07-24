@@ -39,7 +39,11 @@ from bruce_engine.repositories import PostgresUserRepository
 
 users = PostgresUserRepository()
 KEY = crypto.generate_key()
-SCOPE = "openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/calendar.events"
+# least privilege on BOTH hands: calendar.events (not full calendar) + gmail.send/gmail.readonly (not full
+# gmail). Gmail is inherited on the SAME connection, so it rides the one consent (Phase G).
+SCOPE = ("openid https://www.googleapis.com/auth/userinfo.email "
+         "https://www.googleapis.com/auth/calendar.events "
+         "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly")
 
 
 @pytest.fixture(autouse=True)
@@ -101,7 +105,7 @@ def test_authorization_url_carries_pkce_and_offline_consent(clean_db):
         # offline+consent are what actually produce a refresh token; without them the integration
         # silently dies in an hour and Bruce cannot act while the app is closed.
         assert p["access_type"] == "offline" and p["prompt"] == "consent"
-        assert p["scope"] == SCOPE, "least privilege: events only, never full calendar access"
+        assert p["scope"] == SCOPE, "least privilege: calendar.events + gmail.send/readonly, never full access"
         assert len(p["state"]) >= 32, "state must be unguessable"
         # the verifier must NEVER be in the URL — only its hash
         async with user_session(uid) as s:
