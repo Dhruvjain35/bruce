@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from . import (capability_truth, conversation_context, conversation_outcomes, conversation_store,
-               messaging_outbound, technical_render)
+from . import (capability_truth, context_compiler, conversation_context, conversation_outcomes,
+               conversation_store, messaging_outbound, technical_render)
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
@@ -186,13 +186,23 @@ class _Runtime:
                                  decision=None, intent="image_understanding")
             return InboundOutcome(status="processed", user_id=user_id)
 
-        # P0.1: with an explicit, RESOLVED reply target, THAT is the context. Do not also dump the recent
-        # turns — that window is exactly how a newer image B leaked in and got answered instead of the
-        # replied-to image A. The referenced content (fenced as DATA below) stands on its own.
-        if explicit_ref and capsule.has_reference:
-            ctx = "No prior conversation."
-        else:
-            ctx = _context(recent)
+        # G0.2 ContextCompiler: assemble a BOUNDED, prioritized context from layered memory (world tz +
+        # active calendar entities + any open agent run + a bounded conversation window) instead of dumping
+        # the raw recent turns. P0.1 still holds: with an explicit, RESOLVED reply target THAT owns the
+        # context, so episodic is WITHHELD — that window is exactly how a newer image B leaked in and got
+        # answered instead of the replied-to image A. World/entity/operational still ground the reply. The
+        # referenced content (fenced as DATA below) stands on its own. Compilation never drops a turn.
+        include_episodic = not (explicit_ref and capsule.has_reference)
+        try:
+            compiled = await context_compiler.compile(
+                user_id, recent, include_episodic=include_episodic, profile=profile)
+            ctx = compiled.text
+            if compiled.dropped:
+                log.info("ctx_compiled pmid=%s tokens=%s blocks=%s dropped=%s", pmid, compiled.est_tokens,
+                         [b.layer for b in compiled.blocks], list(compiled.dropped))
+        except Exception:
+            log.info("ctx_compile_error pmid=%s", pmid)         # fall back to the honest minimal context
+            ctx = _context(recent) if include_episodic else "No prior conversation."
         _ev = conversation_context.evidence_text(capsule)       # referenced content, fenced as DATA
         if _ev:
             ctx = ctx + "\n\n" + _ev
