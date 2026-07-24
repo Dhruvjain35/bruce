@@ -184,12 +184,12 @@ class StatusQueryHandler:
         return HandlerOutput(text=mission_presentation.render_status(state), styled=False)
 
 
-def _calendar_reply(result, event) -> str:
+def _calendar_reply(result, event, *, now=None) -> str:
     """The honest, fact-locked reply for a calendar outcome. NEVER says 'done' unless the read-back
     verified. All copy is lowercase Bruce voice; the only dash is the numeric date range the outbound
-    gate preserves as a fact."""
+    gate preserves as a fact. `now` is injectable so the when-phrase is deterministic under test."""
     from .calendar_schedule import ScheduleState, human_when
-    when = human_when(event)
+    when = human_when(event, now=now)
     title = (event.title or "that").lower()
     if result.state is ScheduleState.verified:
         base = f"done, {title} is on ur calendar for {when} ✅"

@@ -16,6 +16,7 @@ import os
 from fastapi import FastAPI
 
 from . import worker
+from .background_runner import BackgroundRunner
 from .intake_jobs import PostgresJobStore
 
 app = FastAPI(title="Bruce Worker", version="0.1.0")
@@ -43,4 +44,12 @@ async def process() -> dict[str, int]:
         if not handled:
             break
         processed += 1
-    return {"processed": processed}
+
+    # G0.5: also drain any due background missions on the same wake. Same lease/crash-recovery model; safe
+    # no-op until missions are enqueued. Isolated so an intake result is never lost to a background error.
+    missions = 0
+    try:
+        missions = await BackgroundRunner(worker_id=worker_id, lease_seconds=60).drain(max_runs=_MAX_DRAIN)
+    except Exception:
+        pass
+    return {"processed": processed, "missions": missions}
