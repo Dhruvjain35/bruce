@@ -36,11 +36,16 @@ MODEL_EXTRACTION = "gpt-5.4-mini"    # structured task/date extraction
 MODEL_DRAFTING = "gpt-5.4-mini"      # grounded drafting
 MODEL_VERIFICATION = "gpt-5.4-mini"  # safety-critical entailment gate
 MODEL_CONVERSATION = "gpt-5.4-mini"  # vision-capable conversation brain (multimodal + structured out)
+MODEL_ROUTING = "gpt-5.4-mini"       # compact Stage-1 router: text-only, tiny structured out, hard timeout
 
 # Conversation-brain latency/cost bounds (env-overridable) — protect the "replies in a few seconds"
 # promise. Timeout + one retry cap the tail; a timeout still yields exactly one honest fallback reply.
 CONVERSATION_TIMEOUT_S = float(os.environ.get("BRUCE_CONVERSATION_TIMEOUT_S", "22"))
 CONVERSATION_MAX_RETRIES = int(os.environ.get("BRUCE_CONVERSATION_MAX_RETRIES", "1"))
+
+# Stage-1 router bounds — a HARD, short deadline (routing must be cheap): on breach the router falls back
+# to the deterministic default, never blocking a turn. No retry (a slow route defeats the point).
+ROUTING_TIMEOUT_S = float(os.environ.get("BRUCE_ROUTING_TIMEOUT_S", "2.0"))
 
 # --- OFFLINE ONLY (Featherless open-weight Qwen) — flag-gated, never on a production path.
 MODEL_FEATHERLESS_EXTRACTION = "Qwen/Qwen3-32B"
@@ -110,6 +115,11 @@ def verification_model() -> OpenAIChatModel:
 def conversation_model() -> OpenAIChatModel:
     """Vision-capable conversation brain — OpenAI gpt-5.4-mini. Declares vision support to callers."""
     return openai_model(MODEL_CONVERSATION)
+
+
+def routing_model() -> OpenAIChatModel:
+    """Compact Stage-1 router model (NOT the strongest planner model) — a fast, text-only structured call."""
+    return openai_model(MODEL_ROUTING)
 
 
 # Role-based accessors — OFFLINE ONLY (Featherless). Each raises unless the flag is set, so a
