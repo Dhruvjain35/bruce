@@ -49,7 +49,9 @@ def grounded_calendar_correction(user_text: str | None = None) -> str:
     wants_mutation = bool(_MUTATE_RE.search(user_text or ""))
     update_live = tool_registry.is_live("calendar.update_event")
     create_live = tool_registry.is_live("calendar.create_event")
-    if wants_mutation and not update_live and create_live:
+    if wants_mutation and update_live:
+        return "yeah i can move or delete events on ur calendar too. which one do u mean?"
+    if wants_mutation and create_live:      # update not wired yet
         return ("i can add stuff to ur calendar rn, but updating or deleting existing events isn't live "
                 "yet, that's next. want me to add something?")
     if create_live:

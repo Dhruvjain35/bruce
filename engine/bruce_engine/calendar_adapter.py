@@ -470,7 +470,11 @@ class FakeCalendarAdapter:
     ) -> CalendarEventRef:
         if event_id not in self.events:
             raise CalendarNotFound(event_id)
-        self.events[event_id] = _to_google_body(event, event_id, mission_id=mission_id)
+        body = _to_google_body(event, event_id, mission_id=mission_id)
+        if self.account:                              # provider re-stamps the account on update, like Google
+            body["organizer"] = {"email": self.account}
+            body["creator"] = {"email": self.account}
+        self.events[event_id] = body
         return CalendarEventRef(event_id=event_id, provider=self.provider)
 
     async def delete(self, event_id: str) -> bool:

@@ -100,9 +100,11 @@ def _resolve_date(text: str, now: _dt.datetime) -> tuple[_dt.date, _dt.date | No
     """A single date or an (start, inclusive-end) span, from relative words / weekday / month-day / ISO."""
     t = text.lower()
     today = now.date()
-    if re.search(r"\b(today|tonight)\b", t):
+    # a NEGATED relative day ("not today", "not tomorrow") must not resolve to that day — a correction
+    # like "not today, i said 4 days from now" should fall through to the offset below.
+    if re.search(r"\b(today|tonight)\b", t) and not re.search(r"\bnot\s+(?:today|tonight)\b", t):
         return today, None
-    if re.search(r"\b(tomorrow|tmrw|tmr)\b", t):
+    if re.search(r"\b(tomorrow|tmrw|tmr)\b", t) and not re.search(r"\bnot\s+(?:tomorrow|tmrw|tmr)\b", t):
         return today + _dt.timedelta(days=1), None
     if re.search(r"\b(day after tomorrow)\b", t):
         return today + _dt.timedelta(days=2), None

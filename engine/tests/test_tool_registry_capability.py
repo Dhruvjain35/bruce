@@ -7,20 +7,20 @@ from bruce_engine import capability_truth as ct
 from bruce_engine import tool_registry as tr
 
 
-def test_registry_declares_create_live_update_not():
+def test_registry_declares_crud_live():
     assert tr.is_live("calendar.create_event") is True
-    assert tr.is_live("calendar.update_event") is False
-    assert tr.is_live("calendar.delete_event") is False
-    assert tr.live_operations("calendar") == ["create_event"]
+    assert tr.is_live("calendar.update_event") is True
+    assert tr.is_live("calendar.delete_event") is True
+    assert tr.is_live("calendar.search_events") is False
+    assert set(tr.live_operations("calendar")) == {"create_event", "update_event", "delete_event"}
     assert tr.get("calendar.create_event").write is True
 
 
-def test_update_request_gets_honest_not_a_flat_denial():
+def test_update_request_affirms_now_that_update_is_live():
     reply = ct.grounded_calendar_correction("can u update my calendar")
-    assert "add" in reply.lower()                 # affirms what IS live
-    assert "isn't live yet" in reply.lower() or "not live" in reply.lower()   # honest about update
-    assert "can't" not in reply.lower()           # not a flat "i can't touch your calendar"
-    assert "done" not in reply.lower()            # never fabricates completion
+    assert ("move" in reply.lower() or "update" in reply.lower())   # affirms update (now live)
+    assert "can't" not in reply.lower() and "isn't live" not in reply.lower()
+    assert "done" not in reply.lower()
 
 
 def test_create_request_affirms_capability():
@@ -38,5 +38,5 @@ def test_denial_detection_covers_mutation_verbs():
 def test_flipping_registry_flag_would_stop_the_not_live_line():
     # documents the design: making update live is a ONE-flag change here, not a handler edit
     import dataclasses
-    live_update = dataclasses.replace(tr.get("calendar.update_event"), live=True)
-    assert live_update.live is True
+    off = dataclasses.replace(tr.get("calendar.update_event"), live=False)
+    assert off.live is False

@@ -682,3 +682,69 @@ def test_user_timezone_statement_is_captured_and_confirmed(clean_db):
     assert _run(world_state.get_timezone(uid)) == "America/Chicago"
     reply = _run(_outbound(uid))[-1].text.lower()
     assert "central" in reply and "america/chicago" in reply
+
+
+# ============================ R11: full calendar-agent scenario (create/move/repair/delete) ============
+
+def _sched_decision(title, when_ent, msg):
+    return _decision(IntentKind.actionable, ResponseType.extraction_result, text=msg, caps=["calendar"],
+                     entities=[ExtractedEntity(type="event_title", value=title),
+                               ExtractedEntity(type="time", value=when_ent)])
+
+
+def test_full_calendar_agent_boundary_scenario(clean_db, monkeypatch):
+    """The universal acceptance as an automated test: create -> tz -> move -> move -> create -> repair ->
+    delete. One shared fake Google (create+update+delete hit the same state). Proves entity resolution,
+    verified mutations, repair-not-duplicate, and correct final world state — no Startup School fixture."""
+    from bruce_engine import calendar_adapter, entity_store, world_state
+    FAKE = calendar_adapter.FakeCalendarAdapter(account="me@example.com")
+    monkeypatch.setattr(calendar_adapter, "GoogleCalendarAdapter", lambda *a, **kw: FAKE)
+    uid = uuid4(); _run(_ensure_user(uid)); _seed_connected_calendar(uid)
+
+    def send(pmid, text, decision):
+        return _run(conversation_runtime.handle(FakeChannel(), _msg(pmid, text=text),
+                                                user_id=uid, reply_target=PHONE, reasoner=FakeReasoner(decision)))
+
+    casual = lambda t: _decision(IntentKind.casual, ResponseType.direct_answer, text=t)
+
+    # 1. create chess class tomorrow at 8pm
+    send("s1", "add chess class tmr at 8pm", _sched_decision("chess class", "tomorrow at 8pm", "add chess class tmr at 8pm"))
+    ents = _run(entity_store.active_events(uid))
+    assert len(ents) == 1 and ents[0]["normalized_title"] == "chess class"
+    chess_start_1 = ents[0]["start"]; assert "T20:00" in chess_start_1        # 8pm
+
+    # 2. store timezone
+    send("s2", "i'm in central time", casual("ok"))
+    assert _run(world_state.get_timezone(uid)) == "America/Chicago"
+
+    # 3. move chess class to 9pm  (keeps the date, changes the time)
+    r3 = send("s3", "move chess class to 9pm", casual("ok"))
+    assert r3.status == "processed"
+    ents = _run(entity_store.active_events(uid))
+    assert len(ents) == 1 and "T21:00" in ents[0]["start"] and ents[0]["start"][:10] == chess_start_1[:10]
+    assert len(FAKE.events) == 1                                              # updated in place, no dup
+
+    # 4. move chess class to midnight
+    send("s4", "move chess class to midnight", casual("ok"))
+    ents = _run(entity_store.active_events(uid))
+    assert "T00:00" in ents[0]["start"] and len(FAKE.events) == 1
+
+    # 5. create basketball tournament 4 days from now at 2pm
+    send("s5", "basketball tournament 4 days from now at 2pm, add it",
+         _sched_decision("basketball tournament", "4 days from now at 2pm", "basketball tournament 4 days from now at 2pm, add it"))
+    ents = _run(entity_store.active_events(uid))
+    assert len(ents) == 2 and len(FAKE.events) == 2
+    bball = next(e for e in ents if "basketball" in e["normalized_title"])
+
+    # 6. repair: "not today, i said 4 days from now" -> updates basketball, no duplicate
+    r6 = send("s6", "not today, i said 4 days from now", casual("ok"))
+    assert "fixed" in _run(_outbound(uid))[-1].text.lower()
+    ents = _run(entity_store.active_events(uid))
+    assert len(ents) == 2 and len(FAKE.events) == 2                           # repaired in place, NO new event
+
+    # 7. delete chess class -> verified gone
+    r7 = send("s7", "delete chess class", casual("ok"))
+    assert "deleted" in _run(_outbound(uid))[-1].text.lower()
+    active = _run(entity_store.active_events(uid))
+    assert len(active) == 1 and "basketball" in active[0]["normalized_title"]  # only basketball remains
+    assert len(FAKE.events) == 1                                              # chess really removed from provider

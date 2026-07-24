@@ -34,9 +34,9 @@ class ToolSpec:
 _TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("calendar.create_event", "google_calendar", "create_event", write=True, live=True,
              requires_scope="https://www.googleapis.com/auth/calendar.events"),
-    ToolSpec("calendar.update_event", "google_calendar", "update_event", write=True, live=False,
+    ToolSpec("calendar.update_event", "google_calendar", "update_event", write=True, live=True,
              requires_scope="https://www.googleapis.com/auth/calendar.events"),
-    ToolSpec("calendar.delete_event", "google_calendar", "delete_event", write=True, live=False,
+    ToolSpec("calendar.delete_event", "google_calendar", "delete_event", write=True, live=True,
              requires_scope="https://www.googleapis.com/auth/calendar.events"),
     ToolSpec("calendar.search_events", "google_calendar", "search_events", write=False, live=False,
              requires_scope="https://www.googleapis.com/auth/calendar.events"),

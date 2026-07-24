@@ -296,6 +296,39 @@ class CalendarScheduleHandler:
                              mission_id=creation.mission_id)
 
 
+class CalendarMutationHandler:
+    """Move / reschedule / delete an existing event, and REPAIR a wrong one ("not today, i said 4 days
+    from now") — R6 conversation surface + R9. Priority 72 (above create) so "move chess class to 9pm"
+    updates the existing entity instead of creating a duplicate. Claims on a deterministic mutation/
+    correction verb + a connected calendar; execute resolves the canonical entity (fail-closed on
+    ambiguity), performs the verified provider mutation, and replies from the verified result."""
+    name = "calendar_mutation"
+    priority = 72
+
+    async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
+        from . import calendar_mutation, oauth_google
+        kind = calendar_mutation.classify(octx.msg.text)
+        if kind is None:
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="not_a_mutation")
+        try:
+            integ = await oauth_google.get_integration(octx.user_id)
+        except Exception:
+            integ = None
+        if not (integ is not None and integ.status == "connected" and integ.revoked_at is None):
+            return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
+                                  reason="calendar_not_connected")
+        return HandlerVerdict(disposition=Disposition.claim, priority=self.priority,
+                              reason=f"calendar_{kind}")
+
+    async def execute(self, octx: OutcomeContext) -> HandlerOutput:
+        from . import calendar_mutation
+        kind = calendar_mutation.classify(octx.msg.text)
+        reply = await calendar_mutation.handle(octx.user_id, kind, octx.msg.text or "")
+        log.info("calendar_mutation kind=%s user=%s", kind, octx.user_id)
+        return HandlerOutput(text=reply, styled=False)
+
+
 class WorldStateHandler:
     """Capture a user-stated world fact into UserWorldState (R3). Today: the timezone — "yo i'm in cst" ->
     America/Chicago (stored canonically, never "CST"), so every later temporal op uses the student's real
@@ -526,8 +559,8 @@ class DefaultReplyHandler:
 def default_handlers() -> list[OutcomeHandler]:
     """Claim-candidate handlers, evaluated every turn (pure). Ordering is by explicit priority, not list
     position. A workstream inserts its handler here with a stable priority."""
-    return [CalendarApprovalHandler(), WorldStateHandler(), CalendarScheduleHandler(), StatusQueryHandler(),
-            MissionHandoffHandler(), EventCandidateHandler()]
+    return [CalendarApprovalHandler(), WorldStateHandler(), CalendarMutationHandler(), CalendarScheduleHandler(),
+            StatusQueryHandler(), MissionHandoffHandler(), EventCandidateHandler()]
 
 
 def default_fallback() -> OutcomeHandler:
