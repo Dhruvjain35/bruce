@@ -17,10 +17,11 @@ from . import calendar_tools, entity_resolution, temporal, world_state
 from .calendar_schedule import DEFAULT_TZ
 from .runtime_contracts import ToolOutcome
 
-_DELETE_RE = re.compile(r"\b(delete|remove|cancel|get\s+rid\s+of|take\s+off)\b", re.IGNORECASE)
+_DELETE_RE = re.compile(r"\b(delete|remove|cancel|get\s+rid\s+of)\b|\btake\b[^.?!\n]{0,40}\boff\b(?:\s+my)?\s*(?:cal|calendar|schedule)?",
+                        re.IGNORECASE)
 # Unambiguous mutate verbs only. "make it"/"set it"/"clear" are excluded — they co-occur with CREATE
-# ("add chess class and make it 5pm") and would hijack it.
-_UPDATE_RE = re.compile(r"\b(move|reschedul\w*|change|update|push\s+back|push\s+it|shift|switch|bump)\b",
+# ("add chess class and make it 5pm") and would hijack it. "push X back" is an update (referent-gated).
+_UPDATE_RE = re.compile(r"\b(move|reschedul\w*|change|update|push|pull\s+(?:up|forward)|shift|switch|bump)\b",
                         re.IGNORECASE)
 # corrections: "not today", "i meant", "i said", "actually ... not", "no i said", "that's wrong"
 _CORRECTION_RE = re.compile(

@@ -1,0 +1,2018 @@
+[
+{
+"text": "add dentist appt tmr at 4",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "put robotics club on my cal fridays 3-5",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "schedule sat prep this sat morning 9am",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "yo can u add band practice thurs at 6",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "save the date march 3rd chem quiz 2nd period",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "block off 6-8 tonight for the group project mtg",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add orthodontist appointment on the 15th at 1130",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "pencil in movie night w the girls fri 8pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "throw driving lesson on my calendar next tues 4pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "new event pls: physics lab sunday 2-4",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "can u put soccer game sat 10am-12 on my cal",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add work shift sat 5-9pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "schedule college info session aug 20 at 6",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add study group tmr 3 to 5 in the library",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "put haircut on my cal for the 22nd at 2",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "save the date!! prom is may 16",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add volunteer shift at the shelter sun morning 9-11",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add chem test friday 1st period to my cal",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "put gym w jake tmr 6am on the calendar",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "can u add my therapy appt wed 5pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "schedule oil change thurs aftrnoon like 2ish",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add choir concert dec 12 7pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "throw the coding club mtg on my cal mondays 4-5",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add tutoring w ms lee tmr after school 330",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "schedule financial aid workshop next thurs 6pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "block off 2-4 this afternoon for studying",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add facetime w grandma sat 3pm to my cal",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "put the art club field trip on my cal for the 28th",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add ts to my cal \u2014 mathletes tmr 4pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "gng to sammys bday party sat 7pm, add it pls",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "add bio quiz reminder for tmr 1st period",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "yo add the physics review session mon 3-430",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "schedule doctors appt friday 10am",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "put debate tournament on my cal next sat 8am-4",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "none"
+},
+{
+"text": "move my dentist appt to 3pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "can u push robotics club to thursday instead",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "reschedule sat prep to friday plz",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "change band practice to 5:30 not 4",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "bump the quiz reminder to tmr morning",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "move that thing to next week",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "push my orthodontist back an hr",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "chem lab got moved to 2pm can u fix it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "shift the study group to 7 instead of 6",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "reschedule my haircut to saturday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "move the physics test reminder to wed",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "push my work shift to 5",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "change movie night to 8pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "can u bump the tutoring sesh to later, like 4:30",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "move my thursday thing to friday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "push the college essay sesh back to like 9",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "reschedule volunteer shift to next sat",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "change soccer practice from 6 to 7",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "move guitar lesson up to 3pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "can u shift the dentist to the 24th",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "push tmrws mtg to the afternoon",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "make the SAT thing an hr later",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "move my 2pm to 4",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "reschedule the group project mtg to monday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "change my doctor appt to 10:15am",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "can u move gym to the morning instead",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "push the chem quiz to fri pls",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "bump my church thing to the later service",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "move that robotics mtg to 4 not 3",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "change the essay deadline reminder to sun night",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "can u slide my driving lesson to sunday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "move the fri thing up a day",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "update",
+"state": "entity_exists"
+},
+{
+"text": "cancel my dentist appt tmr",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "delete the robotics club mtg wed",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "remove sat prep from my cal pls",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "yo cancel band practice thurs",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "delete that chem quiz reminder",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "take movie night off my calendar",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "cancel study grp @ 5 tn",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "get rid of the ortho appt fri",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "cancel my shift sat pls",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "delete tutoring tmr",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "nvm cancel that gym sesh i added",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "cancel my haircut monday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "scratch debate practice fri",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "delete the piano lesson this wk",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "cancel the essay workshop sun",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "rmv volunteering sunday am",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "cancel my 4pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "delete the driving lesson tmr am",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "cancel choir tmr",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "can u delete the art club mtg tues",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "entity_exists"
+},
+{
+"text": "ya cancel it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "pending_decision"
+},
+{
+"text": "yeah delete that one",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "pending_decision"
+},
+{
+"text": "do it, get rid of it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "delete_event",
+"state": "pending_decision"
+},
+{
+"text": "cancel that plan with mike",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "should i cancel my saturday plans?",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "ugh i wanna cancel on sarah tn but i feel bad",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "can u cancel my email to ms rivera",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "cancel my netflix lol",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "remove me from the bio gc",
+"expected_class": "fast_conversation",
+"expected_domain": "messaging",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "how do i delete an event off my calendar",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "explain",
+"state": "none"
+},
+{
+"text": "delete this convo after u read it \ud83d\udc80",
+"expected_class": "fast_conversation",
+"expected_domain": "messaging",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "cancel the whole week im so done",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "nvm dont add it",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "chat",
+"state": "pending_decision"
+},
+{
+"text": "no not today i said friday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "i meant 4 days from now not tmr",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no thats wrong make it 3pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "ugh not 2pm the dentist is at 230",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "wait i said robotics is thurs not wed",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "u put it at 5 but its actually 6",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "nah its saturday not sunday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no the sat prep is next week not this week",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "i didnt say monday i said tuesday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "actually change band practice to 4 not 430",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "thats the wrong day quiz is on the 22nd",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no move it back an hr i meant noon",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "not am its pm lol",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "wait no the movie night is at 8 not 7",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "u got the time wrong its 915 not 9",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no i said the 15th not the 5th",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "its not at the library its at my house",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no that shd be next friday not this one",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "oops i meant 3 days from now",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no debate is at 330 change it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "ur wrong its tues not thurs for tutoring",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "make the driving lesson 5pm i said the wrong time",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no not 12 i meant 1230 for lunch w mr k",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no the game starts at 6 not 5 fix it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "i said the 30th not the 13th",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "wait thats wrong soccer is monday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no make it 45 min not an hr",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "not 9am dude its 9pm",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "hold on i meant next tuesday not this tuesday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no the orthodontist is at 4 not 2 change it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "thats not right chem lab is wednesday",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "no i meant the study group not choir",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "repair",
+"state": "entity_exists"
+},
+{
+"text": "ya",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "yup add it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "do it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "yea go ahead and add the robotics meeting",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "add it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "sure put the sat prep on my cal",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "yep lock it in",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "ya do the band practice one",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "go for it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "yeah add the quiz reminder",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "mhm sounds good",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "ye pls",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "okok add it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "bet lock in the movie night thing",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "create",
+"state": "pending_decision"
+},
+{
+"text": "nah",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "cancel",
+"state": "pending_decision"
+},
+{
+"text": "no dont add that",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "cancel",
+"state": "pending_decision"
+},
+{
+"text": "wait no dont",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "cancel",
+"state": "pending_decision"
+},
+{
+"text": "nvm skip the dentist one",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "cancel",
+"state": "pending_decision"
+},
+{
+"text": "actually no leave it",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "cancel",
+"state": "pending_decision"
+},
+{
+"text": "nah im good",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "cancel",
+"state": "pending_decision"
+},
+{
+"text": "dont bother",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "cancel",
+"state": "pending_decision"
+},
+{
+"text": "no dont add it its wrong",
+"expected_class": "direct_action",
+"expected_domain": "calendar",
+"expected_action": "cancel",
+"state": "pending_decision"
+},
+{
+"text": "go ahead",
+"expected_class": "fast_conversation",
+"expected_domain": "conversation",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "yup",
+"expected_class": "fast_conversation",
+"expected_domain": "conversation",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "ya fr that quiz was brutal",
+"expected_class": "fast_conversation",
+"expected_domain": "conversation",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "wait what lol",
+"expected_class": "fast_conversation",
+"expected_domain": "conversation",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "nah im just chillin rn",
+"expected_class": "fast_conversation",
+"expected_domain": "conversation",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "sure why not",
+"expected_class": "fast_conversation",
+"expected_domain": "conversation",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "yeah lowkey same",
+"expected_class": "fast_conversation",
+"expected_domain": "conversation",
+"expected_action": "chat",
+"state": "none"
+},
+{
+"text": "ok just take it from here, i dont wanna deal w the counselor abt my schedule swap anymore",
+"expected_class": "background_mission",
+"expected_domain": "school",
+"expected_action": "own_schedule_change_thread",
+"state": "none"
+},
+{
+"text": "handle ts for me pls, keep emailing ms rivera til she actually sends the rec letter",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "pursue_rec_letter_until_received",
+"state": "none"
+},
+{
+"text": "keep following up w the robotics coach until he confirms the comp carpool",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "follow_up_carpool_confirmation",
+"state": "none"
+},
+{
+"text": "only bother me when u actually need my call on that summer program refund",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "pursue_program_refund",
+"state": "none"
+},
+{
+"text": "stay on top of the bio group proj, chase everyone til we lock a mtg time",
+"expected_class": "background_mission",
+"expected_domain": "school",
+"expected_action": "coordinate_group_meeting_time",
+"state": "none"
+},
+{
+"text": "u got this, run point on getting my quiz grade fixed w mr lang",
+"expected_class": "background_mission",
+"expected_domain": "school",
+"expected_action": "dispute_quiz_grade",
+"state": "none"
+},
+{
+"text": "take this over, dont ping me unless smthg is on fire",
+"expected_class": "background_mission",
+"expected_domain": "world",
+"expected_action": "generic_handoff_escalate_only",
+"state": "none"
+},
+{
+"text": "keep chasing the dentist office til they give me a new appt slot",
+"expected_class": "background_mission",
+"expected_domain": "world",
+"expected_action": "pursue_appt_reschedule",
+"state": "none"
+},
+{
+"text": "handle the whole band concert rsvp mess, just tell me the final date",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "coordinate_concert_rsvp",
+"state": "none"
+},
+{
+"text": "ya just take it from here",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "accept_handoff_continue_followup",
+"state": "pending_decision"
+},
+{
+"text": "just stay on it and lmk when theres an actual decision for me to make",
+"expected_class": "background_mission",
+"expected_domain": "world",
+"expected_action": "monitor_until_decision_point",
+"state": "none"
+},
+{
+"text": "run w it, keep nudging my tutor til she picks a SAT prep time",
+"expected_class": "background_mission",
+"expected_domain": "calendar",
+"expected_action": "secure_tutoring_slot",
+"state": "none"
+},
+{
+"text": "take over the internship app follow ups, only tap me if they wanna interview",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "follow_up_internship_application",
+"state": "none"
+},
+{
+"text": "keep on top of the fundraiser stuff w the club advisor, dont let it die",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "drive_fundraiser_coordination",
+"state": "none"
+},
+{
+"text": "just deal w the whole missing hw grade thing on canvas from here on",
+"expected_class": "background_mission",
+"expected_domain": "school",
+"expected_action": "resolve_missing_grade",
+"state": "none"
+},
+{
+"text": "keep pinging coach abt tryout times til he gives us a straight answer",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "follow_up_tryout_schedule",
+"state": "none"
+},
+{
+"text": "i'm out, u own the science fair signup back n forth now",
+"expected_class": "background_mission",
+"expected_domain": "school",
+"expected_action": "own_science_fair_signup",
+"state": "none"
+},
+{
+"text": "stay on the housing form for the summer camp til its fully submitted",
+"expected_class": "background_mission",
+"expected_domain": "world",
+"expected_action": "complete_camp_form",
+"state": "none"
+},
+{
+"text": "handle it, keep bugging the front office til they email my transcript",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "pursue_transcript_request",
+"state": "none"
+},
+{
+"text": "take the reins on the debate tourney reg, wake me if theres a fee to pay",
+"expected_class": "background_mission",
+"expected_domain": "world",
+"expected_action": "handle_tournament_registration",
+"state": "none"
+},
+{
+"text": "keep following up until my prof replies abt the lab volunteer spot",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "follow_up_research_opportunity",
+"state": "none"
+},
+{
+"text": "just run the whole yearbook photo thing, only loop me in for approvals",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "coordinate_yearbook_photo",
+"state": "none"
+},
+{
+"text": "stay on top of the driver ed scheduling til i get a class that fits",
+"expected_class": "background_mission",
+"expected_domain": "calendar",
+"expected_action": "secure_drivers_ed_slot",
+"state": "none"
+},
+{
+"text": "yh take ts n dont bug me til somethin needs my ok",
+"expected_class": "background_mission",
+"expected_domain": "world",
+"expected_action": "accept_handoff_escalate_only",
+"state": "pending_decision"
+},
+{
+"text": "keep chasing the mathletes advisor til we get a room booked for practice",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "book_practice_room",
+"state": "none"
+},
+{
+"text": "own the movie night planning w the friend gc, just tell me where n when",
+"expected_class": "background_mission",
+"expected_domain": "world",
+"expected_action": "coordinate_movie_night",
+"state": "none"
+},
+{
+"text": "handle the refund back n forth w the sat proctor site til its resolved",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "resolve_sat_refund",
+"state": "none"
+},
+{
+"text": "just take over the volunteer hrs verification, ping me if they need my id",
+"expected_class": "background_mission",
+"expected_domain": "email",
+"expected_action": "verify_volunteer_hours",
+"state": "none"
+},
+{
+"text": "keep at it w the college tour booking til a saturday slot opens up",
+"expected_class": "background_mission",
+"expected_domain": "calendar",
+"expected_action": "book_college_tour",
+"state": "none"
+},
+{
+"text": "u run point on the whole scholarship essay deadline mess from here",
+"expected_class": "background_mission",
+"expected_domain": "school",
+"expected_action": "manage_scholarship_deadlines",
+"state": "none"
+},
+{
+"text": "stay on the orthodontist til they move my appt off the quiz day",
+"expected_class": "background_mission",
+"expected_domain": "world",
+"expected_action": "pursue_appt_reschedule",
+"state": "none"
+},
+{
+"text": "take it from here w the field trip permission slip, only bug me to sign",
+"expected_class": "background_mission",
+"expected_domain": "school",
+"expected_action": "handle_permission_slip",
+"state": "none"
+},
+{
+"text": "yo wsp",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "reply casually to the greeting, keep it short",
+"state": "none"
+},
+{
+"text": "yooo u up",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "respond casually, confirm youre around",
+"state": "none"
+},
+{
+"text": "hru today",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "answer casually and ask back",
+"state": "none"
+},
+{
+"text": "whats 8x7",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "answer 56",
+"state": "none"
+},
+{
+"text": "whats 15% of 80",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "answer 12",
+"state": "none"
+},
+{
+"text": "whats 12 squared again",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "answer 144",
+"state": "none"
+},
+{
+"text": "explain photosynthesis pls",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "give a short clear explanation of photosynthesis",
+"state": "none"
+},
+{
+"text": "wait what do mitochondria even do",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "explain mitochondria simply",
+"state": "none"
+},
+{
+"text": "whats the diff between mitosis n meiosis",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "explain the difference briefly",
+"state": "none"
+},
+{
+"text": "how do i solve for x in 2x+3=11",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "walk through solving, x=4",
+"state": "none"
+},
+{
+"text": "can u explain the quadratic formula again lol",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "explain the quadratic formula",
+"state": "none"
+},
+{
+"text": "explain how to balance chem equations",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "explain balancing chemical equations with a quick example",
+"state": "none"
+},
+{
+"text": "whats a good time to study for the chem quiz",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "give study-timing advice conversationally",
+"state": "none"
+},
+{
+"text": "u think i have time to study b4 band practice",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "reason about timing conversationally, dont create an event",
+"state": "none"
+},
+{
+"text": "what should i wear to the band concert tmr",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "give outfit advice",
+"state": "none"
+},
+{
+"text": "what should i eat b4 the sat",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "give food advice for test day",
+"state": "none"
+},
+{
+"text": "u think i should join robotics club or debate",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "give advice weighing both options",
+"state": "none"
+},
+{
+"text": "should i take ap bio or ap chem next yr",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "give advice on the class choice",
+"state": "none"
+},
+{
+"text": "did that go through",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "answer the status question conversationally",
+"state": "none"
+},
+{
+"text": "did my email to the teacher send",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "answer conversationally; email is not live so just chat about it",
+"state": "none"
+},
+{
+"text": "what are u doing with that",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "explain what youre doing, conversationally",
+"state": "none"
+},
+{
+"text": "hows the essay lookin",
+"expected_class": "fast_conversation",
+"expected_domain": "files",
+"expected_action": "answer conversationally; files not live so just chat",
+"state": "none"
+},
+{
+"text": "ts quiz tmr gonna end me fr",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "reply empathetically, maybe offer to help study",
+"state": "none"
+},
+{
+"text": "bruh this history essay so hard",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "reply supportively, offer help",
+"state": "none"
+},
+{
+"text": "im so tired rn ugh",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "respond casually/empathetically",
+"state": "none"
+},
+{
+"text": "hows ur day lol",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "reply casually",
+"state": "none"
+},
+{
+"text": "whats the capital of australia",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "answer Canberra",
+"state": "none"
+},
+{
+"text": "is it gonna rain tmr",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "answer conversationally about the weather",
+"state": "none"
+},
+{
+"text": "what does ts even mean",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "explain the slang casually",
+"state": "none"
+},
+{
+"text": "yo what time is it",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "tell the time",
+"state": "none"
+},
+{
+"text": "u there?",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "confirm youre here",
+"state": "none"
+},
+{
+"text": "did that go thru to the dentist office or nah",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "answer the status question conversationally",
+"state": "none"
+},
+{
+"text": "whats a good time to study for my chem quiz",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "should i add a break in there",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "move on to the next problem",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "tutor_reply",
+"state": "none"
+},
+{
+"text": "can u help me plan my week",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "make it make sense",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "tutor_reply",
+"state": "none"
+},
+{
+"text": "when should i start studying for the sat",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "is 7pm too late to do hw",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "how do i even fit robotics club into my schedule",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "what should my study schedule look like",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "do u think i have time for band practice and the quiz tmr",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "help me figure out my week",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "should i schedule the dentist for morning or afternoon",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "whats the best way to organize my assignments",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "can we go over that again",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "tutor_reply",
+"state": "none"
+},
+{
+"text": "explain it differently",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "tutor_reply",
+"state": "none"
+},
+{
+"text": "idk how to balance track and studying",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "remind me why i even signed up for debate lol",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "chat_reply",
+"state": "none"
+},
+{
+"text": "what time should i wake up to finish the lab report",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "should i take a break or keep grinding",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "walk me through how to plan for finals",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "is it even worth blocking off time for sat prep",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "how long should i spend on each subject",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "gimme a study plan for tmr",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "what should i prioritize today",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "can u make my schedule less packed",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "help me not bomb chem",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "should movie night be fri or sat",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "figure out when im free this week",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "availability_chat",
+"state": "none"
+},
+{
+"text": "does my week look too busy",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "advise",
+"state": "none"
+},
+{
+"text": "add some structure to my mornings",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "set me up for a good week lol",
+"expected_class": "fast_conversation",
+"expected_domain": "world",
+"expected_action": "chat_reply",
+"state": "none"
+},
+{
+"text": "talk me through my options for the orchestra concert",
+"expected_class": "fast_conversation",
+"expected_domain": "calendar",
+"expected_action": "planning_chat",
+"state": "none"
+},
+{
+"text": "can u email ms rivera n ask if i can turn in the lab report late",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "Explain Bruce can't send email yet; offer to help draft the message so the user can send it",
+"state": "none"
+},
+{
+"text": "email my bio teacher pls i need the extra credit sheet",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "Say Bruce can't email yet; offer to draft a request for the extra credit sheet",
+"state": "none"
+},
+{
+"text": "send a email to coach saying i cant make practice thursday",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "Explain email isn't live; offer to write out the note for the user to copy",
+"state": "none"
+},
+{
+"text": "yo can bruce just reply to that email from my counselor for me",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "Say it can't send/reply to email yet; offer to help word a reply",
+"state": "none"
+},
+{
+"text": "cc my mom on the email to the principal too",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "Explain no email access yet; chat about what to include",
+"state": "none"
+},
+{
+"text": "whats due for apush this week",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Explain Bruce can't see assignments/Canvas yet; chat generally or ask user to share",
+"state": "none"
+},
+{
+"text": "did i already submit the chem lab or nah",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Say it can't check submissions yet; can't verify, offer to help track it",
+"state": "none"
+},
+{
+"text": "when's the essay for english actually due i forgot",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Explain it can't pull due dates yet; ask user or chat about it",
+"state": "none"
+},
+{
+"text": "did i turn in the calc pset??",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Say submission status isn't available yet; offer to help the user keep track",
+"state": "none"
+},
+{
+"text": "whats my grade in physics rn",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Explain it can't see grades yet; chat only",
+"state": "none"
+},
+{
+"text": "anything im missing in my classes this week",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Say it can't see coursework yet; can't answer, offer future help",
+"state": "none"
+},
+{
+"text": "did the spanish quiz get pushed or is it still fri",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Explain no access to class schedule/announcements yet; chat",
+"state": "none"
+},
+{
+"text": "how many points is the robotics writeup worth lol",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Say it can't see assignment details yet; chat generally",
+"state": "none"
+},
+{
+"text": "save this to my drive real quick",
+"expected_class": "fast_conversation",
+"expected_domain": "files",
+"expected_action": "Explain Bruce can't save to Drive yet; chat only",
+"state": "none"
+},
+{
+"text": "put this pic in my sat prep folder",
+"expected_class": "fast_conversation",
+"expected_domain": "files",
+"expected_action": "Say file storage isn't live yet; can't move files",
+"state": "none"
+},
+{
+"text": "can u back up my notes somewhere",
+"expected_class": "fast_conversation",
+"expected_domain": "files",
+"expected_action": "Explain it can't store/back up files yet; chat",
+"state": "none"
+},
+{
+"text": "upload the band practice schedule to google docs pls",
+"expected_class": "fast_conversation",
+"expected_domain": "files",
+"expected_action": "Say Drive/Docs isn't live yet; offer to help another way",
+"state": "none"
+},
+{
+"text": "make a folder for my college app stuff",
+"expected_class": "fast_conversation",
+"expected_domain": "files",
+"expected_action": "Explain it can't create folders yet; chat about organizing",
+"state": "none"
+},
+{
+"text": "find me some sources on the cold war for my history paper",
+"expected_class": "fast_conversation",
+"expected_domain": "research",
+"expected_action": "Explain autonomous research isn't live yet; can chat/point at general ideas",
+"state": "none"
+},
+{
+"text": "look up colleges w good marine bio programs",
+"expected_class": "fast_conversation",
+"expected_domain": "research",
+"expected_action": "Say deep research isn't live yet; chat at a high level",
+"state": "none"
+},
+{
+"text": "can u research scholarships for first gen students",
+"expected_class": "fast_conversation",
+"expected_domain": "research",
+"expected_action": "Explain research runs aren't live; offer general chat only",
+"state": "none"
+},
+{
+"text": "dig up stats on teen sleep for my psych presentation",
+"expected_class": "fast_conversation",
+"expected_domain": "research",
+"expected_action": "Say it can't run research yet; chat generally",
+"state": "none"
+},
+{
+"text": "find quotes i can use for the gatsby essay",
+"expected_class": "fast_conversation",
+"expected_domain": "research",
+"expected_action": "Explain research/lookup isn't live yet; can only chat",
+"state": "none"
+},
+{
+"text": "email the whole group project team the slides",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "Say it can't send email or attachments yet; offer to draft the message",
+"state": "none"
+},
+{
+"text": "check if my fafsa email went thru",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "Explain it can't read your inbox yet; can't verify",
+"state": "none"
+},
+{
+"text": "whats left on my to do list for school tmr",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Say it can't see assignments/tasks yet; chat only",
+"state": "none"
+},
+{
+"text": "did the teacher post grades for the midterm yet",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Explain no grade access yet; can't check",
+"state": "none"
+},
+{
+"text": "share this study guide to my drive n name it apush unit 4",
+"expected_class": "fast_conversation",
+"expected_domain": "files",
+"expected_action": "Say file saving/naming isn't live yet; chat",
+"state": "none"
+},
+{
+"text": "compare essay topics for my common app n tell me which is best",
+"expected_class": "fast_conversation",
+"expected_domain": "research",
+"expected_action": "Multi-step research not live; treat as chat, discuss the topics informally",
+"state": "none"
+},
+{
+"text": "look up when the sat registration deadline is",
+"expected_class": "fast_conversation",
+"expected_domain": "research",
+"expected_action": "Say it can't look things up yet; chat from general knowledge only",
+"state": "none"
+},
+{
+"text": "did i ever email mr patel back about the recommendation letter",
+"expected_class": "fast_conversation",
+"expected_domain": "email",
+"expected_action": "Explain it can't read your sent mail yet; can't confirm",
+"state": "none"
+},
+{
+"text": "pull up my missing assignments for the quarter",
+"expected_class": "fast_conversation",
+"expected_domain": "school",
+"expected_action": "Say gradebook/assignment access isn't live yet; can't pull them",
+"state": "none"
+}
+]

@@ -92,7 +92,19 @@ _HANDOFF_PATTERNS = (
     rf"\b(?:follow|following)\s+up\s+(?:on\s+)?{_OBJ}\b",
     rf"\bkeep\s+(?:following\s+up|chasing|on\s+(?:top\s+of\s+)?{_OBJ}|at\s+{_OBJ})\b",
     rf"\bstay\s+on\s+(?:top\s+of\s+)?{_OBJ}\b",
-    r"\bonly\s+(?:bother|bug|ping|hit|tell|text)\s+me\s+when\b",
+    r"\bonly\s+(?:bother|bug|ping|hit|tell|text|loop|wake)\s+me\b",
+    # durable handoffs with a NOUN object or a durability marker (til / from here / run point / own it)
+    r"\bstay\s+on\s+(?:top\s+of\s+)?the\b",
+    r"\brun\s+point\s+on\b",
+    r"\brun\s+(?:w(?:ith)?\s+it|the\s+whole)\b",
+    r"\btake\s+the\s+reins\b",
+    r"\bkeep\s+(?:nudging|pinging|chasing|following\s+up|on\s+(?:top|it)|at\s+it)\b",
+    r"\b(?:u|you|ur)\s+own\s+(?:the|this|it)\b|\bown\s+the\s+(?:whole\s+)?\w",
+    r"\bdeal\s+w(?:ith)?\s+the\b",
+    r"\bfrom\s+here\s+on\b|\bfrom\s+here\b(?=.*\b(?:handle|deal|run|own|stay|keep|take)\b)",
+    r"\b(?:take|handle|run|own)\b[^.?!\n]*\b(?:til|until)\b",     # "keep nudging … til she picks"
+    r"\bhandle\s+the\s+(?:whole\s+)?\w",
+    r"\btake\s+ts\b",
 )
 _HANDOFF_RE = re.compile("|".join(_HANDOFF_PATTERNS), re.IGNORECASE)
 # First person doing it themselves — "i'll handle it", "i got this", "how do i handle this equation",
@@ -134,7 +146,8 @@ _SCHED_SUPPRESS = re.compile(
     r"\b(?:how|when|where|what|why|whether)\b[^.?!]*\b(?:do|should|would|can|could|will|shall)\s+i\b|"
     r"\b(?:should|would|could|shall|do|can)\s+i\b[^.?!]*\b(?:schedule|calendar|add|put|block|save)\b|"
     r"\bi\s?(?:'?ll| will| can| am|'?m| a?m| gonna| finna)\s+(?:schedule|add|put|calendar|block|save|do|handle)\b|"
-    r"\bimma\s+(?:schedule|add|put|calendar|block|save)\b",
+    r"\bimma\s+(?:schedule|add|put|calendar|block|save)\b|"
+    r"\b(?:nvm|never\s*mind|forget\s+it|don'?t|do\s+not|nah\s+don'?t)\b",   # negation cancels the intent
     re.IGNORECASE)
 
 

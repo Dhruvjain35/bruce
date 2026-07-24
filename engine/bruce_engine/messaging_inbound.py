@@ -45,6 +45,10 @@ class InboundOutcome:
     status: str            # processed | duplicate | linked | bad_code | rate_limited | unlinked_prompt | blocked
     user_id: UUID | None = None
     mission_id: UUID | None = None
+    # G0.1 observability: the FastRouter's chosen path + wall-clock, so latency harness/telemetry and later
+    # execution lanes can read the decision. Populated only for processed conversation turns; None otherwise.
+    execution_class: str | None = None
+    router_ms: float | None = None
 
 
 def _content(msg: InboundMessage) -> tuple[IntakeSourceKind, str | None, bytes | None, str | None]:
