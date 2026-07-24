@@ -183,6 +183,19 @@ def test_casual_reply(clean_db):
     assert out.router_ms is not None and out.router_ms >= 0.0
 
 
+def test_g0_2_compiled_context_grounds_reasoner_with_world_layer(clean_db):
+    """The ContextCompiler must feed the persistent WORLD layer (the student's timezone) into the reasoner's
+    context — proving the model now reasons with the world model, not just a raw turn dump."""
+    from bruce_engine import world_state
+    uid = uuid4(); _run(_ensure_user(uid))
+    _run(world_state.set_timezone(uid, "America/Chicago"))
+    rec = RecordingReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="word"))
+    out = _run(conversation_runtime.handle(FakeChannel(), _msg("g2", text="yo what's the move"),
+                                           user_id=uid, reply_target=PHONE, reasoner=rec))
+    assert out.status == "processed" and rec.called is True
+    assert "central time" in (rec.context or "")            # the WORLD layer reached the model
+
+
 def test_model_failure_is_honest_fallback(clean_db):
     uid = uuid4(); _run(_ensure_user(uid))
     img = Attachment(kind=AttachmentKind.image, media_type="image/png", data=_PNG)
