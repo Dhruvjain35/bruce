@@ -128,19 +128,32 @@ async def _stage0(user_id: UUID, text: str, *, has_attachments: bool, has_reply_
     return None
 
 
-async def _stage1(text: str, model: "RouterModel | None") -> RouterDecision:
-    if model is not None:
-        try:
-            return await model.route(text)
-        except Exception:
-            pass
-    # Default: with only the calendar hands live, an unrouted text is Bruce chatting.
-    return RouterDecision(ExecutionClass.fast_conversation, action=GoalAction.answer, source="router_default")
+_DEFAULT = RouterDecision(ExecutionClass.fast_conversation, action=GoalAction.answer, source="router_default")
+
+
+async def _stage1(user_id: UUID, text: str, *, has_reply_ref: bool, model=None) -> RouterDecision:
+    """The COMPACT router model (Phase C), reached only when Stage 0 was inconclusive. `model` is an injected
+    RouterModelProvider (a fake in tests); in production the CompactRouterModel is used when BRUCE_ROUTER_
+    STAGE1 is on. Any timeout/error/invalid/low-confidence -> the deterministic default (never blocks)."""
+    from . import router_model
+    provider = model if model is not None else (router_model.CompactRouterModel()
+                                                if router_model.stage1_enabled() else None)
+    if provider is None:
+        return _DEFAULT
+    try:
+        request = await router_model.build_request(user_id, text, has_reply_ref=has_reply_ref)
+        outcome = await router_model.route_stage1(request, provider=provider)
+        if outcome.response is not None:
+            return outcome.response.to_router_decision()
+    except Exception:
+        pass
+    return _DEFAULT
 
 
 async def route(user_id: UUID, text: str, *, has_attachments: bool = False, has_reply_ref: bool = False,
-                model: "RouterModel | None" = None) -> tuple[RouterDecision, RouterTiming]:
-    """Classify the execution path. Deterministic first; the compact model only when needed."""
+                model=None) -> tuple[RouterDecision, RouterTiming]:
+    """Classify the execution path. Deterministic Stage 0 first; the compact Stage-1 model ONLY when Stage 0
+    is inconclusive (so a resolved turn makes no model call)."""
     timing = RouterTiming()
     t0 = time.perf_counter()
     d = await _stage0(user_id, text, has_attachments=has_attachments, has_reply_ref=has_reply_ref)
@@ -149,7 +162,7 @@ async def route(user_id: UUID, text: str, *, has_attachments: bool = False, has_
         timing.total_ms = timing.stage0_ms
         return d, timing
     t1 = time.perf_counter()
-    d = await _stage1(text, model)
+    d = await _stage1(user_id, text, has_reply_ref=has_reply_ref, model=model)
     timing.stage1_ms = (time.perf_counter() - t1) * 1000.0
     timing.total_ms = timing.stage0_ms + timing.stage1_ms
     return d, timing
