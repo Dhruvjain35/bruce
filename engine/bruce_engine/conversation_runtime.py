@@ -12,7 +12,7 @@ import logging
 from uuid import UUID
 
 from . import (capability_truth, context_compiler, conversation_context, conversation_outcomes,
-               conversation_store, messaging_outbound, response_composer, technical_render)
+               conversation_store, messaging_outbound, response_composer, router_authority, technical_render)
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
@@ -129,11 +129,12 @@ class _Runtime:
         # the decision is SHADOWED — recorded for the router-quality harness, latency telemetry, and the later
         # execution lanes that will act on it; the proven conversation pipeline below still runs. A router
         # glitch must never drop a turn, so classification is best-effort and content-free.
-        from . import fast_router, tool_broker
+        from . import fast_router, tool_broker, tool_registry
         from .runtime_contracts import ExecutionClass
         router_ec: str | None = None
         router_ms: float | None = None
         shortlisted: tuple[str, ...] | None = None
+        authoritative_decision = None      # G0 Activation Phase A: set -> skip the reasoner, dispatch on it
         try:
             rd, rt = await fast_router.route(
                 user_id, msg.text or "", has_attachments=bool(msg.attachments),
@@ -154,83 +155,109 @@ class _Runtime:
                 shortlisted = tuple(c.capability for c in sl.candidates)
                 log.info("broker pmid=%s caps=%s actionable=%s dead=%s unavailable=%s", pmid,
                          list(shortlisted), sl.has_actionable, list(sl.excluded_dead), list(sl.unavailable))
+            # Phase A: AUTHORITATIVE router. On a deterministic text-action lane whose DB precondition the
+            # router already verified, the winning handler ignores the reasoner's decision — so for a canary
+            # user, skip the expensive vision pass and dispatch on a synthetic decision (identical outcome).
+            skip = router_authority.is_authoritative(user_id) and router_authority.reasoner_skippable(
+                rd, has_attachments=bool(msg.attachments),
+                has_reply_ref=bool(msg.reply_to_message_id or msg.thread_root_message_id))
+            if skip and rd.domain == "calendar":
+                # the calendar handlers CLAIM only when connected; if not, defer to the reasoner so the honest
+                # "not connected" reply is still generated instead of an empty synthetic one (keeps parity).
+                # All calendar ops share ONE google connection, so a known-live cap is the connection proxy —
+                # this also sidesteps the router mislabeling a repair's candidate as calendar.repair_event.
+                skip = await tool_registry.is_available("calendar.update_event", user_id)
+            if skip:
+                authoritative_decision = router_authority.synthetic_decision(rd)
         except Exception:
             log.info("router_error pmid=%s", pmid)     # classification never blocks a reply
-        # A3.2: resolve the EXPLICITLY-referenced message/attachment/prior-answer into a bounded capsule
-        # the GENERIC reasoner consumes as evidence (no reply-specific branch).
+            authoritative_decision = None
+        # A3.2: resolve the EXPLICITLY-referenced message/attachment/prior-answer into a bounded capsule the
+        # GENERIC reasoner consumes as evidence (no reply-specific branch). Hoisted so both the authoritative
+        # and the legacy path share it (a skippable turn has no reference -> a cheap, empty capsule).
         capsule = await conversation_context.resolve(user_id, msg)
-        images, unreadable = _prepare_images(msg)
 
-        # P0.1 AUTHORITATIVE TARGET. An explicit reply target is authoritative: Bruce must answer about the
-        # EXACT message the student pointed at — never a newer/most-recent image, never unrelated recent
-        # context. So when the referenced content can't be loaded AND this message carries no standalone
-        # image of its own, fail closed with an honest, specific ask. This fires even when the student
-        # typed a question alongside the reply (the question is ABOUT the thing we could not load) — the
-        # earlier bug answered such replies from the newest image instead of admitting the miss.
-        explicit_ref = (bool(msg.reply_to_message_id or msg.thread_root_message_id)
-                        or capsule.resolution_source == conversation_context.RELAY_EXACT)
-        if not capsule.referenced_images and not images:
-            if capsule.attachment_pending:                      # replied to an image/file, not downloaded
-                reply = self.style.template("reply_attachment_pending")
+        if authoritative_decision is not None:
+            # Phase A: the FastRouter OWNS this deterministic text-action lane and already verified its DB
+            # precondition; the winning handler re-derives from msg.text + DB and ignores the reasoner. So
+            # skip the vision pass entirely and dispatch on the synthetic decision — identical outcome, no
+            # model on the hot path. (Skippable is gated to no-attachment/no-reply, so no perception is lost.)
+            decision = authoritative_decision
+            log.info("router_authoritative pmid=%s ec=%s action=%s reasoner=skipped", pmid, router_ec,
+                     rd.action.value if rd.action else None)
+        else:
+            images, unreadable = _prepare_images(msg)
+
+            # P0.1 AUTHORITATIVE TARGET. An explicit reply target is authoritative: Bruce must answer about the
+            # EXACT message the student pointed at — never a newer/most-recent image, never unrelated recent
+            # context. So when the referenced content can't be loaded AND this message carries no standalone
+            # image of its own, fail closed with an honest, specific ask. This fires even when the student
+            # typed a question alongside the reply (the question is ABOUT the thing we could not load) — the
+            # earlier bug answered such replies from the newest image instead of admitting the miss.
+            explicit_ref = (bool(msg.reply_to_message_id or msg.thread_root_message_id)
+                            or capsule.resolution_source == conversation_context.RELAY_EXACT)
+            if not capsule.referenced_images and not images:
+                if capsule.attachment_pending:                      # replied to an image/file, not downloaded
+                    reply = self.style.template("reply_attachment_pending")
+                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                                         decision=None, intent="image_understanding")
+                    return InboundOutcome(status="processed", user_id=user_id)
+                if capsule.attachment_load_failed:                  # the exact file EXISTS but we couldn't load
+                    # P0.2: fail closed honestly — we KNOW which image, we just couldn't load its bytes. Never
+                    # tell the user to resend a file that is genuinely there, and never fall through to answer
+                    # from the newest/nearest image.
+                    reply = self.style.template("reply_image_unavailable")
+                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                                         decision=None, intent="image_understanding")
+                    return InboundOutcome(status="processed", user_id=user_id)
+                if explicit_ref and not (capsule.referenced_text or capsule.prior_answer):
+                    reply = self.style.template("reply_target_unavailable")        # target lost / nothing to show
+                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                                         decision=None, intent="image_understanding")
+                    return InboundOutcome(status="processed", user_id=user_id)
+
+            images = capsule.referenced_images + images     # the referenced attachment is authoritative -> first
+
+            # attachment the relay couldn't fetch OR bytes we genuinely can't open, and nothing else to go
+            # on -> honest resend ask. (A healthy HEIC no longer lands here — it's normalized to JPEG above.)
+            if (msg.attachment_unavailable or unreadable) and not (msg.text and msg.text.strip()) and not images:
+                reply = self.style.template("could_not_read_attachment")
                 await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
                                      decision=None, intent="image_understanding")
                 return InboundOutcome(status="processed", user_id=user_id)
-            if capsule.attachment_load_failed:                  # the exact file EXISTS but we couldn't load
-                # P0.2: fail closed honestly — we KNOW which image, we just couldn't load its bytes. Never
-                # tell the user to resend a file that is genuinely there, and never fall through to answer
-                # from the newest/nearest image.
-                reply = self.style.template("reply_image_unavailable")
+
+            # G0.2 ContextCompiler: assemble a BOUNDED, prioritized context from layered memory (world tz +
+            # active calendar entities + any open agent run + a bounded conversation window) instead of dumping
+            # the raw recent turns. P0.1 still holds: with an explicit, RESOLVED reply target THAT owns the
+            # context, so episodic is WITHHELD — that window is exactly how a newer image B leaked in and got
+            # answered instead of the replied-to image A. World/entity/operational still ground the reply. The
+            # referenced content (fenced as DATA below) stands on its own. Compilation never drops a turn.
+            include_episodic = not (explicit_ref and capsule.has_reference)
+            try:
+                compiled = await context_compiler.compile(
+                    user_id, recent, include_episodic=include_episodic, profile=profile)
+                ctx = compiled.text
+                if compiled.dropped:
+                    log.info("ctx_compiled pmid=%s tokens=%s blocks=%s dropped=%s", pmid, compiled.est_tokens,
+                             [b.layer for b in compiled.blocks], list(compiled.dropped))
+            except Exception:
+                log.info("ctx_compile_error pmid=%s", pmid)         # fall back to the honest minimal context
+                ctx = _context(recent) if include_episodic else "No prior conversation."
+            _ev = conversation_context.evidence_text(capsule)       # referenced content, fenced as DATA
+            if _ev:
+                ctx = ctx + "\n\n" + _ev
+            try:
+                rr = await self.reasoner.decide(text=msg.text, images=images, context=ctx)
+            except Exception:
+                # A model/backend glitch is OUR fault, not the image's. Never say "couldn't read that" for
+                # a healthy photo (the exact false-negative we're fixing) — own it and ask for a retry.
+                reply = _FALLBACK
                 await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
-                                     decision=None, intent="image_understanding")
-                return InboundOutcome(status="processed", user_id=user_id)
-            if explicit_ref and not (capsule.referenced_text or capsule.prior_answer):
-                reply = self.style.template("reply_target_unavailable")        # target lost / nothing to show
-                await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
-                                     decision=None, intent="image_understanding")
-                return InboundOutcome(status="processed", user_id=user_id)
+                                     decision=None, intent="unsupported")
+                log.info("conv_model_error pmid=%s", pmid)
+                return InboundOutcome(status="model_error", user_id=user_id)
 
-        images = capsule.referenced_images + images     # the referenced attachment is authoritative -> first
-
-        # attachment the relay couldn't fetch OR bytes we genuinely can't open, and nothing else to go
-        # on -> honest resend ask. (A healthy HEIC no longer lands here — it's normalized to JPEG above.)
-        if (msg.attachment_unavailable or unreadable) and not (msg.text and msg.text.strip()) and not images:
-            reply = self.style.template("could_not_read_attachment")
-            await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
-                                 decision=None, intent="image_understanding")
-            return InboundOutcome(status="processed", user_id=user_id)
-
-        # G0.2 ContextCompiler: assemble a BOUNDED, prioritized context from layered memory (world tz +
-        # active calendar entities + any open agent run + a bounded conversation window) instead of dumping
-        # the raw recent turns. P0.1 still holds: with an explicit, RESOLVED reply target THAT owns the
-        # context, so episodic is WITHHELD — that window is exactly how a newer image B leaked in and got
-        # answered instead of the replied-to image A. World/entity/operational still ground the reply. The
-        # referenced content (fenced as DATA below) stands on its own. Compilation never drops a turn.
-        include_episodic = not (explicit_ref and capsule.has_reference)
-        try:
-            compiled = await context_compiler.compile(
-                user_id, recent, include_episodic=include_episodic, profile=profile)
-            ctx = compiled.text
-            if compiled.dropped:
-                log.info("ctx_compiled pmid=%s tokens=%s blocks=%s dropped=%s", pmid, compiled.est_tokens,
-                         [b.layer for b in compiled.blocks], list(compiled.dropped))
-        except Exception:
-            log.info("ctx_compile_error pmid=%s", pmid)         # fall back to the honest minimal context
-            ctx = _context(recent) if include_episodic else "No prior conversation."
-        _ev = conversation_context.evidence_text(capsule)       # referenced content, fenced as DATA
-        if _ev:
-            ctx = ctx + "\n\n" + _ev
-        try:
-            rr = await self.reasoner.decide(text=msg.text, images=images, context=ctx)
-        except Exception:
-            # A model/backend glitch is OUR fault, not the image's. Never say "couldn't read that" for
-            # a healthy photo (the exact false-negative we're fixing) — own it and ask for a retry.
-            reply = _FALLBACK
-            await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
-                                 decision=None, intent="unsupported")
-            log.info("conv_model_error pmid=%s", pmid)
-            return InboundOutcome(status="model_error", user_id=user_id)
-
-        decision = rr.decision
+            decision = rr.decision
 
         # Outcome dispatch (D-INT-1/D-INT-3): two-phase evaluate -> priority select -> execute, presentation
         # runtime-owned. A handler-collision (two claims at the same top priority) is a config bug: it fails
