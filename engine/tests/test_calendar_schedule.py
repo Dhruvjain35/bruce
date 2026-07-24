@@ -81,7 +81,9 @@ def test_no_resolvable_date_returns_none_never_guesses():
 
 def test_human_when_collapses_exclusive_end_to_inclusive_range():
     ev = cs.build_calendar_event(_startup_school())
-    assert cs.human_when(ev) == "july 25–26"                 # inclusive, not 25-27
+    # pin `now` so the relative renderer yields the absolute range (else it says "tomorrow to 26" once
+    # the wall clock reaches jul 24) — this asserts the exclusive->inclusive end collapse, not the calendar.
+    assert cs.human_when(ev, now=_NOW) == "july 25–26"       # inclusive, not 25-27
 
 
 def test_human_when_single_day():
@@ -93,7 +95,7 @@ def test_verified_reply_is_honest_and_survives_the_outbound_gate():
     ev = cs.build_calendar_event(_startup_school())
     res = cs.ScheduleResult(state=cs.ScheduleState.verified, mission_id=uuid4(),
                             title=ev.title, all_day=True, event_id="abc", account="me@example.com")
-    reply = co._calendar_reply(res, ev)
+    reply = co._calendar_reply(res, ev, now=_NOW)            # pin now -> deterministic absolute range
     assert reply.startswith("done, startup school 2026 is on ur calendar for july 25–26 ✅")
     assert "all-day event" in reply
     gated = gate_outbound_text(reply, "self_hosted_imessage")

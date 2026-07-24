@@ -20,6 +20,7 @@ MIGRATION_LANES: dict[str, str] = {
     "0022": "runtime",             # general agent runtime lane opener: user_world_state (R3)
     "0023": "runtime",             # agent_runs + agent_run_events (R2)
     "0024": "runtime",             # calendar_event_entities (R7)
+    "0025": "runtime",             # agent_runs background-mission lease columns (G0.5)
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the

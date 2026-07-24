@@ -327,6 +327,13 @@ class AgentRun(Base, TSV):
     blocked_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
     completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 0025 — background-mission lease (a durable run advanced by the worker, claimed FOR UPDATE SKIP LOCKED
+    # like intake_jobs). next_run_at gates when a queued/rescheduled run becomes claimable.
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_run_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("5"))
     __table_args__ = (UniqueConstraint("user_id", "idempotency_key", name="uq_agent_run_idem"),)
 
 
