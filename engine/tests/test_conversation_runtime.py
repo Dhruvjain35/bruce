@@ -196,6 +196,47 @@ def test_g0_2_compiled_context_grounds_reasoner_with_world_layer(clean_db):
     assert "central time" in (rec.context or "")            # the WORLD layer reached the model
 
 
+def test_phaseA_authoritative_remember_skips_the_reasoner(clean_db, monkeypatch):
+    """Phase A: a deterministic text-action lane the router owns (a world-state statement) dispatches on a
+    synthetic decision WITHOUT the vision reasoner — the handler still runs + persists, identical outcome."""
+    from bruce_engine import world_state
+    monkeypatch.setenv("BRUCE_ROUTER_AUTHORITY_PCT", "100")
+    uid = uuid4(); _run(_ensure_user(uid))
+    rec = RecordingReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="unused"))
+    out = _run(conversation_runtime.handle(FakeChannel(), _msg("pa1", text="im in cst"),
+                                           user_id=uid, reply_target=PHONE, reasoner=rec))
+    assert out.status == "processed"
+    assert rec.called is False                              # reasoner SKIPPED — the router was authoritative
+    assert _run(world_state.get_timezone(uid)) == "America/Chicago"   # the handler ran + persisted for real
+    assert out.execution_class == "direct_action"
+
+
+def test_phaseA_authoritative_defers_chat_to_the_reasoner(clean_db, monkeypatch):
+    """Chat is NOT skippable — the model generates the reply, so even at 100% authority the reasoner runs."""
+    monkeypatch.setenv("BRUCE_ROUTER_AUTHORITY_PCT", "100")
+    uid = uuid4(); _run(_ensure_user(uid))
+    rec = RecordingReasoner(_decision(IntentKind.casual, ResponseType.direct_answer, text="not much lol"))
+    out = _run(conversation_runtime.handle(FakeChannel(), _msg("pa2", text="yo whats good lol"),
+                                           user_id=uid, reply_target=PHONE, reasoner=rec))
+    assert out.status == "processed" and rec.called is True
+    assert out.execution_class == "fast_conversation"
+
+
+def test_phaseA_authoritative_defers_disconnected_calendar(clean_db, monkeypatch):
+    """The connected-gate: a calendar mutation whose provider isn't connected DEFERS to the reasoner, so the
+    honest 'not connected' reply is still generated instead of an empty synthetic one (parity preserved)."""
+    from bruce_engine import entity_store
+    monkeypatch.setenv("BRUCE_ROUTER_AUTHORITY_PCT", "100")
+    uid = uuid4(); _run(_ensure_user(uid))
+    _run(entity_store.record_event(uid, title="chess club", start="2026-07-25T15:00:00",
+         end="2026-07-25T16:00:00", timezone="America/Chicago", location=None, provider="google_calendar",
+         provider_account_id="a@b.com", provider_event_id="evt_x", source_message_ids=["m1"]))
+    rec = RecordingReasoner(_decision(IntentKind.actionable, ResponseType.status, text="calendar not connected"))
+    out = _run(conversation_runtime.handle(FakeChannel(), _msg("pa3", text="move chess club to 9pm"),
+                                           user_id=uid, reply_target=PHONE, reasoner=rec))
+    assert out.status == "processed" and rec.called is True   # not connected -> deferred to the reasoner
+
+
 def test_g0_3_scheduling_turn_shortlists_the_create_tool(clean_db):
     """The router→ToolBroker seam runs end-to-end: a scheduling message shortlists exactly the calendar
     create tool (never the whole registry), surfaced on the outcome for telemetry + the G0.4 planner."""
