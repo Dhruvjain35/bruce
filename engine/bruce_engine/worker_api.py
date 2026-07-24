@@ -16,8 +16,9 @@ import os
 from fastapi import FastAPI
 
 from . import worker
-from .background_runner import BackgroundRunner
+from .background_runner import BackgroundRunner, PlanMissionAdvancer
 from .intake_jobs import PostgresJobStore
+from .mission_executor import MissionExecutor
 
 app = FastAPI(title="Bruce Worker", version="0.1.0")
 
@@ -45,11 +46,16 @@ async def process() -> dict[str, int]:
             break
         processed += 1
 
-    # G0.5: also drain any due background missions on the same wake. Same lease/crash-recovery model; safe
-    # no-op until missions are enqueued. Isolated so an intake result is never lost to a background error.
+    # G0.5/Phase E: drain due background missions on the same wake with the REAL advancer — each claimed run
+    # is driven through its plan steps (verified provider calls + waits), checkpointed, dead-lettered on
+    # budget. Same lease/crash-recovery model. Isolated so an intake result is never lost to a background
+    # error. (No mission is enqueued in the live path until the first mission type ships — Gmail, Phase G.)
     missions = 0
-    try:
-        missions = await BackgroundRunner(worker_id=worker_id, lease_seconds=60).drain(max_runs=_MAX_DRAIN)
-    except Exception:
-        pass
+    if os.environ.get("BRUCE_BACKGROUND_RUNNER_OFF", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        try:
+            advancer = PlanMissionAdvancer(executor=MissionExecutor())
+            missions = await BackgroundRunner(worker_id=worker_id, lease_seconds=60,
+                                              advancer=advancer).drain(max_runs=_MAX_DRAIN)
+        except Exception:
+            pass
     return {"processed": processed, "missions": missions}

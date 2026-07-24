@@ -193,3 +193,34 @@ async def reschedule_background(user_id: UUID, run_id: UUID, *, next_run_at: dat
             "UPDATE agent_runs SET status = 'queued', next_run_at = :nra, lease_owner = NULL, "
             "lease_expires_at = NULL, " + reset + "version = version + 1, updated_at = now() " + cond),
             params)
+
+
+async def checkpoint_background(user_id: UUID, run_id: UUID, *, recovery_state: dict,
+                               worker_id: str | None = None) -> None:
+    """Persist a mission's progress checkpoint (recovery_state) FENCED to the lease owner in the UPDATE's own
+    WHERE (write-time, like complete/reschedule — not a read-then-flush) so a worker that lost the lease can
+    never clobber the new owner's more-advanced checkpoint. A restart resumes from here, redoing no step."""
+    import json
+    async with user_session(user_id) as s:
+        cond = "WHERE id = :id AND user_id = :uid"
+        params: dict = {"cp": json.dumps(recovery_state), "id": str(run_id), "uid": str(user_id)}
+        if worker_id is not None:
+            cond += " AND lease_owner = :worker"
+            params["worker"] = worker_id[:64]
+        await s.execute(sa_text(
+            "UPDATE agent_runs SET recovery_state = CAST(:cp AS jsonb), version = version + 1, "
+            "updated_at = now() " + cond), params)
+
+
+async def cancel_background(user_id: UUID, run_id: UUID) -> None:
+    """User/owner cancellation — terminal 'cancelled', lease cleared. The claim excludes it thereafter; a
+    worker mid-advance sees status=cancelled on its next read and stops."""
+    async with user_session(user_id) as s:
+        res = await s.execute(sa_text(
+            "UPDATE agent_runs SET status = 'cancelled', completed_at = now(), lease_owner = NULL, "
+            "lease_expires_at = NULL, version = version + 1, updated_at = now() "
+            "WHERE id = :id AND user_id = :uid AND status NOT IN ('completed','failed','cancelled','dead_letter')"),
+            {"id": str(run_id), "uid": str(user_id)})
+        if res.rowcount:                                    # only log a transition that actually happened
+            s.add(schema.AgentRunEvent(user_id=user_id, agent_run_id=run_id, status="cancelled", detail={}))
+            await s.flush()
