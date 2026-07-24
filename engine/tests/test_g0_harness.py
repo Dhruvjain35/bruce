@@ -106,9 +106,11 @@ def test_context_is_bounded_and_grounded():
 def test_broker_shortlists_the_right_tool():
     uid = _user()
 
-    async def _avail(cap, u):
-        return True
-    with patch.object(tool_registry, "is_available", _avail):
+    _CAL_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+
+    async def _conn(u, provider):                       # Phase B: broker's single connection probe
+        return tool_broker._Conn(connected=True, scopes=(_CAL_SCOPE,))
+    with patch.object(tool_broker, "_provider_connection", _conn):
         sl_create = _run(tool_broker.shortlist(uid, domain="calendar", action=GoalAction.create,
                                                candidate_capabilities=("calendar.create_event",)))
         sl_search = _run(tool_broker.shortlist(uid, domain="calendar", action=GoalAction.search))

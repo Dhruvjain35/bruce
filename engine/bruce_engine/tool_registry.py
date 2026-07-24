@@ -14,8 +14,10 @@ honest "not live yet" into a working capability.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID
+
+_CAL_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 
 
 @dataclass(frozen=True)
@@ -27,19 +29,28 @@ class ToolSpec:
     live: bool                # implemented AND reachable end-to-end for a real user right now
     reversible: bool = True
     requires_scope: str | None = None
+    # a COMPACT argument schema {field: type} — a "?" suffix marks optional. This is what the broker hands a
+    # planner so it fills args from the schema, never from ad-hoc handler knowledge. Deliberately tiny.
+    arg_schema: dict = field(default_factory=dict)
 
 
 # Calendar is the first tool set. create is live_write_verified; update/delete/search have adapter methods
 # but no conversation route yet -> live=False (honest). Add providers by adding rows, never a handler.
 _TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("calendar.create_event", "google_calendar", "create_event", write=True, live=True,
-             requires_scope="https://www.googleapis.com/auth/calendar.events"),
+             reversible=False, requires_scope=_CAL_SCOPE,
+             arg_schema={"title": "str", "start": "datetime", "end": "datetime?", "all_day": "bool?",
+                         "timezone": "str?"}),
     ToolSpec("calendar.update_event", "google_calendar", "update_event", write=True, live=True,
-             requires_scope="https://www.googleapis.com/auth/calendar.events"),
+             requires_scope=_CAL_SCOPE,
+             arg_schema={"target_entity_id": "str", "new_start": "datetime", "new_end": "datetime?",
+                         "new_timezone": "str?"}),
     ToolSpec("calendar.delete_event", "google_calendar", "delete_event", write=True, live=True,
-             requires_scope="https://www.googleapis.com/auth/calendar.events"),
+             reversible=False, requires_scope=_CAL_SCOPE,
+             arg_schema={"target_entity_id": "str"}),
     ToolSpec("calendar.search_events", "google_calendar", "search_events", write=False, live=False,
-             requires_scope="https://www.googleapis.com/auth/calendar.events"),
+             requires_scope=_CAL_SCOPE,
+             arg_schema={"query": "str", "time_min": "datetime?", "time_max": "datetime?"}),
 )
 _BY_CAP: dict[str, ToolSpec] = {t.capability: t for t in _TOOLS}
 
@@ -81,3 +92,18 @@ async def is_available(capability: str, user_id: UUID) -> bool:
         return (integ is not None and integ.status == "connected"
                 and integ.revoked_at is None and bool(integ.refresh_token_encrypted))
     return False
+
+
+async def granted_scopes(user_id: UUID, provider: str) -> tuple[str, ...]:
+    """The scopes the user's CONNECTED integration actually granted for a provider (empty if not connected).
+    Lets the broker distinguish 'connected but missing the scope' (insufficient_scope) from disconnected."""
+    if provider == "google_calendar":
+        from . import oauth_google
+        try:
+            integ = await oauth_google.get_integration(user_id)
+        except Exception:
+            return ()
+        if integ is None or integ.status != "connected" or integ.revoked_at is not None:
+            return ()
+        return tuple(integ.scopes or ())
+    return ()
