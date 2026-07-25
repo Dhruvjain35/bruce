@@ -74,7 +74,8 @@ class GmailAdapter(Protocol):
                    marker: str) -> GmailMessageRef: ...
     async def get(self, message_id: str) -> dict | None: ...              # NORMALIZED, never raw google
     async def get_thread(self, thread_id: str) -> list[dict]: ...
-    async def find_reply(self, thread_id: str, *, after_message_id: str) -> dict | None: ...
+    async def find_reply(self, thread_id: str, *, after_message_id: str,
+                         own_message_ids: tuple[str, ...] = ()) -> dict | None: ...
 
 
 def _normalize(raw: dict) -> dict:
@@ -167,13 +168,16 @@ class FakeGmailAdapter:
     async def get_thread(self, thread_id: str) -> list[dict]:
         return [_normalize(m) for m in self.messages.values() if m.get("threadId") == thread_id]
 
-    async def find_reply(self, thread_id: str, *, after_message_id: str) -> dict | None:
-        """A reply = a message in the thread that is NOT one of ours (no SENT label). Test injects one via
-        inject_incoming()."""
-        for m in self.messages.values():
-            if m.get("threadId") == thread_id and "SENT" not in (m.get("labelIds") or []):
-                return _normalize(m)
-        return None
+    async def find_reply(self, thread_id: str, *, after_message_id: str,
+                         own_message_ids: tuple[str, ...] = ()) -> dict | None:
+        """Same rule as the real adapter: a reply is a thread message that arrived after ours and that we
+        did not send, identified by id rather than by the SENT label (so a self-thread still resolves)."""
+        msgs = await self.get_thread(thread_id)
+        ours = {m for m in (after_message_id, *own_message_ids) if m}
+        at = next((i for i, m in enumerate(msgs) if m.get("id") == after_message_id), None)
+        later = msgs[at + 1:] if at is not None else msgs
+        inbound = [m for m in later if m.get("id") not in ours]
+        return inbound[-1] if inbound else None
 
     # test seam: simulate the student replying in the thread
     def inject_incoming(self, thread_id: str, *, from_addr: str, subject: str, body: str) -> str:
@@ -319,9 +323,19 @@ class GoogleGmailAdapter:
         self._raise_for(resp)
         return [_normalize(m) for m in (resp.json().get("messages") or [])]
 
-    async def find_reply(self, thread_id: str, *, after_message_id: str) -> dict | None:
-        """An inbound reply = a message in the thread that is NOT one of ours (no SENT label) and isn't the
-        message we sent. Returns the latest such message, or None if the student hasn't replied yet."""
+    async def find_reply(self, thread_id: str, *, after_message_id: str,
+                         own_message_ids: tuple[str, ...] = ()) -> dict | None:
+        """A reply = a message that arrived in the thread AFTER ours and that we did not send.
+
+        "Ours" is identified by MESSAGE ID and position, not by the SENT label. A label-only rule looks
+        right and silently fails the most ordinary case there is: when the student has Bruce email their
+        OWN address, their reply is also sent by the connected account, so it carries SENT too and would
+        be discarded forever — the mission would poll to exhaustion and finish "no reply" with nothing
+        wrong in the logs. Position + identity works for both a self-thread and a normal one.
+        """
         msgs = await self.get_thread(thread_id)
-        inbound = [m for m in msgs if "SENT" not in (m.get("labelIds") or []) and m.get("id") != after_message_id]
+        ours = {m for m in (after_message_id, *own_message_ids) if m}
+        at = next((i for i, m in enumerate(msgs) if m.get("id") == after_message_id), None)
+        later = msgs[at + 1:] if at is not None else msgs
+        inbound = [m for m in later if m.get("id") not in ours]
         return inbound[-1] if inbound else None
