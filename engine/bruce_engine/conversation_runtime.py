@@ -129,11 +129,12 @@ class _Runtime:
         # the decision is SHADOWED — recorded for the router-quality harness, latency telemetry, and the later
         # execution lanes that will act on it; the proven conversation pipeline below still runs. A router
         # glitch must never drop a turn, so classification is best-effort and content-free.
-        from . import fast_router, tool_broker, tool_registry
+        from . import fast_router, mission_planner, tool_broker, tool_registry
         from .runtime_contracts import ExecutionClass
         router_ec: str | None = None
         router_ms: float | None = None
         shortlisted: tuple[str, ...] | None = None
+        mission_plan = None                # C1: set when a routed background mission was durably enqueued
         authoritative_decision = None      # G0 Activation Phase A: set -> skip the reasoner, dispatch on it
         try:
             rd, rt = await fast_router.route(
@@ -172,6 +173,18 @@ class _Runtime:
                     skip = await tool_registry.is_available("calendar.update_event", user_id)
             if skip:
                 authoritative_decision = router_authority.synthetic_decision(rd)
+            # C1: a routed BACKGROUND mission becomes a DURABLE run right here. This is the seam that was
+            # missing — until now `enqueue_background` had no live caller, so a mission only existed if a
+            # job inserted one by hand. The key is derived from the inbound message, so a webhook
+            # redelivery resolves to the SAME run instead of sending a second email. Best-effort like the
+            # rest of this block: a planner fault must never cost the student their reply.
+            if mission_planner.is_enqueueable(rd):
+                plan = await mission_planner.plan_mission(
+                    user_id, rd, text=msg.text or "",
+                    idempotency_key=mission_planner.mission_idempotency_key(ch, pmid))
+                mission_plan = plan
+                log.info("mission_plan pmid=%s enqueued=%s status=%s run=%s existed=%s",
+                         pmid, plan.enqueued, plan.status, plan.run_id, plan.already_existed)
         except Exception:
             log.info("router_error pmid=%s", pmid)     # classification never blocks a reply
             authoritative_decision = None
@@ -303,7 +316,10 @@ class _Runtime:
                  router_ec, None if router_ms is None else round(router_ms, 1))
         return InboundOutcome(status="processed", user_id=user_id,
                               execution_class=router_ec, router_ms=router_ms,
-                              shortlisted_capabilities=shortlisted)
+                              shortlisted_capabilities=shortlisted,
+                              mission_run_id=(mission_plan.run_id if mission_plan and mission_plan.enqueued
+                                              else None),
+                              mission_status=(mission_plan.status if mission_plan else None))
 
     def _present(self, text: str, *, decision: ConversationDecision, profile, channel: str) -> str:
         """Channel-aware presentation = humanity styling THEN trust safety gates (D-INT-2 seam).

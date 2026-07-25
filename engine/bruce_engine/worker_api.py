@@ -11,18 +11,27 @@ this makes the queue self-healing. All durability + crash recovery is the job ta
 
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI
 
+from . import notifier as notifier_mod
 from . import worker
 from .background_runner import BackgroundRunner, PlanMissionAdvancer
 from .intake_jobs import PostgresJobStore
 from .mission_executor import MissionExecutor
 
+log = logging.getLogger(__name__)
+
 app = FastAPI(title="Bruce Worker", version="0.1.0")
 
 _MAX_DRAIN = int(os.environ.get("BRUCE_WORKER_DRAIN_MAX", "25"))
+
+
+def background_runner_enabled() -> bool:
+    """Kill switch, read at call time so a test (or a redeploy) can flip it without reimporting."""
+    return os.environ.get("BRUCE_BACKGROUND_RUNNER_OFF", "").strip().lower() not in {"1", "true", "yes", "on"}
 
 
 @app.get("/health")
@@ -36,12 +45,16 @@ async def process() -> dict[str, int]:
     (unchanged) extraction service, and persists — a crash mid-job just expires the lease."""
     store = PostgresJobStore()
     worker_id = f"cloudrun-{os.uname().nodename}-{os.getpid()}"
-    processed = 0
+    processed, intake_errors = 0, 0
     for _ in range(_MAX_DRAIN):
         try:
             handled = await worker.process_one(store, worker_id=worker_id, lease_seconds=60)
         except Exception:
-            break  # unexpected error: leave remaining jobs for the next invocation / retry
+            # leave remaining jobs for the next invocation / retry — but SAY SO. A swallowed error here
+            # used to be indistinguishable from an empty queue in both the response and the logs.
+            intake_errors += 1
+            log.exception("intake_drain_failed worker=%s processed=%d", worker_id, processed)
+            break
         if not handled:
             break
         processed += 1
@@ -49,13 +62,21 @@ async def process() -> dict[str, int]:
     # G0.5/Phase E: drain due background missions on the same wake with the REAL advancer — each claimed run
     # is driven through its plan steps (verified provider calls + waits), checkpointed, dead-lettered on
     # budget. Same lease/crash-recovery model. Isolated so an intake result is never lost to a background
-    # error. (No mission is enqueued in the live path until the first mission type ships — Gmail, Phase G.)
-    missions = 0
-    if os.environ.get("BRUCE_BACKGROUND_RUNNER_OFF", "").strip().lower() not in {"1", "true", "yes", "on"}:
+    # error. C1 wires the live enqueue path, so this drain now has real work to claim.
+    missions, mission_errors = 0, 0
+    if background_runner_enabled():
         try:
-            advancer = PlanMissionAdvancer(executor=MissionExecutor())
+            # notifier is None until a transport is verified end to end (see bruce_engine/notifier.py).
+            # None is deliberate: the runner then completes the mission WITHOUT stamping notified=true,
+            # so no run ever claims a delivery that did not happen.
+            advancer = PlanMissionAdvancer(executor=MissionExecutor(),
+                                           notifier=notifier_mod.build_notifier())
             missions = await BackgroundRunner(worker_id=worker_id, lease_seconds=60,
                                               advancer=advancer).drain(max_runs=_MAX_DRAIN)
         except Exception:
-            pass
-    return {"processed": processed, "missions": missions}
+            # a mission crash must never look like a healthy empty queue: {"missions": 0} was previously
+            # returned for BOTH, which made a production failure invisible.
+            mission_errors += 1
+            log.exception("background_drain_failed worker=%s", worker_id)
+    return {"processed": processed, "missions": missions,
+            "intake_errors": intake_errors, "mission_errors": mission_errors}

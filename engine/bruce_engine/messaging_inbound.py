@@ -51,6 +51,11 @@ class InboundOutcome:
     router_ms: float | None = None
     # G0.3 observability: the ToolBroker's shortlisted capabilities for a tool-bearing path (None for chat).
     shortlisted_capabilities: tuple[str, ...] | None = None
+    # C1 observability: the durable mission this turn enqueued, and the honest reason when it did not.
+    # `mission_run_id` is set ONLY on a real enqueue; `mission_status` always carries the planner's verdict
+    # (ok | no_tool | disconnected | insufficient_scope | no_recipient | invalid) for a mission-routed turn.
+    mission_run_id: str | None = None
+    mission_status: str | None = None
 
 
 def _content(msg: InboundMessage) -> tuple[IntakeSourceKind, str | None, bytes | None, str | None]:
