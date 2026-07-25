@@ -22,7 +22,8 @@ from dataclasses import dataclass
 
 from .conversation_style import enforce_no_dashes
 from .email_brief import EmailBrief, Relationship, relationship_style
-from .email_quality import QualityReport, validate_email
+from .email_quality import (HAS_ASK, QualityReport, is_generic_subject, scrub, validate_email,
+                            _ATTACH_CLAIM)
 from .email_voice import UserWritingProfile
 
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -48,15 +49,20 @@ def _ends_sentence(s: str) -> str:
 
 def _subject(brief: EmailBrief) -> str:
     if brief.is_reply and brief.thread_subject:
-        base = brief.thread_subject.strip()
+        base = enforce_no_dashes(brief.thread_subject.strip())
         return base if base.lower().startswith("re:") else f"Re: {base}"
-    # a specific, human subject from the purpose (fall back to the ask); never a generic one-worder
-    raw = (brief.purpose or brief.requested_outcome or "").strip().rstrip(".")
-    raw = re.sub(r"^\s*(please|can you|could you|i want to|i need to|to)\s+", "", raw, flags=re.IGNORECASE)
-    subj = raw[:80].strip()
-    if subj:
-        subj = subj[0].upper() + subj[1:]
-    return subj or "Following up"
+    # a specific, human subject from the purpose (fall back to the ask); scrubbed + de-dashed, never generic
+    for src in (brief.purpose, brief.requested_outcome):
+        raw = scrub(src or "").strip().rstrip(".?!")
+        raw = re.sub(r"^\s*(please|can you|could you|would you|i want to|i need to|i wanted to ask|just|to)\s+",
+                     "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\?.*$", "", raw).strip()
+        subj = raw[:80].strip()
+        if subj and not is_generic_subject(subj):
+            return enforce_no_dashes(subj[0].upper() + subj[1:])
+    # concrete fallback (only when both fields are empty/generic) — a recipient/topic anchor, never "Following up"
+    who = brief.recipient_name or brief.recipient_relationship.value
+    return enforce_no_dashes(f"Note for {who}")
 
 
 def _greeting(brief: EmailBrief, profile: UserWritingProfile) -> str:
@@ -73,21 +79,29 @@ def _greeting(brief: EmailBrief, profile: UserWritingProfile) -> str:
 def _deterministic_draft(brief: EmailBrief, profile: UserWritingProfile) -> tuple[str, str]:
     """The guaranteed-clean floor. Built only from the brief, engineered to pass validate_email()."""
     style = relationship_style(brief.recipient_relationship)
+    present = [a for a in brief.attachments if a.present]
     lines: list[str] = [_greeting(brief, profile), ""]
 
-    # one line of necessary context (the reason), only if the brief supplied it
-    context = (brief.source_context or "").strip()
-    if context:
-        lines.append(_ends_sentence(context))
+    def _no_false_attach(txt: str) -> str:
+        # never let a brief field assert an attachment the email isn't actually carrying
+        return txt if present else _ATTACH_CLAIM.sub("mentioned", txt)
 
-    # the actual request; guarantee a clear ask (CTA) is present
-    ask = _ends_sentence(brief.requested_outcome.strip())
-    if not re.search(r"\?|\b(let me know|could you|can you|please|when|i need|would you)\b", ask, re.IGNORECASE):
+    # one line of necessary context (the reason), only if the brief supplied it; scrubbed, capped, own block
+    context = scrub(_no_false_attach((brief.source_context or "").strip()))
+    if context:
+        for sent in re.split(r"(?<=[.!?])\s+", context)[:3]:    # cap to 3 sentences so no giant block forms
+            s = sent.strip()
+            if s:
+                lines.append(_ends_sentence(s))
+        lines.append("")
+
+    # the actual request; scrub filler, then guarantee a clear ask (CTA) using the validator's own pattern
+    ask = _ends_sentence(scrub(_no_false_attach(brief.requested_outcome.strip())))
+    if not HAS_ASK.search(ask):
         ask = ask + " Let me know."
     lines.append(ask)
 
     # a grounded attachment line, only when something is really attached
-    present = [a for a in brief.attachments if a.present]
     if present:
         names = present[0].name if len(present) == 1 else ", ".join(a.name for a in present)
         lines.append(f"I attached {names}.")
@@ -203,7 +217,7 @@ async def compose_email(brief: EmailBrief, *, profile: UserWritingProfile | None
         return ComposedEmail(floor_subject, floor_body, used_model=False, fell_back=True, report=report)
 
     for attempt in range(max_rewrites + 1):
-        body = enforce_no_dashes(body)                    # safe deterministic fix for the one banned char
+        subject, body = enforce_no_dashes(subject), enforce_no_dashes(body)   # de-dash BOTH before judging
         report = validate_email(subject, body, brief, profile=profile)
         if report.ok:
             return ComposedEmail(subject, body, used_model=True, fell_back=False, report=report)

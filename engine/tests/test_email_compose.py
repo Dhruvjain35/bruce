@@ -214,7 +214,122 @@ def test_writing_profile_round_trips(_pg):
     uid = uuid4(); _run(users.ensure(uid, auth_provider="test"))
     assert _run(email_voice.get_writing_profile(uid)) == UserWritingProfile()   # empty default
     _run(email_voice.save_writing_profile(uid, UserWritingProfile(
-        greeting="Hey", sign_off="Best", formality=2, disliked_phrases=("circle back",))))
+        greeting="Hey", sign_off="Best", formality=2, disliked_phrases=("circle back",),
+        recipient_style={"coach_smith": {"formality": 4, "disliked_phrases": ("yo",)}})))
     got = _run(email_voice.get_writing_profile(uid))
     assert got.greeting == "Hey" and got.sign_off == "Best" and got.formality == 2
     assert got.disliked_phrases == ("circle back",)
+    # nested recipient override survives the JSONB round-trip as a tuple
+    assert got.recipient_style["coach_smith"]["disliked_phrases"] == ("yo",)
+
+
+# --- hardening: the evasions/edge-cases the adversarial review found are all closed -----------------
+
+_B = SCENARIOS["teacher"]        # a plain teacher brief to validate arbitrary drafts against
+
+
+def _codes(body, subject="Homework help", brief=_B):
+    return validate_email(subject, body, brief).codes()
+
+
+@pytest.mark.parametrize("body,code", [
+    ("Hi Mr. Smith, I trust this finds you well. Could you send the assignment? Thanks, Dhruv", "banned_phrase"),
+    ("Hi Mr. Smith, just circling back on the assignment. Could you send it? Thanks, Dhruv", "banned_phrase"),
+    ("Hi Mr. Smith, touching base about the assignment. Could you send it? Thanks, Dhruv", "banned_phrase"),
+    ("Hi Mr. Smith, as we discussed, could you send the assignment? Thanks, Dhruv", "banned_phrase"),
+    ("Hi Mr. Smith, could you leverage the portal to send it? Thanks, Dhruv", "inflated_vocab"),
+    ("Hi Mr. Smith, I'm thrilled to ask, could you send it? Thanks, Dhruv", "fake_enthusiasm"),
+    ("Hi Mr. Smith, could you send it? Thanks so much in advance, Dhruv", "excessive_gratitude"),
+    ("Hi Mr. Smith, could you send it?\n\nWarmest,\nDhruv", "weird_signoff"),
+    ("Hi Mr. Smith, could you send it?\n\nLooking forward to hearing from you,\nDhruv", "weird_signoff"),
+    ("Hi Mr. Smith, gotta get that assignment, can you send it? Thanks, Dhruv", "tone_mismatch"),
+    ("Hi Mr. Smith, could you send the Lincoln High packet? Thanks, Dhruv", "invented_entity"),
+    ("Hi Mr. Smith, per our call last week, could you resend it? Thanks, Dhruv", "invented_context"),
+])
+def test_evasions_are_caught(body, code):
+    assert code in _codes(body), (code, _codes(body))
+
+
+@pytest.mark.parametrize("subject", ["Following up", "Just checking in", "Touching base", "A quick question",
+                                     "Hi there", "FYI", "Quick update"])
+def test_generic_subjects_are_rejected(subject):
+    assert "generic_subject" in validate_email(subject, "Hi Mr. Smith, could you send it? Thanks, Dhruv", _B).codes()
+
+
+def test_grounded_numbers_survive_reformatting():
+    # a grounded phone/amount reformatted in the body is NOT flagged as invented
+    b = EmailBrief(sender_name="Dhruv", recipient_relationship=Relationship.support,
+                   purpose="billing question", requested_outcome="can you call me at 4155550198 about the $2500 charge",
+                   facts=("4155550198", "$2500"))
+    r = validate_email("Billing", "Hi, can you call me at (415) 555-0198 about the $2,500 charge? Thanks, Dhruv", b)
+    assert "invented_fact" not in r.codes(), r.codes()
+
+
+def test_word_quantity_grounding():
+    grounded = EmailBrief(sender_name="Dhruv", recipient_name="Mr. Smith", recipient_relationship=Relationship.teacher,
+                          purpose="essay length", requested_outcome="is it three pages", facts=("three pages",))
+    assert "invented_fact" not in validate_email("Essay", "Hi Mr. Smith, is it three pages? Thanks, Dhruv", grounded).codes()
+    ungrounded = EmailBrief(sender_name="Dhruv", recipient_name="Mr. Smith", recipient_relationship=Relationship.teacher,
+                            purpose="essay length", requested_outcome="how long is the essay")
+    assert "invented_fact" in validate_email("Essay", "Hi Mr. Smith, is it five pages? Thanks, Dhruv", ungrounded).codes()
+
+
+def test_wrong_recipient_is_flagged():
+    b = EmailBrief(sender_name="Dhruv", recipient_name="Mr. Smith", recipient_relationship=Relationship.teacher,
+                   purpose="homework", requested_outcome="could you send the assignment")
+    assert "wrong_recipient" in validate_email("Homework", "Hi Ms. Jones, could you send it? Thanks, Dhruv", b).codes()
+
+
+def test_whitespace_sender_does_not_crash():
+    b = EmailBrief(sender_name="   ", recipient_relationship=Relationship.support,
+                   purpose="refund", requested_outcome="can you refund order 12")
+    r = validate_email("Refund", "Hi, can you refund order 12?", b)     # must return a report, never raise
+    assert isinstance(r.codes(), tuple)
+
+
+# --- floor is genuinely self-consistent even for adversarial briefs -------------------------------
+
+@pytest.mark.parametrize("brief", [
+    EmailBrief(sender_name="Dhruv", recipient_name="Mr. Smith", recipient_relationship=Relationship.teacher,
+               purpose="i hope this finds you well and wanted to reach out",   # banned filler in the fields
+               requested_outcome="kindly send the assignment at your earliest convenience"),
+    EmailBrief(sender_name="Dhruv", recipient_name="Coach", recipient_relationship=Relationship.coach,
+               purpose="scheduling", requested_outcome="can we move practice — is 5 ok"),   # em dash in a field
+    EmailBrief(sender_name="Dhruv", recipient_name="Priya", recipient_relationship=Relationship.professional,
+               purpose="update", requested_outcome="here is my status",
+               source_context="First I finished the report. Then I reviewed the data. After that I checked the "
+               "numbers. Then I wrote the summary. Then I proofread it. Then I formatted it. Then I sent it."),  # long
+    EmailBrief(sender_name="Dhruv", recipient_name="Priya", recipient_relationship=Relationship.professional,
+               purpose="resume", requested_outcome="see attached resume", source_context="I attached the file"),  # false attach
+    EmailBrief(sender_name="Dhruv", recipient_name="Sam", recipient_relationship=Relationship.peer,
+               purpose="", requested_outcome=""),   # empty fields -> must not emit a generic subject
+])
+def test_floor_stays_clean_on_adversarial_briefs(brief):
+    from bruce_engine.email_quality import is_generic_subject
+    composed = _run(email_compose.compose_email(brief))
+    assert composed.report.ok, composed.report.codes()
+    assert "—" not in composed.subject + composed.body
+    assert not is_generic_subject(composed.subject), composed.subject
+
+
+def test_correction_less_stiff_and_multi_clause():
+    p = UserWritingProfile(formality=4)
+    stiff = apply_correction(p, "make it less stiff")
+    assert stiff.understood and stiff.profile.formality == 3
+    combo = apply_correction(p, "make it warmer but keep it professional")
+    joined = " ".join(combo.directives).lower()
+    assert "warmer" in joined and "professional" in joined       # neither half dropped
+
+
+def test_persist_only_on_standing_request():
+    p = UserWritingProfile(formality=4)
+    assert apply_correction(p, "make it less formal").persist is False
+    assert apply_correction(p, "always keep it less formal").persist is True
+    assert apply_correction(p, "i always struggle to sound less formal").persist is False   # incidental 'always'
+
+
+def test_for_recipient_unions_disliked_phrases():
+    p = UserWritingProfile(disliked_phrases=("circle back",),
+                           recipient_style={"prof": {"formality": 5, "disliked_phrases": ("touch base",)}})
+    r = p.for_recipient("prof")
+    assert r.formality == 5 and set(r.disliked_phrases) == {"circle back", "touch base"}

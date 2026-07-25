@@ -39,24 +39,35 @@ class UserWritingProfile:
     recipient_style: dict = field(default_factory=dict)   # {recipient_key: {field: value}} overrides
 
     def for_recipient(self, recipient_key: str | None) -> "UserWritingProfile":
-        """Fold a recipient-specific override (e.g. always formal with 'coach_smith') over the base profile."""
+        """Fold a recipient-specific override (e.g. always formal with 'coach_smith') over the base profile.
+        disliked_phrases UNIONS (a recipient override never drops the user's global never-use list)."""
         if not recipient_key:
             return self
         ov = self.recipient_style.get(recipient_key) or {}
         if not ov:
             return self
-        base = {k: v for k, v in self.__dict__.items() if k not in ("recipient_style",)}
-        base.update({k: v for k, v in ov.items() if k in base})
+        base = {k: v for k, v in self.__dict__.items() if k != "recipient_style"}
+        base.update({k: v for k, v in ov.items() if k in base and k != "disliked_phrases"})
+        if ov.get("disliked_phrases"):
+            base["disliked_phrases"] = tuple(dict.fromkeys((*self.disliked_phrases, *ov["disliked_phrases"])))
         return replace(self, **base)
 
     def to_dict(self) -> dict:
-        return {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.__dict__.items()}
+        d = {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.__dict__.items()}
+        # deep-convert tuples nested inside recipient_style overrides so a JSONB round-trip is lossless
+        d["recipient_style"] = {rk: {k: (list(v) if isinstance(v, tuple) else v) for k, v in (ov or {}).items()}
+                                for rk, ov in (self.recipient_style or {}).items()}
+        return d
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "UserWritingProfile":
         d = dict(d or {})
-        if "disliked_phrases" in d and d["disliked_phrases"] is not None:
+        if d.get("disliked_phrases") is not None:
             d["disliked_phrases"] = tuple(d["disliked_phrases"])
+        if d.get("recipient_style"):
+            d["recipient_style"] = {rk: ({**ov, "disliked_phrases": tuple(ov["disliked_phrases"])}
+                                         if ov.get("disliked_phrases") is not None else dict(ov))
+                                    for rk, ov in d["recipient_style"].items()}
         allowed = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in d.items() if k in allowed})
 
@@ -86,7 +97,10 @@ async def save_writing_profile(user_id: UUID, profile: UserWritingProfile) -> No
 
 # --- corrections ("make it less formal", "sound more like me", "keep it short") -------------------
 
-_PERSIST_SIGNAL = re.compile(r"\b(always|from now on|going forward|every time|by default)\b", re.IGNORECASE)
+# a STANDING-preference request — an anchored directive, not an incidental "always" ("i always struggle")
+_PERSIST_SIGNAL = re.compile(
+    r"\b(from now on|going forward|by default|every time)\b|"
+    r"\balways\s+(keep|make|write|sound|be|use|sign|start|send|do|end|address)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -97,36 +111,54 @@ class CorrectionResult:
     understood: bool                   # False -> we could not map the instruction to a change
 
 
+def _match_clause(c: str, profile: UserWritingProfile, changes: dict, directives: list[str]) -> bool:
+    """Map ONE clause to a profile change / directive. Returns whether it matched anything known."""
+    def formality():
+        return changes.get("formality", profile.formality) or 3
+    hit = False
+    if re.search(r"\b(less formal|not (so |too )?formal|more casual|loosen|less stiff|not (so |too )?stiff)\b", c):
+        changes["formality"] = max(1, formality() - 1); directives.append("less formal, warmer, not stiff"); hit = True
+    if re.search(r"\b(more formal|too casual|more professional|more polished|keep it (professional|formal|polished)|"
+                 r"stay (professional|formal))\b", c):
+        directives.append("keep a polished, professional register")
+        if re.search(r"\b(more formal|too casual)\b", c):
+            changes["formality"] = min(5, formality() + 1)
+        hit = True
+    if re.search(r"\b(shorter|keep it short|too long|tighten|trim|concise|cut it down|brief)\b", c):
+        changes["sentence_length"] = "short"; directives.append("shorter, tighter"); hit = True
+    if re.search(r"\b(sound more like me|more like me|in my voice|my style|my own words)\b", c):
+        directives.append("match the user's own voice from their profile"); hit = True
+    if re.search(r"\b(less ai|don'?t (make it )?sound (like )?ai|not robotic|less generic|more human|"
+                 r"not so (formal|generic))\b", c):
+        directives.append("more human, remove any generic or AI-sounding phrasing"); hit = True
+    if re.search(r"\b(respectful but not stiff|polite but not stiff)\b", c):
+        directives.append("respectful but relaxed, not stiff"); hit = True
+    if re.search(r"\b(warmer|friendlier|nicer|kinder)\b", c):
+        directives.append("a touch warmer"); hit = True
+    if re.search(r"\b(more direct|get to the point|blunter|to the point)\b", c):
+        directives.append("more direct, lead with the ask"); hit = True
+    return hit
+
+
 def apply_correction(profile: UserWritingProfile, instruction: str) -> CorrectionResult:
-    """Map a natural correction to profile changes + recompose directives. Deterministic (no model): the
-    common corrections are recognized; anything else is passed through as a free directive for the composer."""
-    t = (instruction or "").lower()
+    """Map a natural correction to profile changes + recompose directives. Deterministic (no model). A
+    multi-part instruction ("warmer but keep it professional") is split so NO clause is silently dropped; an
+    unrecognized clause is passed to the composer verbatim. Persists ONLY on a standing-preference request."""
     changes: dict = {}
     directives: list[str] = []
     understood = False
+    clauses = [c.strip() for c in re.split(r"\b(?:but|and|while|also)\b|[,;]", instruction or "") if c.strip()]
+    for c in clauses:
+        if _match_clause(c.lower(), profile, changes, directives):
+            understood = True
+        elif not re.fullmatch(r"(?i)\s*(please|make it|can you|could you|it)\s*", c):
+            directives.append(c)                    # keep the clause's intent instead of dropping it
 
-    if re.search(r"\b(less formal|not (so |too )?formal|more casual|loosen)\b", t):
-        changes["formality"] = max(1, (profile.formality or 3) - 1); directives.append("less formal, warmer"); understood = True
-    if re.search(r"\b(more formal|too casual|more professional|more polished)\b", t):
-        changes["formality"] = min(5, (profile.formality or 3) + 1); directives.append("more polished"); understood = True
-    if re.search(r"\b(shorter|keep it short|too long|tighten|trim|concise|cut it down)\b", t):
-        changes["sentence_length"] = "short"; directives.append("shorter, tighter"); understood = True
-    if re.search(r"\b(sound more like me|more like me|in my voice|my style)\b", t):
-        directives.append("match the user's own voice from their profile"); understood = True
-    if re.search(r"\b(less ai|don'?t (make it )?sound (like )?ai|not robotic|less generic|more human)\b", t):
-        directives.append("more human, remove any generic or AI-sounding phrasing"); understood = True
-    if re.search(r"\b(respectful but not stiff|polite but not stiff|not stiff)\b", t):
-        directives.append("respectful but relaxed, not stiff"); understood = True
-    if re.search(r"\b(warmer|friendlier|nicer)\b", t):
-        directives.append("a touch warmer"); understood = True
-    if re.search(r"\b(more direct|get to the point|blunter)\b", t):
-        directives.append("more direct, lead with the ask"); understood = True
-
-    if not understood:
-        # unknown instruction -> hand it to the composer verbatim as a directive, don't silently drop it
-        directives.append(instruction.strip())
-
-    persist = bool(_PERSIST_SIGNAL.search(t)) and bool(changes)
+    persist = bool(_PERSIST_SIGNAL.search((instruction or "").lower())) and bool(changes)
     new_profile = replace(profile, **changes) if changes else profile
+    # dedupe directives, order-preserving
+    seen: dict = {}
+    for d in directives:
+        seen.setdefault(d, None)
     return CorrectionResult(profile=new_profile, persist=persist,
-                            directives=tuple(d for d in directives if d), understood=understood)
+                            directives=tuple(seen), understood=understood)
