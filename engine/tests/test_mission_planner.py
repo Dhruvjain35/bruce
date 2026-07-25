@@ -197,15 +197,19 @@ async def test_normal_inbound_reply_still_detected():
 
 # --- the notifier seam must not let a run claim an undelivered notification -----------------------
 
-def test_production_notifier_is_absent_so_no_run_claims_delivery():
+def test_production_notifier_is_the_relay_transport():
+    """C2: the seam is filled. A real transport now exists, so a finished mission actually reaches the
+    student instead of completing silently."""
     from bruce_engine import notifier
-    assert notifier.build_notifier() is None, (
-        "a do-nothing notifier would make PlanMissionAdvancer stamp notified=true for a message that was "
-        "never sent; None is the honest wiring until a transport is verified")
+    built = notifier.build_notifier()
+    assert isinstance(built, notifier.RelayNotifier)
 
 
-def test_notifier_flag_alone_cannot_claim_delivery(monkeypatch):
-    monkeypatch.setenv("BRUCE_MISSION_NOTIFIER", "1")
+def test_kill_switch_falls_back_to_no_claimed_delivery(monkeypatch):
+    """Throwing the kill switch must degrade to None, NOT to a do-nothing notifier: PlanMissionAdvancer
+    only stamps notified=true when a notifier is invoked, so None keeps a disabled transport from
+    recording deliveries that never happened."""
+    monkeypatch.setenv("BRUCE_MISSION_NOTIFIER_OFF", "1")
     from bruce_engine import notifier
-    assert notifier.transport_configured() is True
-    assert notifier.build_notifier() is None, "the flag must never be sufficient to claim delivery"
+    assert notifier.transport_configured() is False
+    assert notifier.build_notifier() is None

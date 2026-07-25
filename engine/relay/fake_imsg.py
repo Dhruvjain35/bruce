@@ -29,6 +29,8 @@ class InProcessImsg:
       send_rejects      -- first N sends raise ImsgSendRejected  (DEFINITE pre-handoff decline -> retryable)
       exit_before_handoff -- raise ImsgSendRejected              (child gone before dispatch -> retryable)
       crash_unknown     -- raise a generic transport error       (AMBIGUOUS handoff -> unknown)
+      no_guid           -- RETURN None instead of a guid         (imsg answered but gave no confirmation:
+                           ambiguous, never a silent success — exercises the relay's `if not guid` branch)
       crash_after_handoff_hook -- called AFTER the bytes are recorded as sent but the guid is not returned
                                   (simulates a crash right after imsg accepted -> ambiguous to the relay)
       send_raises / send_fails -- generic errors (ambiguous), kept for existing tests
@@ -36,7 +38,7 @@ class InProcessImsg:
 
     def __init__(self, events: list[dict] | None = None, *, send_fails: int = 0,
                  send_raises: bool = False, send_rejects: int = 0, exit_before_handoff: bool = False,
-                 crash_unknown: bool = False) -> None:
+                 crash_unknown: bool = False, no_guid: bool = False) -> None:
         self._events = list(events or [])
         self.sent: list[dict] = []
         self.calls = 0                     # TOTAL send_text invocations (incl. failures) — for "sent exactly once"
@@ -46,6 +48,7 @@ class InProcessImsg:
         self._send_rejects = send_rejects  # first N raise ImsgSendRejected (definite pre-handoff)
         self._exit_before_handoff = exit_before_handoff
         self._crash_unknown = crash_unknown
+        self._no_guid = no_guid            # answered without a confirmation guid -> ambiguous, not success
         self.crash_after_handoff_hook = None   # optional callable(): raise AFTER recording the handoff
         self._guid = 0
 
@@ -72,6 +75,10 @@ class InProcessImsg:
         if self._send_fails > 0:
             self._send_fails -= 1
             raise RuntimeError("imsg send transient")
+        if self._no_guid:
+            # imsg answered, but without a confirmation guid. The bytes MAY have gone, so the relay must
+            # treat this as ambiguous rather than success — and must not resend.
+            return None
         self._guid += 1
         guid = f"fake-out-{self._guid}"
         self.sent.append({"to": to, "text": text, "guid": guid})   # bytes accepted (recorded here)
