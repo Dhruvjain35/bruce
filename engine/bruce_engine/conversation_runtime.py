@@ -272,11 +272,19 @@ class _Runtime:
             except Exception:
                 # A model/backend glitch is OUR fault, not the image's. Never say "couldn't read that" for
                 # a healthy photo (the exact false-negative we're fixing) — own it and ask for a retry.
-                reply = _FALLBACK
+                # If a MISSION already ran this turn, its outcome outranks the glitch: a verified send
+                # followed by a reasoner error must not tell the student "something glitched" while a
+                # real email is already in their inbox and monitoring is running.
+                reply = mission_planner.reply_for(mission_plan) or _FALLBACK
                 await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
                                      decision=None, intent="unsupported")
-                log.info("conv_model_error pmid=%s", pmid)
-                return InboundOutcome(status="model_error", user_id=user_id)
+                log.info("conv_model_error pmid=%s mission=%s", pmid,
+                         mission_plan.status if mission_plan else None)
+                return InboundOutcome(
+                    status="model_error", user_id=user_id,
+                    mission_run_id=(mission_plan.run_id if mission_plan and mission_plan.enqueued else None),
+                    mission_status=(mission_plan.status if mission_plan else None),
+                    shortlisted_capabilities=shortlisted)
 
             decision = rr.decision
 
@@ -288,13 +296,31 @@ class _Runtime:
                                                   profile=profile, channel=ch, user_id=user_id, pmid=pmid)
         except conversation_outcomes.OutcomeCollision:
             log.error("conv_outcome_collision pmid=%s", pmid)      # loud; details already logged, no content
-            await self._finalize(user_id, ch, ident, pmid, _FALLBACK, reply_target,
+            await self._finalize(user_id, ch, ident, pmid,
+                                 mission_planner.reply_for(mission_plan) or _FALLBACK, reply_target,
                                  decision=None, intent="unsupported")
-            return InboundOutcome(status="outcome_collision", user_id=user_id)
+            return InboundOutcome(
+                status="outcome_collision", user_id=user_id,
+                mission_run_id=(mission_plan.run_id if mission_plan and mission_plan.enqueued else None),
+                mission_status=(mission_plan.status if mission_plan else None))
 
         # P0.5 capability-truth guard: never let a model reply DENY a capability that is actually live.
         # Cheap regex first; only pay for the connection lookup when the reply reads like a calendar denial.
         reply_out = outcome.reply
+
+        # C1/D: when a MISSION lane ran, the runtime's own outcome decides the words, not the reasoner.
+        # The reasoner writes without knowing what was executed, and that produced BOTH live failures we
+        # have seen: a cheerful "i've got it" for work never started, and "i can't send emails from here"
+        # for a mission that had just sent a verified email and enqueued monitoring. A state-grounded
+        # reply cannot contradict the run, in either direction.
+        if mission_plan is not None:
+            grounded = mission_planner.reply_for(mission_plan)
+            if grounded:
+                if grounded != reply_out:
+                    log.info("mission_reply_grounded pmid=%s status=%s enqueued=%s verified=%s",
+                             pmid, mission_plan.status, mission_plan.enqueued,
+                             mission_plan.verified_send)
+                reply_out = grounded
         if capability_truth.mentions_calendar_denial(reply_out):
             from . import oauth_google
             try:
