@@ -61,7 +61,8 @@ class _GmailAPI:
             mid = f"m_{self.sends}"
             self.sent[mid] = {"id": mid, "threadId": self.thread, "labelIds": ["SENT"],
                               "payload": {"headers": [{"name": "To", "value": "coach@school.edu"},
-                                                      {"name": "Subject", "value": "hi"}]}}
+                                                      {"name": "Subject", "value": "hi"},
+                                                      {"name": "Message-Id", "value": f"<{mid}@mail.gmail.com>"}]}}
             return httpx.Response(200, json={"id": mid, "threadId": self.thread})
         if m == "GET" and "/messages/" in p:
             mid = p.rsplit("/", 1)[-1]
@@ -73,7 +74,9 @@ class _GmailAPI:
             msgs = list(self.sent.values()) + [
                 {"id": "in_1", "threadId": self.thread, "labelIds": ["INBOX"],
                  "payload": {"headers": [{"name": "From", "value": "coach@school.edu"},
-                                         {"name": "Subject", "value": "re: hi"}]}}]
+                                         {"name": "Subject", "value": "re: hi"},
+                                         {"name": "Message-Id", "value": "<in1@school.edu>"},
+                                         {"name": "In-Reply-To", "value": "<m_1@mail.gmail.com>"}]}}]
             return httpx.Response(200, json={"messages": msgs})
         return httpx.Response(404, json={})
 

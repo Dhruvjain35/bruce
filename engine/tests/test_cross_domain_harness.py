@@ -165,7 +165,9 @@ def test_background_mission_through_shared_runner():
     _run(runner.drain())
     assert adapter.send_calls == 1 and calls == []                                                    # 16 (sent, waiting, silent)
     tid = next(iter(adapter.messages.values()))["threadId"]
-    adapter.inject_incoming(tid, from_addr="coach@school.edu", subject="re: q", body="sure")
+    sent_id = next(k for k, v in adapter.messages.items() if "SENT" in v["labelIds"])
+    adapter.inject_incoming(tid, from_addr="coach@school.edu", subject="re: q", body="sure",
+                            in_reply_to=adapter.rfc_of(sent_id))
     _run(agent_run_store.reschedule_background(uid, rid, next_run_at=datetime.now(timezone.utc) - timedelta(seconds=1)))
     _run(runner.drain())
     assert len(calls) == 1                                                                            # 17 (one notification)

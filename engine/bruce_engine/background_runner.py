@@ -119,9 +119,14 @@ class PlanMissionAdvancer:
             if not thread_id:
                 raise MissionStepFailed("await_reply has no thread to watch")
             polls = int(cp.get("polls", 0))
+            # replies this mission has ALREADY acted on: a crash between detecting and checkpointing must
+            # not let the same message be discovered again and notified twice.
+            consumed = tuple(v.get("reply_id") for v in (cp.get("results") or {}).values()
+                             if isinstance(v, dict) and v.get("reply_id"))
             read = NextAction(type=ActionType.call_tool, capability="gmail.find_reply", provider="gmail",
                               operation="find_reply",
-                              arguments={"thread_id": thread_id, "after_message_id": after_id})
+                              arguments={"thread_id": thread_id, "after_message_id": after_id,
+                                         "consumed_reply_ids": list(consumed)})
             tr = await self.executor.execute(uid, read, idempotency_key=f"{rid}:step{idx}:poll{polls}")
             if tr.read_back:                                    # a reply arrived -> advance to the notify/next step
                 cp["polls"] = 0

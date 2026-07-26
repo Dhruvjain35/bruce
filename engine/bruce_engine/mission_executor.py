@@ -60,7 +60,9 @@ class MissionExecutor:
             # reply (or None), which the advancer inspects to decide continue-vs-keep-waiting.
             a = action.arguments or {}
             adapter = self._adapter or gmail_adapter.real_adapter(user_id)
-            reply = await adapter.find_reply(a.get("thread_id"), after_message_id=a.get("after_message_id"))
+            reply = await adapter.find_reply(
+                a.get("thread_id"), after_message_id=a.get("after_message_id"),
+                consumed_reply_ids=tuple(a.get("consumed_reply_ids") or ()))
             return ToolResult(ToolOutcome.ok, cap, "gmail", "find_reply", verified=False, read_back=reply)
         # No other capability is background-executable yet.
         return ToolResult(ToolOutcome.provider_error, cap, action.provider or "", action.operation or "",
