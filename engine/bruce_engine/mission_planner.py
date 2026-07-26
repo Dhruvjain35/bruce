@@ -67,6 +67,10 @@ class MissionPlan:
     subject: str | None = None
     body: str | None = None
     already_existed: bool = False
+    # The broker's shortlist for this turn. Carried out so the runtime can report WHICH tools were
+    # offered on a mission path — the runtime only surfaces its own shortlist for direct/foreground
+    # lanes, so without this a mission's capability truth would be invisible from outside.
+    shortlisted: tuple[str, ...] = ()
 
 
 def is_enqueueable(decision) -> bool:
@@ -124,6 +128,7 @@ async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: s
     sl = await tool_broker.shortlist(user_id, domain=decision.domain, action=decision.action,
                                      candidate_capabilities=decision.candidate_capabilities
                                      or (SEND_CAPABILITY,))
+    shortlisted = tuple(c.capability for c in sl.candidates)
     cand = next((c for c in sl.actionable() if c.capability == SEND_CAPABILITY), None)
     if cand is None:
         status = "no_tool"
@@ -135,14 +140,16 @@ async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: s
             status = "unsupported"
         elif sl.candidates:
             status = sl.candidates[0].status
-        return MissionPlan(False, status, reason="send capability is not actionable for this user")
+        return MissionPlan(False, status, reason="send capability is not actionable for this user",
+                           shortlisted=shortlisted)
 
     # 2. recipient — explicit or the student's own account; never invented.
     to, how = await resolve_recipient(user_id, text)
     if not to:
         return MissionPlan(False, "no_recipient",
                            reason="no address in the message and no connected account to fall back to"
-                           if how == "self_unknown" else "no recipient could be resolved from the message")
+                           if how == "self_unknown" else "no recipient could be resolved from the message",
+                           shortlisted=shortlisted)
 
     # 3. body — through the quality layer, so the validator (and the no-em-dash rule) governs this path too.
     profile = await email_voice.get_writing_profile(user_id)
@@ -162,7 +169,7 @@ async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: s
                         operation="send_message", arguments=args, risk=Risk.medium)
     ok, why = planner.validate_action(action, sl)
     if not ok:
-        return MissionPlan(False, "invalid", reason=why)
+        return MissionPlan(False, "invalid", reason=why, shortlisted=shortlisted)
 
     # 5. exactly-once enqueue. A duplicate key returns the EXISTING run instead of queuing a second send.
     goal = build_steps(args)
@@ -172,7 +179,7 @@ async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: s
     log.info("mission_enqueued user=%s run=%s recipient_kind=%s existed=%s", user_id, run.get("id"),
              how, existed)
     return MissionPlan(True, "ok", run_id=str(run.get("id")), to=to, subject=composed.subject,
-                       body=composed.body, already_existed=existed)
+                       body=composed.body, already_existed=existed, shortlisted=shortlisted)
 
 
 def mission_idempotency_key(channel: str, provider_message_id: str) -> str:

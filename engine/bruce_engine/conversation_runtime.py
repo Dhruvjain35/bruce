@@ -183,8 +183,13 @@ class _Runtime:
                     user_id, rd, text=msg.text or "",
                     idempotency_key=mission_planner.mission_idempotency_key(ch, pmid))
                 mission_plan = plan
-                log.info("mission_plan pmid=%s enqueued=%s status=%s run=%s existed=%s",
-                         pmid, plan.enqueued, plan.status, plan.run_id, plan.already_existed)
+                # surface the broker's shortlist for the MISSION lane too: the block above only computes
+                # one for direct/foreground, so without this a mission's capability truth is invisible.
+                if plan.shortlisted:
+                    shortlisted = plan.shortlisted
+                log.info("mission_plan pmid=%s enqueued=%s status=%s run=%s existed=%s caps=%s",
+                         pmid, plan.enqueued, plan.status, plan.run_id, plan.already_existed,
+                         list(plan.shortlisted))
         except Exception:
             log.info("router_error pmid=%s", pmid)     # classification never blocks a reply
             authoritative_decision = None
