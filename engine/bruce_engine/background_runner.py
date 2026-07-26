@@ -109,9 +109,13 @@ class PlanMissionAdvancer:
             # WAIT for an inbound reply in the thread a prior send opened. This is a POLL, not a busy loop: each
             # due tick does ONE cheap read (no model), and if no reply is in yet it reschedules and yields — so
             # a run can sleep for hours across worker restarts without holding a lease or spending a model call.
+            # The thread may come from a PRIOR STEP in this mission, or be handed in directly when the
+            # send already happened INSIDE the turn (the acknowledgement can only claim "sent" after a
+            # verified send, so the send is not a mission step in that shape — the mission is pure wait).
             src = str(step.get("from_step", idx - 1))
             prior = (cp.get("results") or {}).get(src) or {}
-            thread_id, after_id = prior.get("thread_id"), prior.get("message_id")
+            thread_id = step.get("thread_id") or prior.get("thread_id")
+            after_id = step.get("after_message_id") or prior.get("message_id")
             if not thread_id:
                 raise MissionStepFailed("await_reply has no thread to watch")
             polls = int(cp.get("polls", 0))

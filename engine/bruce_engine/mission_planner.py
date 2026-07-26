@@ -11,9 +11,17 @@ Invariants this module holds (each one is a test):
     the built action is re-validated with `planner.validate_action`, so a mission can only ever contain a
     tool the broker actually offered AND marked actionable for THIS user. If nothing is actionable the
     mission is NOT enqueued and the broker's honest status is returned instead.
-  * EXACTLY-ONCE ENQUEUE. The idempotency key is derived from the inbound message, and `create_run` treats
-    a duplicate key as a reference to the existing run. A webhook redelivery, a retry, or the student
-    sending the same text twice resolves to the SAME run — never a second email.
+  * THE SEND HAPPENS INSIDE THE TURN, VERIFIED, BEFORE ANY ACKNOWLEDGEMENT. Bruce may only say "sent"
+    once a real message went out AND read-back verification passed, so the send cannot be a future
+    mission step. It runs through `agent_loop.run_direct_action` (its own AgentRun, the same verification
+    a direct action gets) and the mission that follows is PURE MONITORING. A mission retry therefore
+    cannot re-send: there is no send left in it.
+  * NOTHING DURABLE SURVIVES A FAILED SEND. If the send does not verify, no mission is enqueued and the
+    caller is told exactly that. If the send verifies but the enqueue fails, that is reported as its own
+    state — the mail really did go, so claiming otherwise would be a second kind of lie.
+  * EXACTLY-ONCE. The idempotency key is derived from the inbound message: `create_run` treats a duplicate
+    key as a reference to the existing run, and the send's key (`<key>:send`) makes a retried turn resolve
+    to the SAME Gmail message. A webhook redelivery cannot produce a second email or a second mission.
   * NO FABRICATED RECIPIENT. An address is used only when it is explicit in the text or is the student's
     own connected account. An unresolved recipient returns `no_recipient`; it never guesses.
   * THE QUALITY LAYER IS ON THIS PATH. Bodies are built by `email_compose.compose_email`, so the validator
@@ -71,6 +79,12 @@ class MissionPlan:
     # offered on a mission path — the runtime only surfaces its own shortlist for direct/foreground
     # lanes, so without this a mission's capability truth would be invisible from outside.
     shortlisted: tuple[str, ...] = ()
+    # Set only after a REAL send that read-back verified. `verified_send` is what entitles a reply to use
+    # the word "sent"; enqueue_failed carries it True so the student is told the mail went but the
+    # monitoring did not start, rather than one lie in either direction.
+    message_id: str | None = None
+    thread_id: str | None = None
+    verified_send: bool = False
 
 
 def is_enqueueable(decision) -> bool:
@@ -99,19 +113,26 @@ async def resolve_recipient(user_id: UUID, text: str) -> tuple[str | None, str]:
     return None, "unresolved"
 
 
-def build_steps(action_args: dict) -> dict:
-    """The mission plan the BackgroundRunner already knows how to drive: send, then wait for a real reply,
-    then notify exactly once. `await_reply` is a poll, not a busy loop — no model call while waiting."""
-    return {
-        "steps": [
-            {"kind": "action",
-             "action": {"capability": SEND_CAPABILITY, "provider": "gmail", "operation": "send_message",
-                        "arguments": dict(action_args)}},
-            {"kind": "await_reply", "from_step": 0, "poll_seconds": POLL_SECONDS, "max_polls": MAX_POLLS},
-        ],
-        "notify": True,
-        "to": action_args.get("to"),
-    }
+# A self-addressed request to be told about the reply IS its own purpose: the student is asking for
+# something they can reply to. Nothing is invented. Any other recipient needs a stated ask.
+_ROUNDTRIP = re.compile(r"\b(when|if)\s+i\s+(reply|respond|answer|write\s+back)\b|\bround.?trip\b",
+                        re.IGNORECASE)
+
+
+def derive_intent(text: str, how: str) -> tuple[str, str] | None:
+    """(purpose, requested_outcome) for the email, or None when the purpose is NOT derivable.
+
+    None is the honest answer for "email coach smith and tell me when he replies": Bruce knows who to
+    write to and nothing about what to say, and inventing a message a real person will read is worse
+    than asking. A self-send round-trip is the one case where the request states its own content.
+    """
+    body = text or ""
+    if how == "self" and _ROUNDTRIP.search(body):
+        return ("a quick check that mail from Bruce reaches you",
+                "reply to this so i know it arrived")
+    if how == "self":
+        return ("a note to yourself", "reply to this so i know it arrived")
+    return None
 
 
 async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: str,
@@ -151,19 +172,22 @@ async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: s
                            if how == "self_unknown" else "no recipient could be resolved from the message",
                            shortlisted=shortlisted)
 
-    # 3. body — through the quality layer, so the validator (and the no-em-dash rule) governs this path too.
+    # 3. WHAT should the email say? Never invent content aimed at a real person. A self-addressed
+    # round-trip request carries its own purpose ("send me something I can reply to"), so that IS
+    # derivable. Anything else without a stated ask returns needs_content and the student is asked.
+    intent = derive_intent(text, how)
+    if intent is None:
+        return MissionPlan(False, "needs_content", to=to, shortlisted=shortlisted,
+                           reason="no derivable purpose for a real recipient; ask rather than invent")
+
     profile = await email_voice.get_writing_profile(user_id)
     brief = EmailBrief(
         sender_name=sender_name or profile.sender_name or "",
         recipient_relationship=Relationship.peer if how == "self" else Relationship.professional,
-        purpose="a message the student asked Bruce to send",
-        requested_outcome="reply to this so I know it reached you",
-        recipient_email=to,
-        source_context=text or None,
-    )
+        purpose=intent[0], requested_outcome=intent[1], recipient_email=to)
     composed = await email_compose.compose_email(brief, profile=profile)
 
-    # 4. fail closed against the broker's own compact schema before anything durable is written.
+    # 4. fail closed against the broker's own compact schema before anything is sent.
     args = {"to": to, "subject": composed.subject, "body": composed.body}
     action = NextAction(type=ActionType.call_tool, capability=SEND_CAPABILITY, provider="gmail",
                         operation="send_message", arguments=args, risk=Risk.medium)
@@ -171,15 +195,74 @@ async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: s
     if not ok:
         return MissionPlan(False, "invalid", reason=why, shortlisted=shortlisted)
 
-    # 5. exactly-once enqueue. A duplicate key returns the EXISTING run instead of queuing a second send.
-    goal = build_steps(args)
-    run = await agent_run_store.enqueue_background(user_id, domain="gmail", goal=goal,
-                                                   idempotency_key=idempotency_key)
-    existed = str(run.get("status")) not in {"queued"} or bool(run.get("recovery_state"))
-    log.info("mission_enqueued user=%s run=%s recipient_kind=%s existed=%s", user_id, run.get("id"),
-             how, existed)
+    # 5. SEND NOW, VERIFIED, INSIDE THE TURN. The acknowledgement is allowed to say "sent" only after a
+    # real send that read-back verified, so the send cannot be a future mission step — it has to have
+    # already happened by the time we reply. run_direct_action gives the send its own AgentRun and the
+    # same read-back verification a direct action gets; the idempotency key makes a retried turn resolve
+    # to the SAME message instead of mailing twice.
+    from . import agent_loop
+    from .gmail_executor import GmailSendExecutor
+    send_key = f"{idempotency_key}:send"
+    ex = GmailSendExecutor(to=to, subject=composed.subject, body=composed.body, idempotency_key=send_key)
+    res = await agent_loop.run_direct_action(user_id, executor=ex, idempotency_key=send_key)
+    if not res.verified:
+        # NOTHING durable is created: no mission, no monitoring, and the caller says so plainly.
+        log.warning("mission_send_unverified user=%s outcome=%s reason=%s", user_id,
+                    res.tool_result.outcome.value, res.tool_result.reason)
+        return MissionPlan(False, "send_failed", to=to, shortlisted=shortlisted,
+                           reason=res.tool_result.reason or "gmail send was not verified")
+
+    message_id = res.tool_result.provider_entity_id
+    thread_id = (res.tool_result.read_back or {}).get("threadId") or message_id
+
+    # 6. only NOW enqueue the durable wait. The mission is pure monitoring — the send already happened,
+    # so a mission retry can never re-send. Exactly-once on the inbound message's key.
+    goal = {"steps": [{"kind": "await_reply", "thread_id": thread_id, "after_message_id": message_id,
+                       "poll_seconds": POLL_SECONDS, "max_polls": MAX_POLLS}],
+            "notify": True, "to": to}
+    try:
+        run = await agent_run_store.enqueue_background(user_id, domain="gmail", goal=goal,
+                                                       idempotency_key=idempotency_key)
+    except Exception as exc:
+        # The email really did go out, so we must NOT pretend monitoring started.
+        log.exception("mission_enqueue_failed_after_verified_send user=%s msg=%s", user_id, message_id)
+        return MissionPlan(False, "enqueue_failed", to=to, shortlisted=shortlisted,
+                           message_id=message_id, thread_id=thread_id, verified_send=True,
+                           reason=f"send verified but enqueue failed: {exc}")
+
+    existed = bool(run.get("recovery_state"))
+    log.info("mission_enqueued user=%s run=%s recipient_kind=%s msg=%s existed=%s", user_id,
+             run.get("id"), how, message_id, existed)
     return MissionPlan(True, "ok", run_id=str(run.get("id")), to=to, subject=composed.subject,
-                       body=composed.body, already_existed=existed, shortlisted=shortlisted)
+                       body=composed.body, already_existed=existed, shortlisted=shortlisted,
+                       message_id=message_id, thread_id=thread_id, verified_send=True)
+
+
+def reply_for(plan: MissionPlan) -> str | None:
+    """The student-facing reply, derived ENTIRELY from what actually happened.
+
+    This exists because the reasoner writes replies without knowing what the runtime did, which produced
+    both failure modes we have now seen live: a cheerful "i've got it" for work that was never started,
+    and "i can't send emails from here" for a mission that had just been enqueued. When a mission lane
+    ran, its outcome — not a model — decides the words.
+    """
+    if plan is None or plan.status == "not_a_mission":
+        return None
+    if plan.enqueued and plan.verified_send:
+        return "sent. i'll text u when ur reply comes in"
+    if plan.status == "send_failed":
+        return "gmail didn't send it, so i'm not waiting on a reply yet"
+    if plan.status == "enqueue_failed":
+        return "the email sent, but reply tracking didn't start. i'm fixing that"
+    if plan.status == "needs_content":
+        return "what do u want the email to say?"
+    if plan.status == "no_recipient":
+        return "who should i email? give me their address and i'll send it"
+    if plan.status == "insufficient_scope":
+        return "i don't have permission to send from ur gmail yet, so i can't start that"
+    if plan.status in {"disconnected", "no_tool", "unsupported"}:
+        return "ur gmail isn't connected here yet, so i can't send that"
+    return "i couldn't start that, so i'm not going to say i did"
 
 
 def mission_idempotency_key(channel: str, provider_message_id: str) -> str:

@@ -95,14 +95,28 @@ async def test_self_reference_with_unknown_account_refuses(monkeypatch):
 
 # --- the mission plan shape the runner already knows how to drive ---------------------------------
 
-def test_steps_are_send_then_wait_then_notify_with_no_model_in_the_wait():
-    goal = mission_planner.build_steps({"to": "a@b.com", "subject": "s", "body": "b"})
-    kinds = [s["kind"] for s in goal["steps"]]
-    assert kinds == ["action", "await_reply"]
-    assert goal["notify"] is True
-    wait = goal["steps"][1]
-    assert wait["from_step"] == 0 and wait["poll_seconds"] >= 60      # a poll, never a busy loop
-    assert goal["steps"][0]["action"]["capability"] == "gmail.send_message"
+def test_derive_intent_never_invents_content_for_a_real_person():
+    """A self-addressed round-trip request states its own purpose. An email aimed at someone else with no
+    stated ask returns None, so the student is asked instead of a real person receiving invented text."""
+    assert mission_planner.derive_intent("email me and tell me when i reply", "self") is not None
+    assert mission_planner.derive_intent("email me the notes", "self") is not None
+    assert mission_planner.derive_intent("email coach smith and tell me when he replies", "explicit") is None
+
+
+def test_reply_is_derived_from_what_actually_happened():
+    """The words come from the run, never a model. Both live failure modes are pinned: a work claim with
+    no work, and a denial for work that succeeded."""
+    from bruce_engine.mission_planner import MissionPlan, reply_for
+    assert reply_for(MissionPlan(True, "ok", verified_send=True)) == "sent. i'll text u when ur reply comes in"
+    assert reply_for(MissionPlan(False, "send_failed")) == \
+        "gmail didn't send it, so i'm not waiting on a reply yet"
+    assert reply_for(MissionPlan(False, "enqueue_failed", verified_send=True)) == \
+        "the email sent, but reply tracking didn't start. i'm fixing that"
+    assert reply_for(MissionPlan(False, "needs_content")) == "what do u want the email to say?"
+    assert reply_for(MissionPlan(False, "not_a_mission")) is None      # non-mission turns untouched
+    # a plan that did NOT send can never produce the word "sent"
+    for st in ("send_failed", "needs_content", "no_recipient", "disconnected", "insufficient_scope"):
+        assert "sent." not in reply_for(MissionPlan(False, st))
 
 
 def test_idempotency_key_is_one_mission_per_inbound_message():
