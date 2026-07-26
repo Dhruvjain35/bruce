@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from email.message import EmailMessage
 from typing import Protocol
@@ -75,11 +76,33 @@ class GmailAdapter(Protocol):
     async def get(self, message_id: str) -> dict | None: ...              # NORMALIZED, never raw google
     async def get_thread(self, thread_id: str) -> list[dict]: ...
     async def find_reply(self, thread_id: str, *, after_message_id: str,
-                         own_message_ids: tuple[str, ...] = ()) -> dict | None: ...
+                         own_message_ids: tuple[str, ...] = (),
+                         consumed_reply_ids: tuple[str, ...] = ()) -> dict | None: ...
+
+
+# RFC Message-IDs look like <abc@host>; addresses are extracted from display-name headers.
+_MSGID_RE = re.compile(r"<[^<>@\s]+@[^<>\s]+>")
+_ADDR_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def _addrs(value: str | None) -> set[str]:
+    """The bare addresses in a header value ("Mr Smith <a@b.com>, c@d.com" -> {a@b.com, c@d.com})."""
+    return {a.lower() for a in _ADDR_RE.findall(value or "")}
+
+
+def _ref_ids(value: str | None) -> set[str]:
+    """RFC Message-IDs inside an In-Reply-To / References header (angle-bracketed, space separated)."""
+    return {m.strip().lower() for m in _MSGID_RE.findall(value or "")}
 
 
 def _normalize(raw: dict) -> dict:
-    """The ONE place Gmail field names live. A normalized message: id/threadId/labels/to/from/subject/snippet."""
+    """The ONE place Gmail field names live.
+
+    RFC threading headers are part of the contract, not decoration: a Gmail message id is a STORAGE id,
+    and a self-send produces two stored messages (the sent copy and its delivered twin) that share ONE
+    RFC Message-ID. Reply detection is therefore an RFC-header question, and normalizing those headers
+    here is what lets `find_reply` answer it without re-fetching.
+    """
     headers = {h.get("name", "").lower(): h.get("value", "") for h in
                (raw.get("payload", {}).get("headers") or [])}
     return {
@@ -87,7 +110,65 @@ def _normalize(raw: dict) -> dict:
         "labelIds": list(raw.get("labelIds") or []),
         "to": headers.get("to"), "from": headers.get("from"), "subject": headers.get("subject"),
         "marker": headers.get(_IDEM_HEADER.lower()), "snippet": raw.get("snippet"),
+        # RFC threading identity
+        "rfc_message_id": (headers.get("message-id") or "").strip().lower() or None,
+        "in_reply_to": headers.get("in-reply-to"),
+        "references": headers.get("references"),
+        "date": headers.get("date"),
+        "internal_date": raw.get("internalDate"),
     }
+
+
+def select_reply(messages: list[dict], *, after_message_id: str,
+                 own_message_ids: tuple[str, ...] = (),
+                 consumed_reply_ids: tuple[str, ...] = ()) -> dict | None:
+    """Pick the genuine reply to OUR message out of a thread, or None. Pure — no provider, no I/O.
+
+    Written as a function because reply detection has now failed in production TWICE, in opposite
+    directions, and both failures were one-line rules:
+
+      * "no SENT label" — the student's reply to their OWN address carries SENT, so it was discarded
+        forever and the mission polled to exhaustion in silence.
+      * "any message after ours" — a self-send stores the outgoing copy AND its delivered twin as two
+        Gmail messages with DIFFERENT storage ids, so the twin was reported as a reply and Bruce texted
+        "they replied" when nobody had.
+
+    A Gmail message id is a STORAGE id. RFC Message-ID is the MESSAGE's identity, and the twin shares
+    ours exactly — that is what distinguishes it. The rules, all of which must hold:
+
+      1. not one of our own stored messages (by Gmail id)
+      2. not carrying OUR RFC Message-ID (this is the self-delivered twin)
+      3. not already consumed by this mission (restart must not re-detect)
+      4. linked to us by In-Reply-To / References when those headers exist
+      5. when no linkage header exists at all, FAIL CLOSED — better a late notification than a false one
+
+    Labels are deliberately never consulted: in a self-thread they cannot express authorship.
+    """
+    ours_ids = {m for m in (after_message_id, *own_message_ids) if m}
+    consumed = {c for c in consumed_reply_ids if c}
+    ours = [m for m in messages if m.get("id") in ours_ids]
+    our_rfc = {m.get("rfc_message_id") for m in ours if m.get("rfc_message_id")}
+
+    candidates = []
+    for m in messages:
+        if m.get("id") in ours_ids or m.get("id") in consumed:
+            continue                                            # 1, 3
+        rfc = m.get("rfc_message_id")
+        if rfc and rfc in our_rfc:
+            continue                                            # 2 — the self-delivered twin
+        linked = _ref_ids(m.get("in_reply_to")) | _ref_ids(m.get("references"))
+        if our_rfc:
+            if not linked:
+                continue                                        # 5 — no linkage to judge by: fail closed
+            if not (linked & our_rfc):
+                continue                                        # 4 — threaded, but not a reply to US
+        elif not linked:
+            continue                                            # our own headers unknown: fail closed
+        candidates.append(m)
+
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda m: str(m.get("internal_date") or ""))[-1]
 
 
 def matches_sent(read_back: dict | None, *, to: str, subject: str) -> tuple[bool, str]:
@@ -143,6 +224,8 @@ class FakeGmailAdapter:
         self._by_marker: dict[str, str] = {}
         self.send_calls = 0
         self.account = account
+        self._seq = 0
+        self._rfc_by_mid: dict[str, str] = {}
 
     async def send(self, *, to: str, subject: str, body: str, thread_id: str | None,
                    marker: str) -> GmailMessageRef:
@@ -152,13 +235,31 @@ class FakeGmailAdapter:
             return GmailMessageRef(mid, self.messages[mid]["threadId"], self.provider, already_sent=True)
         mid = "m_" + hashlib.sha256(marker.encode()).hexdigest()[:16]
         tid = thread_id or ("t_" + mid)
+        rfc = f"<{mid}@mail.gmail.com>"
+        self._seq += 1
         self.messages[mid] = {
-            "id": mid, "threadId": tid, "labelIds": ["SENT"],
+            "id": mid, "threadId": tid, "labelIds": ["SENT"], "internalDate": str(1000 + self._seq),
             "payload": {"headers": [{"name": "To", "value": to}, {"name": "Subject", "value": subject},
                                     {"name": "From", "value": self.account or ""},
+                                    {"name": "Message-Id", "value": rfc},
                                     {"name": _IDEM_HEADER, "value": marker}]},
             "snippet": (body or "")[:80]}
         self._by_marker[marker] = mid
+        self._rfc_by_mid[mid] = rfc
+        # A SELF-SEND is stored TWICE by Gmail: the outgoing copy and its delivered twin, with DIFFERENT
+        # storage ids but the SAME RFC Message-ID. Modelling that here is the whole point — the twin is
+        # what production mistook for a reply, and a fake without it would let that bug pass green.
+        if self.account and to.strip().lower() == self.account.strip().lower():
+            twin = mid + "_twin"
+            self._seq += 1
+            self.messages[twin] = {
+                "id": twin, "threadId": tid, "labelIds": ["SENT", "INBOX"],
+                "internalDate": str(1000 + self._seq),
+                "payload": {"headers": [{"name": "To", "value": to}, {"name": "Subject", "value": subject},
+                                        {"name": "From", "value": self.account or ""},
+                                        {"name": "Message-Id", "value": rfc},
+                                        {"name": _IDEM_HEADER, "value": marker}]},
+                "snippet": (body or "")[:80]}
         return GmailMessageRef(mid, tid, self.provider)
 
     async def get(self, message_id: str) -> dict | None:
@@ -169,24 +270,36 @@ class FakeGmailAdapter:
         return [_normalize(m) for m in self.messages.values() if m.get("threadId") == thread_id]
 
     async def find_reply(self, thread_id: str, *, after_message_id: str,
-                         own_message_ids: tuple[str, ...] = ()) -> dict | None:
-        """Same rule as the real adapter: a reply is a thread message that arrived after ours and that we
-        did not send, identified by id rather than by the SENT label (so a self-thread still resolves)."""
-        msgs = await self.get_thread(thread_id)
-        ours = {m for m in (after_message_id, *own_message_ids) if m}
-        at = next((i for i, m in enumerate(msgs) if m.get("id") == after_message_id), None)
-        later = msgs[at + 1:] if at is not None else msgs
-        inbound = [m for m in later if m.get("id") not in ours]
-        return inbound[-1] if inbound else None
+                         own_message_ids: tuple[str, ...] = (),
+                         consumed_reply_ids: tuple[str, ...] = ()) -> dict | None:
+        """The SAME rule as the real adapter — one implementation, so the fake cannot drift into passing
+        tests the provider would fail."""
+        return select_reply(await self.get_thread(thread_id), after_message_id=after_message_id,
+                            own_message_ids=own_message_ids, consumed_reply_ids=consumed_reply_ids)
 
     # test seam: simulate the student replying in the thread
-    def inject_incoming(self, thread_id: str, *, from_addr: str, subject: str, body: str) -> str:
-        mid = "in_" + hashlib.sha256(f"{thread_id}|{body}".encode()).hexdigest()[:12]
+    def inject_incoming(self, thread_id: str, *, from_addr: str, subject: str, body: str,
+                        in_reply_to: str | None = None, labels: list[str] | None = None,
+                        rfc_message_id: str | None = None) -> str:
+        """Simulate a message arriving in the thread. `in_reply_to` takes the RFC Message-ID of the message
+        being replied to (use rfc_of()) — a real client always sets it, and without it select_reply fails
+        closed, which is the behaviour we want to be able to test."""
+        mid = "in_" + hashlib.sha256(f"{thread_id}|{body}|{from_addr}".encode()).hexdigest()[:12]
+        self._seq += 1
+        headers = [{"name": "From", "value": from_addr}, {"name": "Subject", "value": subject},
+                   {"name": "Message-Id", "value": rfc_message_id or f"<{mid}@mail.example>"}]
+        if in_reply_to:
+            headers.append({"name": "In-Reply-To", "value": in_reply_to})
+            headers.append({"name": "References", "value": in_reply_to})
         self.messages[mid] = {
-            "id": mid, "threadId": thread_id, "labelIds": ["INBOX"],
-            "payload": {"headers": [{"name": "From", "value": from_addr}, {"name": "Subject", "value": subject}]},
-            "snippet": body[:80]}
+            "id": mid, "threadId": thread_id, "labelIds": list(labels or ["INBOX"]),
+            "internalDate": str(1000 + self._seq),
+            "payload": {"headers": headers}, "snippet": body[:80]}
         return mid
+
+    def rfc_of(self, message_id: str) -> str | None:
+        """The RFC Message-ID of a message this fake stored — what a real replying client would echo."""
+        return self._rfc_by_mid.get(message_id)
 
 
 # --- the REAL Google adapter ----------------------------------------------------------------------
@@ -317,25 +430,19 @@ class GoogleGmailAdapter:
         token = await self._token()
         resp = await self._request("GET", f"/users/me/threads/{thread_id}", token=token,
                                    params=[("format", "metadata"), ("metadataHeaders", "To"),
-                                           ("metadataHeaders", "Subject"), ("metadataHeaders", "From")])
+                                           ("metadataHeaders", "Subject"), ("metadataHeaders", "From"),
+                                           ("metadataHeaders", "Message-Id"),
+                                           ("metadataHeaders", "In-Reply-To"),
+                                           ("metadataHeaders", "References"),
+                                           ("metadataHeaders", "Date")])
         if resp.status_code == 404:
             return []
         self._raise_for(resp)
         return [_normalize(m) for m in (resp.json().get("messages") or [])]
 
     async def find_reply(self, thread_id: str, *, after_message_id: str,
-                         own_message_ids: tuple[str, ...] = ()) -> dict | None:
-        """A reply = a message that arrived in the thread AFTER ours and that we did not send.
-
-        "Ours" is identified by MESSAGE ID and position, not by the SENT label. A label-only rule looks
-        right and silently fails the most ordinary case there is: when the student has Bruce email their
-        OWN address, their reply is also sent by the connected account, so it carries SENT too and would
-        be discarded forever — the mission would poll to exhaustion and finish "no reply" with nothing
-        wrong in the logs. Position + identity works for both a self-thread and a normal one.
-        """
-        msgs = await self.get_thread(thread_id)
-        ours = {m for m in (after_message_id, *own_message_ids) if m}
-        at = next((i for i, m in enumerate(msgs) if m.get("id") == after_message_id), None)
-        later = msgs[at + 1:] if at is not None else msgs
-        inbound = [m for m in later if m.get("id") not in ours]
-        return inbound[-1] if inbound else None
+                         own_message_ids: tuple[str, ...] = (),
+                         consumed_reply_ids: tuple[str, ...] = ()) -> dict | None:
+        """Delegates to `select_reply` so the real and fake adapters share ONE rule (see its docstring)."""
+        return select_reply(await self.get_thread(thread_id), after_message_id=after_message_id,
+                            own_message_ids=own_message_ids, consumed_reply_ids=consumed_reply_ids)

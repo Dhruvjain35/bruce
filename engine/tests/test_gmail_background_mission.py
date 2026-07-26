@@ -120,7 +120,9 @@ def test_mission_sends_once_waits_then_notifies_once_on_reply():
 
     # the student REPLIES in the thread
     tid = sent["threadId"]
+    sent_id = next(k for k, v in adapter.messages.items() if "SENT" in v["labelIds"])
     adapter.inject_incoming(tid, from_addr=STUDENT, subject="re: quick question about practice",
+                            in_reply_to=adapter.rfc_of(sent_id),
                             body="sure, 5 works")
 
     # next due tick: the reply wakes the run -> it completes and notifies EXACTLY once

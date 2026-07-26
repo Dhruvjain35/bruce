@@ -168,45 +168,8 @@ async def test_missing_scope_is_reported_as_missing_scope(monkeypatch):
 
 # --- find_reply: the self-thread bug that would have made D wait forever --------------------------
 
-@pytest.mark.asyncio
-async def test_self_thread_reply_is_detected_even_though_it_carries_the_sent_label():
-    """'email me' means Bruce mails the student's OWN account, so their reply is ALSO labelled SENT. The
-    old label-only rule discarded it and the mission would have polled to exhaustion in silence."""
-    fake = gmail_adapter.FakeGmailAdapter()
-    ref = await fake.send(to="student@gmail.com", subject="s", body="b", thread_id=None, marker="m1")
-    # a self-reply: same account, so Gmail labels it SENT as well as INBOX
-    rid = fake.inject_incoming(ref.thread_id, from_addr="student@gmail.com", subject="Re: s", body="yes")
-    fake.messages[rid]["labelIds"] = ["SENT", "INBOX"]
-
-    reply = await fake.find_reply(ref.thread_id, after_message_id=ref.message_id)
-    assert reply is not None and reply["id"] == rid
-
-
-@pytest.mark.asyncio
-async def test_our_own_sent_message_is_never_mistaken_for_a_reply():
-    fake = gmail_adapter.FakeGmailAdapter()
-    ref = await fake.send(to="prof@nd.edu", subject="s", body="b", thread_id=None, marker="m1")
-    assert await fake.find_reply(ref.thread_id, after_message_id=ref.message_id) is None
-
-
-@pytest.mark.asyncio
-async def test_a_later_message_we_sent_is_excluded_by_own_message_ids():
-    fake = gmail_adapter.FakeGmailAdapter()
-    first = await fake.send(to="prof@nd.edu", subject="s", body="b", thread_id=None, marker="m1")
-    second = await fake.send(to="prof@nd.edu", subject="s", body="ping", thread_id=first.thread_id,
-                             marker="m2")
-    got = await fake.find_reply(first.thread_id, after_message_id=first.message_id,
-                                own_message_ids=(second.message_id,))
-    assert got is None, "our own follow-up must not look like the student's reply"
-
-
-@pytest.mark.asyncio
-async def test_normal_inbound_reply_still_detected():
-    fake = gmail_adapter.FakeGmailAdapter()
-    ref = await fake.send(to="prof@nd.edu", subject="s", body="b", thread_id=None, marker="m1")
-    rid = fake.inject_incoming(ref.thread_id, from_addr="prof@nd.edu", subject="Re: s", body="sure")
-    reply = await fake.find_reply(ref.thread_id, after_message_id=ref.message_id)
-    assert reply is not None and reply["id"] == rid
+# NOTE: reply-detection cases moved to tests/test_reply_truth.py, which tests the RFC-header
+# rule directly against the real failure (self-send twin) rather than through this module.
 
 
 # --- the notifier seam must not let a run claim an undelivered notification -----------------------

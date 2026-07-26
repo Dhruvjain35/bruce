@@ -53,7 +53,8 @@ def test_reply_detection_in_thread():
                                 body="reply when you can", idempotency_key="k2"))
     tid = r.read_back["threadId"]
     assert _run(adapter.find_reply(tid, after_message_id=r.provider_entity_id)) is None   # no reply yet
-    adapter.inject_incoming(tid, from_addr="me@personal.com", subject="re: ping", body="here's my reply")
+    adapter.inject_incoming(tid, from_addr="me@personal.com", subject="re: ping",
+                            body="here's my reply", in_reply_to=adapter.rfc_of(r.provider_entity_id))
     reply = _run(adapter.find_reply(tid, after_message_id=r.provider_entity_id))
     assert reply is not None and "SENT" not in reply["labelIds"]   # an inbound reply, not our own send
 

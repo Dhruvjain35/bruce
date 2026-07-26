@@ -40,6 +40,8 @@ from sqlalchemy import select
 from . import messaging_outbound, schema
 from .db import user_session
 from .messaging import ChannelKind
+from .notification_brief import (NotificationBrief, Relationship,
+                                 deterministic_notification, validate_notification)
 
 log = logging.getLogger(__name__)
 
@@ -97,13 +99,48 @@ async def resolve_handle(user_id: UUID) -> str | None:
             .order_by(schema.MessagingIdentity.id.desc()).limit(1))).scalar_one_or_none()
 
 
-def compose_notification(run: dict) -> str:
-    """What the student actually reads. Grounded in the run: it says a reply landed, and nothing it
-    cannot support. No em dash (the outbound gate asserts on one anyway)."""
+def brief_for(run: dict, *, own_account: str | None = None) -> NotificationBrief:
+    """Turn a finished run into the small set of VERIFIED facts a notification may use.
+
+    Everything here comes from the run's own checkpoint. No provider payload, no email body, and no
+    invented actor: if we do not know a name or a relationship we say "they", never an address.
+    """
+    cp = run.get("recovery_state") or {}
+    results = cp.get("results") or {}
+    replied = any(isinstance(v, dict) and v.get("reply") for v in results.values())
     goal = run.get("goal") or {}
-    to = goal.get("to")
-    who = f"{to} replied" if to else "you got a reply"
-    return f"hey, {who} to the email i sent for you. want me to pull it up?"
+    to = (goal.get("to") or "").strip() or None
+    is_self = bool(to and own_account and to.lower() == own_account.lower())
+
+    return NotificationBrief(
+        event_type="reply_received" if replied else ("no_reply" if cp.get("no_reply") else "reply_received"),
+        verified=replied,
+        agent_run_id=str(run.get("id")),
+        receipt_id=f"{run.get('id')}:{NOTIFY_PURPOSE}",
+        actor_relationship=Relationship.self_ if is_self else Relationship.unknown,
+        # A contact name / relationship / grounded summary needs entity resolution and a summariser that
+        # can be held to grounding. Neither exists yet, so they stay None and the floor says less rather
+        # than guessing — "they replied" is true; "mr. smith said friday" would not be.
+        actor_name=None, reply_summary=None,
+        source_entity_id=(next((v.get("reply_id") for v in results.values()
+                                if isinstance(v, dict) and v.get("reply_id")), None)),
+    )
+
+
+def compose_notification(run: dict, *, own_account: str | None = None) -> str:
+    """What the student actually reads: the deterministic floor over the verified brief, validated.
+
+    The floor is used directly today. A phrasing model plugs in here later, and it can only ever REPHRASE
+    what the brief already asserts — `validate_notification` is the gate, and a failed rewrite falls back
+    to this string rather than shipping something ungrounded.
+    """
+    brief = brief_for(run, own_account=own_account)
+    text = deterministic_notification(brief)
+    verdict = validate_notification(text, brief)
+    if not verdict.ok:
+        log.error("notification_floor_failed_validation run=%s issues=%s", run.get("id"), verdict.issues)
+        return "u got a reply"           # the smallest true thing we can say
+    return text
 
 
 class RelayNotifier:
@@ -111,6 +148,17 @@ class RelayNotifier:
 
     Returns only on a durable, deduplicated enqueue. Everything else raises, so the runner retries.
     """
+
+    @staticmethod
+    async def _own_account(user_id: UUID) -> str | None:
+        """The student's connected Google address, so a self-thread reads as "ur reply came in" instead
+        of the impersonal "they replied"."""
+        try:
+            from . import oauth_google
+            integ = await oauth_google.get_integration(user_id)
+            return getattr(integ, "provider_account_id", None) if integ else None
+        except Exception:
+            return None
 
     async def __call__(self, user_id: UUID, run: dict, *, idempotency_key: str) -> None:
         handle = await resolve_handle(user_id)
@@ -124,7 +172,8 @@ class RelayNotifier:
         try:
             await messaging_outbound.enqueue(
                 user_id=user_id, to_handle=handle, channel=_CHANNEL, kind=NOTIFY_KIND,
-                text=compose_notification(run), idempotency_key=idempotency_key,
+                text=compose_notification(run, own_account=await self._own_account(user_id)),
+                idempotency_key=idempotency_key,
                 mission_id=UUID(str(mission_id)) if mission_id else None)
         except Exception as exc:
             log.exception("notify_enqueue_failed user=%s run=%s key=%s", user_id, run.get("id"),
