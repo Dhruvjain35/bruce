@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import logging
 import re
 from uuid import UUID
 
@@ -25,9 +26,26 @@ from .db import user_session, worker_session
 from .messaging import Attachment, AttachmentKind, ChannelKind, InboundMessage, MessagingChannel, OutboundMessage
 from .models import IntakeSourceKind
 
+log = logging.getLogger(__name__)
+
 # Bruce-voiced copy (casual, honest, no em dash, no corporate tone). Also gated at enqueue as a backstop.
-# This is the UN-enrolled fallback ack — an enrolled user gets the conversation runtime, never this.
+# This is the UN-enrolled fallback ack, and it may ONLY be sent when a real intake mission was created for
+# real content. It is a claim of active work, so anything that did not produce work must not use it.
 ACK_TEXT = "gotchu, i've got it. give me a sec to look and i'll get back to u 👀"
+# Said INSTEAD of ACK_TEXT when the conversation runtime is not available to this user and the message is
+# not something to track. Manufacturing an intake mission out of "yo" and then claiming to be working on it
+# is a false claim of active work: it produced a real mission row that meant nothing.
+NO_RUNTIME_CHATTER_TEXT = ("hey. i can't chat on this number yet, but send me a flyer, screenshot, pdf, "
+                           "link, or a note and i'll track it.")
+# Said when the message is an EXECUTABLE goal (send an email, watch for a reply) that only the conversation
+# runtime can carry out. Naming the blocker beats a cheerful ack for something that will never happen.
+NO_RUNTIME_GOAL_TEXT = "i can't send email from this number yet, so i'm not going to pretend i started that."
+# Conversational chatter with nothing to track. Deliberately tight and anchored to the WHOLE message, so a
+# real note that merely opens with "hey" ("hey, track this: essay due friday") is still intake.
+_CHATTER_RE = re.compile(
+    r"^\s*(?:yo+|hey+|hi+|hello+|sup|wsg|wyd|hru|hbu|good\s+(?:morning|afternoon|evening|night)|"
+    r"what['’]?s\s+up|i['’]?m\s+saying\s+\w+|ok(?:ay)?|k|thx|thanks?|ty|np|lol|lmao|nvm|bet|word)"
+    r"[\s!.?,]*$", re.IGNORECASE)
 # PRIVATE-ALPHA linking copy. No iPhone app or profile screen exists yet, so we NEVER reference one.
 # A code is issued out of band by the Bruce team (operator CLI: scripts/create_link_code). Failure
 # replies are deliberately generic — they never reveal whether a given number/account exists.
@@ -42,7 +60,8 @@ _CODE_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 
 @dataclasses.dataclass
 class InboundOutcome:
-    status: str            # processed | duplicate | linked | bad_code | rate_limited | unlinked_prompt | blocked
+    status: str            # processed | duplicate | linked | bad_code | rate_limited | unlinked_prompt |
+    #                        blocked | no_runtime (gate denied AND nothing real to do -> honest refusal)
     user_id: UUID | None = None
     mission_id: UUID | None = None
     # G0.1 observability: the FastRouter's chosen path + wall-clock, so latency harness/telemetry and later
@@ -56,6 +75,14 @@ class InboundOutcome:
     # (ok | no_tool | disconnected | insufficient_scope | no_recipient | invalid) for a mission-routed turn.
     mission_run_id: str | None = None
     mission_status: str | None = None
+
+
+def _is_executable_goal(text: str) -> bool:
+    """Does this ask Bruce to DO something only the conversation runtime can carry out (send an email,
+    watch a thread)? Reuses the FastRouter's own send-intent pattern so the fallback and the router agree
+    on what an executable goal looks like, instead of drifting apart with a second copy of the rule."""
+    from . import fast_router
+    return bool(text and fast_router._SEND_INTENT.search(text))
 
 
 def _content(msg: InboundMessage) -> tuple[IntakeSourceKind, str | None, bytes | None, str | None]:
@@ -135,9 +162,32 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
     # access gate allows THIS user (an active production entitlement or a live staging enrollment, unless a
     # global kill / hard-off overrides). The gate is by user_id, not a fragile handle allow-list; the
     # runtime also refuses groups. When access is denied, fall through to the unchanged legacy path.
+    from . import access_control  # local import: same cycle-avoidance as the runtime import below
     from . import conversation_runtime  # local import: breaks the runtime<->inbound circular import
-    if not msg.is_group and await conversation_runtime.enabled_for(user_id):
+    access = await access_control.conversation_access(user_id, "conversation")
+    if not msg.is_group and access.allow:
         return await conversation_runtime.handle(channel, msg, user_id=user_id, reply_target=reply_target)
+
+    # 2c. RUNTIME NOT AVAILABLE. Log WHY at warning: a lapsed enrollment used to be invisible here, so the
+    # system degraded to the legacy intake path in silence and every turn came back as a canned ack. A
+    # 15-minute enrollment expiring mid-conversation should be loud, not a mystery.
+    log.warning("conversation_runtime_unavailable user=%s source=%s reason=%s is_group=%s",
+                user_id, access.source, access.reason, msg.is_group)
+
+    # A claim of active work has to be TRUE. Without the runtime, conversational chatter and executable
+    # goals produce nothing real, so they must not be turned into an intake mission and must not be
+    # answered with "i've got it, give me a sec". Content with something to track still goes to intake:
+    # that is what this fallback is FOR, and its ack is honest because a real mission is created.
+    if not msg.attachments:
+        body = (msg.text or "").strip()
+        if _CHATTER_RE.match(body):
+            await _send(channel, to=reply_target, user_id=user_id, kind="acknowledged",
+                        text=NO_RUNTIME_CHATTER_TEXT, dedup_key=f"noruntime:{msg.provider_message_id}")
+            return InboundOutcome(status="no_runtime", user_id=user_id, mission_status="chatter")
+        if _is_executable_goal(body):
+            await _send(channel, to=reply_target, user_id=user_id, kind="acknowledged",
+                        text=NO_RUNTIME_GOAL_TEXT, dedup_key=f"noruntime:{msg.provider_message_id}")
+            return InboundOutcome(status="no_runtime", user_id=user_id, mission_status="executable_goal")
 
     # 3. Idempotency: has this exact provider message already been handled?
     async with worker_session() as s:
