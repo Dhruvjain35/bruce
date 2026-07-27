@@ -124,6 +124,24 @@ class _Runtime:
             user_id, channel=ch, channel_identity=ident, provider_message_id=pmid, text=msg.text)
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
 
+        # INVALIDATE CONFLICTING AUTHORIZATION — step 3 of the authoritative execution order, and it runs
+        # here rather than inside the router because it must hold whether or not semantic routing is on.
+        # A refusal has to close outstanding consent even when this turn goes nowhere near a tool: the
+        # student who says "actually never mind" while a background mission is asleep gets no reply that
+        # mentions it, and the mission must still be dead when it wakes an hour later.
+        #
+        # Best-effort, like the rest of intake — but note the direction it fails in. A store fault leaves
+        # an authorization ALIVE, which is the unsafe direction, so it is logged at warning rather than
+        # swallowed silently. The durable recheck at execution is the second line for exactly this case.
+        try:
+            from . import authorization_store, user_action_boundary as _uab
+            _boundary = _uab.evaluate(msg.text)
+            if _boundary.blocks_execution():
+                await authorization_store.record_refusal(
+                    user_id, _boundary, message_id=pmid, conversation_id=ident)
+        except Exception:
+            log.warning("authz_refusal_record_failed pmid=%s", pmid)
+
         # G0.1 FastRouter: classify the cheapest-correct execution path (fast chat / single verified action /
         # foreground agent / durable mission) BEFORE the heavy reasoner, and instrument its latency. This turn
         # the decision is SHADOWED — recorded for the router-quality harness, latency telemetry, and the later

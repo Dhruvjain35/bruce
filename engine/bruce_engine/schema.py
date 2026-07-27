@@ -397,6 +397,71 @@ class GmailSentLedger(Base):
     __table_args__ = (UniqueConstraint("user_id", "marker", name="uq_gmail_ledger_user_marker"),)
 
 
+class AuthorizationEvidenceRow(Base):
+    """Durable consent (#121a). One row per authorization, bound to one trusted message, one user, one
+    operation, and one arguments fingerprint.
+
+    #120 kept this in memory for the length of a turn, which is safe and cannot serve a background
+    mission: a mission executes long after the turn that planned it, so it must carry an
+    authorization_id and have the executor RELOAD and RECHECK this row. It must never carry a copied
+    verdict — a boolean that was true once is not evidence that it is true now.
+
+    Append-mostly. `invalidated_at`, `superseded_by_authorization_id` and `consumed_at` are one-way
+    transitions; nothing else about a row may change after it is written, or the audit trail is worthless.
+    """
+
+    __tablename__ = "authorization_evidence"
+    authorization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    user_id = _owner()
+    conversation_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    trusted_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_message_timestamp: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False)
+    decision_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    mission_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    normalized_arguments: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    arguments_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    polarity: Mapped[str] = mapped_column(String(24), nullable=False)
+    authorization_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    explicit_operation_request: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"))
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("1.0"))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    invalidated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    invalidated_by_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    superseded_by_authorization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True)
+    consumed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_by_attempt: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    operation_receipt_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class AuthorizationRefusal(Base):
+    """The refusal timeline (#121a). One row every time the deterministic boundary blocks a turn.
+
+    "No later refusal" cannot be answered from the evidence table alone: a refusal that arrives while
+    nothing is outstanding marks no authorization row, and yet it still has to stop a mission that was
+    authorized before it and wakes up after it. So refusals are recorded on their own timeline and
+    compared against an authorization's own timestamp at execution.
+    """
+
+    __tablename__ = "authorization_refusals"
+    id = _pk()
+    user_id = _owner()
+    refused_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    polarity: Mapped[str] = mapped_column(String(24), nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
 class ModelCost(Base):
     __tablename__ = "model_costs"
     id = _pk()

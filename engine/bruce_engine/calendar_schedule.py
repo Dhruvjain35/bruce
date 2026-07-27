@@ -377,30 +377,28 @@ async def schedule_event(
         user_id, mission_id, MissionPhase.executing.value, "creation_attempted", status="running")
     # THE EXECUTION GATE. The authorization is bound to the exact event that was offered, so an event
     # whose time or title changed between the offer and this call no longer matches and does not run.
-    from . import execution_gate
+    from . import execution_gate, mutation_gateway
     gate_args = execution_gate.calendar_create_args(
         title=event.title, start=event.start, end=event.end, timezone=event.timezone,
         location=event.location)
-    gate_v = execution_gate.evaluate(authorization, user_id=user_id, provider="google_calendar",
-                                     operation="create_event", arguments=gate_args,
-                                     attempt_key=str(mission_id), conversation_id=conversation_id)
-    if gate_v.denied:
-        await mission_kernel.record_phase(
-            user_id, mission_id, MissionPhase.blocked.value, f"not_authorized:{gate_v.reason}",
-            status="running")
-        await _write_receipt(user_id, mission_id, "not_authorized", {"reason": gate_v.reason})
-        return ScheduleResult(state=ScheduleState.not_authorized, mission_id=mission_id,
-                              title=event.title, all_day=all_day, reason=gate_v.reason)
 
+    async def _perform():
+        return await calendar_adapter.execute_and_verify(
+            adapter, event, user_id=user_id, mission_id=mission_id,
+            source_message_id=source_message_id, attachment_digest=attachment_digest,
+            expected_account=bound_account,        # None -> learn+backfill; known -> HARD-verify
+        )
+
+    # THE ONE DOOR. The authorization is reloaded and rejudged here, not trusted from the caller — a
+    # flyer approved twenty minutes ago is a different thing from a flyer approved twenty minutes ago
+    # and then taken back. The grant is bound to the exact event that was offered, so an event whose
+    # time or title changed between the offer and this call no longer matches and does not run.
     try:
-        with execution_gate.open_authorization(
-                authorization, user_id=user_id, provider="google_calendar", operation="create_event",
-                arguments=gate_args, attempt_key=str(mission_id), conversation_id=conversation_id):
-            result = await calendar_adapter.execute_and_verify(
-                adapter, event, user_id=user_id, mission_id=mission_id,
-                source_message_id=source_message_id, attachment_digest=attachment_digest,
-                expected_account=bound_account,        # None -> learn+backfill; known -> HARD-verify
-            )
+        gated = await mutation_gateway.execute_with_evidence(
+            user_id, authorization, provider="google_calendar", operation="create_event",
+            arguments=gate_args, perform=_perform, conversation_id=conversation_id,
+            attempt_key=str(mission_id), mission_id=mission_id,
+            receipt_of=lambda r: getattr(r, "event_id", None))
     except calendar_adapter.CalendarError as exc:
         await mission_kernel.record_phase(
             user_id, mission_id, MissionPhase.failed.value, f"provider_error:{type(exc).__name__}",
@@ -409,6 +407,17 @@ async def schedule_event(
                              {"error": type(exc).__name__, "detail": str(exc)[:200]})
         return ScheduleResult(state=ScheduleState.failed, mission_id=mission_id, title=event.title,
                               all_day=all_day, reason=str(exc)[:200])
+
+    if gated.denied:
+        # Never blame the connection for a consent problem, and never leave a phase record implying the
+        # write was attempted. `not_authorized` is its own honest state with its own receipt.
+        await mission_kernel.record_phase(
+            user_id, mission_id, MissionPhase.blocked.value, f"not_authorized:{gated.reason}",
+            status="running")
+        await _write_receipt(user_id, mission_id, "not_authorized", {"reason": gated.reason})
+        return ScheduleResult(state=ScheduleState.not_authorized, mission_id=mission_id,
+                              title=event.title, all_day=all_day, reason=gated.reason)
+    result = gated.value
 
     read_account = (result.read_back or {}).get("account")
     # 4. learn the account from the authoritative record if the connection couldn't tell us up front
