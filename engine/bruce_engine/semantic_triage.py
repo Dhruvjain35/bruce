@@ -131,7 +131,10 @@ referent to a specific event or thread is not your job; say what they want and l
 Reserve ambiguous for turns where the GOAL itself is unclear, not the record.
 
 If a message asks for something and then takes it back — "add practice friday actually no dont" —
-decision_polarity is decline. The retraction wins over the request, whatever order they arrive in."""
+decision_polarity is decline, whatever order the clauses arrive in. But a decline calls the whole thing
+OFF: replacing one detail with another — "no, make it 4", "nah thursday instead" — is a correction that
+still wants the work done, and its polarity is none. Measured, each half of that distinction is
+load-bearing; dropping either one costs either adversarial safety or every correction."""
 
 
 class _TriageOut(BaseModel):

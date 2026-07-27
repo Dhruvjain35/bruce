@@ -218,11 +218,14 @@ def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
         # ABOUT the mission, not requesting a second one. Measured: every status question during an
         # active Gmail run spawned a duplicate monitor of a thread already being monitored.
         #
-        # But `goal_count` has to gate it. The first version of this rule suppressed on the run alone, and
-        # swallowed ten explicit requests — "watch for a reply from coach" during an unrelated run is a
-        # goal being asked for, not a question about an existing one. No goal asked => it is a question.
-        if (ctx.active_run_id and ctx.active_run_domain == domain
-                and turn.goal_count is not GoalCount.one):
+        # Gating this on `goal_count` was tried and measured WORSE: it let status questions through as
+        # new missions and took the false-action rate from 0.012 to 0.117. No semantic field separates
+        # "watch for a reply from coach" from "did they reply" — the model marks both as a continuation
+        # wanting monitoring — so the guard stays strict and errs toward not starting a second mission.
+        # The cost is real and accepted: an explicit second watch request during an active run in the
+        # same domain is answered conversationally instead of spawning a run. A missed request is a
+        # recall miss; a spurious durable mission is an unrequested action.
+        if ctx.active_run_id and ctx.active_run_domain == domain:
             return Derivation(execution_class=_CHAT, action="answer", domain=domain,
                               continuation_run_id=ctx.active_run_id, confidence=turn.confidence,
                               rule="monitoring_already_running")
