@@ -121,7 +121,17 @@ durable_monitoring. Putting something on a schedule is calendar + create.
 Students state goals as facts. "i have a dentist appointment thursday at 3", "my chem final is on the
 14th", "essay is due monday" are new goals to record — a specific thing at a specific time is executable,
 not small talk. Likewise a durable fact about themselves ("im in central time", "i go by dj") is memory +
-remember + executable: they are asking you to hold onto it."""
+remember + executable: they are asking you to hold onto it.
+
+Wanting something followed up, chased, checked back on, or watched until an answer arrives is
+durable_monitoring, however it is phrased.
+
+Changing a named thing is executable even when you cannot tell WHICH record they mean. Resolving a
+referent to a specific event or thread is not your job; say what they want and let the runtime find it.
+Reserve ambiguous for turns where the GOAL itself is unclear, not the record.
+
+If a message asks for something and then takes it back — "add practice friday actually no dont" —
+decision_polarity is decline. The retraction wins over the request, whatever order they arrive in."""
 
 
 class _TriageOut(BaseModel):

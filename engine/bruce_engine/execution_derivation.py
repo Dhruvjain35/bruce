@@ -217,7 +217,12 @@ def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
         # Already watching this domain? Then "any update", "still waiting?", "did they reply" is asking
         # ABOUT the mission, not requesting a second one. Measured: every status question during an
         # active Gmail run spawned a duplicate monitor of a thread already being monitored.
-        if ctx.active_run_id and ctx.active_run_domain == domain:
+        #
+        # But `goal_count` has to gate it. The first version of this rule suppressed on the run alone, and
+        # swallowed ten explicit requests — "watch for a reply from coach" during an unrelated run is a
+        # goal being asked for, not a question about an existing one. No goal asked => it is a question.
+        if (ctx.active_run_id and ctx.active_run_domain == domain
+                and turn.goal_count is not GoalCount.one):
             return Derivation(execution_class=_CHAT, action="answer", domain=domain,
                               continuation_run_id=ctx.active_run_id, confidence=turn.confidence,
                               rule="monitoring_already_running")
