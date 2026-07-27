@@ -200,6 +200,24 @@ def default_provider() -> SemanticTriage:
     return _DEFAULT_PROVIDER
 
 
+async def warmup() -> bool:
+    """Pay the first-connection cost at process start instead of on a student's first message.
+
+    Caching the agent was not enough: the HTTP client connects lazily, so the FIRST request still paid the
+    handshake. Measured in Cloud Run, that first call took over 3000ms and blew the deadline while every
+    subsequent call sat between 811ms and 1122ms — the entire tail was one cold connection.
+
+    Best-effort and silent. A failed warm-up costs nothing; it just means the first turn pays what it
+    would have paid anyway and falls back deterministically, which is the safe direction."""
+    if not enabled():
+        return False
+    try:
+        await asyncio.wait_for(default_provider().read(render_request("hi")), timeout=TRIAGE_TIMEOUT_S * 2)
+        return True
+    except Exception:
+        return False
+
+
 def _classify_failure(exc: Exception) -> str:
     """Name the failure honestly, because the name decides whether it is retried and who has to fix it.
 
