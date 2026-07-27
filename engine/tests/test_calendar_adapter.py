@@ -257,7 +257,7 @@ def test_undo_deletes_and_proves_absence_by_read_back():
         cal = FakeCalendarAdapter()
         ev = _event()
         r = await execute_and_verify(cal, ev, user_id=UID, mission_id=MID)
-        u = await ca.undo(cal, event_id=r.event_id)
+        u = await ca.undo(cal, event_id=r.event_id, user_id=UID)
         assert u.verified is True and "gone" in u.reason
         assert cal.events == {}
 
@@ -269,8 +269,8 @@ def test_undo_is_idempotent():
     async def run():
         cal = FakeCalendarAdapter()
         r = await execute_and_verify(cal, _event(), user_id=UID, mission_id=MID)
-        first = await ca.undo(cal, event_id=r.event_id)
-        second = await ca.undo(cal, event_id=r.event_id)
+        first = await ca.undo(cal, event_id=r.event_id, user_id=UID)
+        second = await ca.undo(cal, event_id=r.event_id, user_id=UID)
         assert first.verified is True and second.verified is True
 
     asyncio.run(run())
@@ -285,7 +285,7 @@ def test_undo_that_did_not_actually_delete_is_not_confirmed():
     async def run():
         cal = Stubborn()
         r = await execute_and_verify(cal, _event(), user_id=UID, mission_id=MID)
-        u = await ca.undo(cal, event_id=r.event_id)
+        u = await ca.undo(cal, event_id=r.event_id, user_id=UID)
         assert u.verified is False and "still present" in u.reason
 
     asyncio.run(run())
@@ -502,3 +502,19 @@ def test_live_google_executes_once_and_reads_back():
         assert again.event_id == first.event_id and again.verified is True
 
     asyncio.run(run())
+
+
+# --- execution boundary -------------------------------------------------------------------------------
+# THIS FILE DOES NOT EXERCISE AUTHORIZATION. Every test above is about provider semantics — read-back
+# verification, 409 handling, idempotent retry, account binding, run bookkeeping — and calls the verified
+# I/O directly rather than through the turn that would mint consent for it. Suspending the gate keeps
+# those assertions about the thing they are actually testing.
+#
+# The boundary itself is proven in test_authorization_evidence.py and test_authorization_zero_call.py,
+# which never import this seam. `unchecked_provider_writes_for_test` raises outside pytest, so this is a
+# statement about a test file, not a hole in the engine.
+@pytest.fixture(autouse=True)
+def _provider_semantics_not_authorization():
+    from bruce_engine import execution_gate
+    with execution_gate.unchecked_provider_writes_for_test():
+        yield

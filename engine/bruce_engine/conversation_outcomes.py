@@ -199,6 +199,10 @@ def _calendar_reply(result, event, *, now=None) -> str:
     if result.state is ScheduleState.not_connected:
         return (f"i've got {title} ready to add, but ur google calendar isn't connected yet. "
                 f"connect it and i'll put it on there for {when}.")
+    if result.state is ScheduleState.not_authorized:
+        # Never blame the connection for a consent problem, and never imply it was added. Ask once,
+        # plainly, for the thing that is actually missing.
+        return f"i didn't put {title} on ur calendar. want it on there for {when}?"
     if result.state is ScheduleState.verification_inconclusive:
         return (f"i added {title} to ur calendar but couldn't confirm it stuck when i checked back, "
                 f"so i'm not calling it done. want me to recheck?")
@@ -288,9 +292,23 @@ class CalendarScheduleHandler:
             evidence={"reply_to_message_id": getattr(octx.msg, "reply_to_message_id", None)},
             extracted_facts=facts)
         digest = calendar_schedule.attachment_digest(attachment_refs)
+        # The student's own message is what asked for this. A create is reversible by Bruce (undo reads
+        # back to prove the event is gone), which is why it is not in the destructive set and why a
+        # direct request is enough consent for it. The grant binds to the exact event about to be
+        # written, so the extraction cannot drift between here and the provider.
+        from . import authorization_evidence as ae, execution_gate
+        authz = ae.try_grant(
+            user_id=octx.user_id, provider="google_calendar", operation="create_event",
+            arguments=execution_gate.calendar_create_args(
+                title=event.title, start=event.start, end=event.end, timezone=event.timezone,
+                location=event.location),
+            authorization_type=ae.AuthorizationType.direct_explicit,
+            text=octx.msg.text, trusted_message_id=octx.pmid,
+            conversation_id=octx.msg.channel_identity)
         result = await calendar_schedule.schedule_event(
             octx.user_id, creation.mission_id, event,
-            source_message_id=octx.pmid, attachment_digest=digest)
+            source_message_id=octx.pmid, attachment_digest=digest, authorization=authz,
+            conversation_id=octx.msg.channel_identity)
         log.info("calendar_schedule state=%s mission_id=%s", result.state.value, creation.mission_id)
         return HandlerOutput(text=_calendar_reply(result, event), styled=False,
                              mission_id=creation.mission_id)
@@ -341,7 +359,9 @@ class CalendarMutationHandler:
     async def execute(self, octx: OutcomeContext) -> HandlerOutput:
         from . import calendar_mutation
         kind = calendar_mutation.classify(octx.msg.text)
-        reply = await calendar_mutation.handle(octx.user_id, kind, octx.msg.text or "")
+        reply = await calendar_mutation.handle(octx.user_id, kind, octx.msg.text or "",
+                                               source_message_id=octx.pmid,
+                                               conversation_id=octx.msg.channel_identity)
         log.info("calendar_mutation kind=%s user=%s", kind, octx.user_id)
         return HandlerOutput(text=reply, styled=False)
 
@@ -428,8 +448,23 @@ class CalendarApprovalHandler:
         # approved -> execute the EXACT offered event on the SAME mission (stable id -> no duplicate)
         src = (goal.get("source_message_ids") or [octx.pmid])[0]
         digest = goal.get("attachment_digest") or ""
+        # `decision_approval`: Bruce put this exact event on screen and the student answered yes to THAT.
+        # The trusted message is the student's REPLY (octx.pmid), not the flyer that started it — consent
+        # comes from the person, and the flyer is evidence. The grant is bound to the offered event, so a
+        # goal record edited between the offer and the approval fails the fingerprint instead of executing.
+        from . import authorization_evidence as ae, execution_gate
+        authz = ae.try_grant(
+            user_id=octx.user_id, provider="google_calendar", operation="create_event",
+            arguments=execution_gate.calendar_create_args(
+                title=event.title, start=event.start, end=event.end, timezone=event.timezone,
+                location=event.location),
+            authorization_type=ae.AuthorizationType.decision_approval,
+            text=octx.msg.text, trusted_message_id=octx.pmid, decision_id=str(mid),
+            conversation_id=octx.msg.channel_identity,
+            has_pending_decision=True, explicit_operation_request=False)
         result = await calendar_schedule.schedule_event(
-            octx.user_id, mid, event, source_message_id=src, attachment_digest=digest)
+            octx.user_id, mid, event, source_message_id=src, attachment_digest=digest,
+            authorization=authz, conversation_id=octx.msg.channel_identity)
         log.info("calendar_approval_executed state=%s mission_id=%s", result.state.value, mid)
         return HandlerOutput(text=_calendar_reply(result, event), styled=False, mission_id=mid)
 

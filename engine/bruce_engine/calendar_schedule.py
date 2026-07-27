@@ -75,6 +75,7 @@ class ScheduleState(str, Enum):
     ahead of the evidence (a write is never reported as ``verified``)."""
 
     not_connected = "not_connected"
+    not_authorized = "not_authorized"   # the account is fine; nobody authorized THIS event
     parsed = "parsed"
     prepared = "prepared"
     creation_attempted = "creation_attempted"
@@ -336,6 +337,8 @@ async def schedule_event(
     attachment_digest: str = "",
     http_client: httpx.AsyncClient | None = None,
     adapter: calendar_adapter.CalendarAdapter | None = None,
+    authorization=None,
+    conversation_id: str | None = None,
 ) -> ScheduleResult:
     """The operation graph: bind account -> prepare -> create-once -> fetch back -> verify -> receipt.
 
@@ -372,12 +375,32 @@ async def schedule_event(
     # 3. creation attempted -> create once
     await mission_kernel.record_phase(
         user_id, mission_id, MissionPhase.executing.value, "creation_attempted", status="running")
+    # THE EXECUTION GATE. The authorization is bound to the exact event that was offered, so an event
+    # whose time or title changed between the offer and this call no longer matches and does not run.
+    from . import execution_gate
+    gate_args = execution_gate.calendar_create_args(
+        title=event.title, start=event.start, end=event.end, timezone=event.timezone,
+        location=event.location)
+    gate_v = execution_gate.evaluate(authorization, user_id=user_id, provider="google_calendar",
+                                     operation="create_event", arguments=gate_args,
+                                     attempt_key=str(mission_id), conversation_id=conversation_id)
+    if gate_v.denied:
+        await mission_kernel.record_phase(
+            user_id, mission_id, MissionPhase.blocked.value, f"not_authorized:{gate_v.reason}",
+            status="running")
+        await _write_receipt(user_id, mission_id, "not_authorized", {"reason": gate_v.reason})
+        return ScheduleResult(state=ScheduleState.not_authorized, mission_id=mission_id,
+                              title=event.title, all_day=all_day, reason=gate_v.reason)
+
     try:
-        result = await calendar_adapter.execute_and_verify(
-            adapter, event, user_id=user_id, mission_id=mission_id,
-            source_message_id=source_message_id, attachment_digest=attachment_digest,
-            expected_account=bound_account,        # None -> learn+backfill; known -> HARD-verify
-        )
+        with execution_gate.open_authorization(
+                authorization, user_id=user_id, provider="google_calendar", operation="create_event",
+                arguments=gate_args, attempt_key=str(mission_id), conversation_id=conversation_id):
+            result = await calendar_adapter.execute_and_verify(
+                adapter, event, user_id=user_id, mission_id=mission_id,
+                source_message_id=source_message_id, attachment_digest=attachment_digest,
+                expected_account=bound_account,        # None -> learn+backfill; known -> HARD-verify
+            )
     except calendar_adapter.CalendarError as exc:
         await mission_kernel.record_phase(
             user_id, mission_id, MissionPhase.failed.value, f"provider_error:{type(exc).__name__}",

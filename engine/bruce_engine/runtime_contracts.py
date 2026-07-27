@@ -116,6 +116,9 @@ class ToolOutcome(str, Enum):
     already_exists = "already_exists"        # idempotent retry hit the same entity
     not_found = "not_found"
     unauthorized = "unauthorized"            # reconnect needed
+    forbidden = "forbidden"                  # the PROVIDER is fine; nobody authorized Bruce to do this.
+                                             # Distinct from `unauthorized` on purpose: one is answered by
+                                             # reconnecting an account, the other by the student saying yes.
     insufficient_scope = "insufficient_scope"
     rate_limited = "rate_limited"
     provider_error = "provider_error"

@@ -539,7 +539,7 @@ def _matches(
 
 
 async def undo(
-    adapter: CalendarAdapter, *, event_id: str
+    adapter: CalendarAdapter, *, event_id: str, user_id: UUID
 ) -> VerificationResult:
     """Reverse an executed calendar action, and PROVE it is gone by reading back.
 
@@ -549,6 +549,11 @@ async def undo(
     Idempotent: deleting an already-absent event is success, not an error — a student tapping Undo
     twice must not see a failure for work that is genuinely done.
     """
+    from . import execution_gate
+    # An undo is still a provider deletion. That Bruce created the event does not make removing it
+    # something Bruce may decide alone.
+    execution_gate.require(user_id, provider="google_calendar", operation="delete_event",
+                           arguments=execution_gate.calendar_delete_args(provider_event_id=event_id))
     await adapter.delete(event_id)
     still_there = await adapter.get(event_id)
     if still_there is not None:
@@ -598,6 +603,12 @@ async def execute_and_verify(
         user_id, mission_id, event,
         source_message_id=source_message_id, attachment_digest=attachment_digest)
     html_link: str | None = None
+
+    from . import execution_gate
+    execution_gate.require(user_id, provider="google_calendar", operation="create_event",
+                           arguments=execution_gate.calendar_create_args(
+                               title=event.title, start=event.start, end=event.end,
+                               timezone=event.timezone, location=event.location))
 
     try:
         ref = await adapter.insert(

@@ -154,3 +154,19 @@ def test_wrong_account_read_back_is_inconclusive_never_succeeds(clean_db):
     # the bound account is not overwritten by the mismatching one
     integ = _run(oauth_google.get_integration(uid))
     assert integ.provider_account_id == "bound@example.com"
+
+
+# --- execution boundary -------------------------------------------------------------------------------
+# THIS FILE DOES NOT EXERCISE AUTHORIZATION. Every test above is about provider semantics — read-back
+# verification, 409 handling, idempotent retry, account binding, run bookkeeping — and calls the verified
+# I/O directly rather than through the turn that would mint consent for it. Suspending the gate keeps
+# those assertions about the thing they are actually testing.
+#
+# The boundary itself is proven in test_authorization_evidence.py and test_authorization_zero_call.py,
+# which never import this seam. `unchecked_provider_writes_for_test` raises outside pytest, so this is a
+# statement about a test file, not a hole in the engine.
+@pytest.fixture(autouse=True)
+def _provider_semantics_not_authorization():
+    from bruce_engine import execution_gate
+    with execution_gate.unchecked_provider_writes_for_test():
+        yield
