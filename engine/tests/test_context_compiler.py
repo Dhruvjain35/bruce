@@ -52,7 +52,9 @@ def test_all_layers_present_and_priority_ordered():
     with _state(tz="America/Chicago", run=run, events=events):
         c = _run(context_compiler.compile(uuid4(), _turns(4)))
     layers = [b.layer for b in c.blocks]
-    assert layers == ["world", "operational", "entity", "episodic"]      # priority order, highest first
+    # M1A added the now-anchor at priority 102, ABOVE world: a truncated context that keeps the friendly
+    # timezone name but drops the DATE returns the model to guessing, which is the defect it fixes.
+    assert layers == ["now", "world", "operational", "entity", "episodic"]   # priority order, highest first
     assert "central time" in c.text and "schedule the dentist" in c.text and "Chess Club" in c.text
     assert "Recent conversation" in c.text
     assert c.dropped == ()
@@ -115,7 +117,7 @@ def test_nondict_goal_does_not_collapse_the_whole_compile():
     with _state(tz="America/Chicago", run=run):
         c = _run(context_compiler.compile(uuid4(), _turns(3)))
     layers = {b.layer for b in c.blocks}
-    assert layers == {"world", "operational", "episodic"}    # nothing collapsed; all present
+    assert layers == {"now", "world", "operational", "episodic"}    # nothing collapsed; all present
     assert "Open task" in c.text and "school" in c.text      # operational degraded to the domain, no crash
     assert "central time" in c.text and "Recent conversation" in c.text
 

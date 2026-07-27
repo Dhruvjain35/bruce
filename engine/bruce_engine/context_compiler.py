@@ -35,6 +35,11 @@ _MAX_TURNS = 8               # episodic window ceiling (budget may trim below th
 # Capability sits ABOVE world state: what Bruce can do is the fact the model most often gets wrong, and
 # a truncated context that drops it returns the model to guessing — the exact defect this closes.
 _P_CAPABILITY = 105
+# The now-anchor sits just under capability truth and ABOVE world: if truncation has to drop
+# one, losing the DATE while keeping a friendly timezone name is the worse outcome. A model with no clock resolves every relative date by
+# guessing: the deterministic `temporal` resolver has always taken an injected `now`, but the MODEL was
+# only ever told a timezone, never the date. "tomorrow at 3" had nothing to be relative to.
+_P_NOW = 102
 _P_WORLD, _P_OPERATIONAL, _P_ENTITY, _P_EPISODIC = 100, 90, 80, 50
 
 _NO_HISTORY = "No prior conversation."
@@ -95,6 +100,27 @@ def _fmt_when(start: str | None, end: str | None) -> str:
 # Each builder fault-isolates its WHOLE body, not just the store read: a malformed row (a non-dict JSONB
 # `goal`, a non-string `start`) must degrade ITS layer to omitted, never throw past the guard and collapse
 # the entire compiled context to the legacy fallback. One bad layer ≠ losing world+entity+episodic.
+async def _now_block(user_id) -> str | None:
+    """Weekday, date and local clock in the student's OWN timezone.
+
+    Uses `world_state.resolve_timezone`, not calendar_schedule.DEFAULT_TZ — that constant is
+    America/Los_Angeles with a TODO next to it, and a Central-timezone student would be told the wrong
+    day near midnight. A missing timezone means we say nothing rather than assert a wrong date.
+    """
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo
+        tz = await world_state.get_timezone(user_id)
+        if not tz:
+            return None
+        local = _dt.datetime.now(ZoneInfo(tz))
+        return (f"Right now it is {local:%A, %B %d, %Y} at {local:%I:%M %p} "
+                f"({world_state.friendly_name(tz)}). Use this for any relative date or time; "
+                f"never assume today's date.")
+    except Exception:
+        return None
+
+
 async def _world_block(user_id) -> str | None:
     try:
         tz = await world_state.get_timezone(user_id)
@@ -175,6 +201,7 @@ async def compile(user_id, recent, *, include_episodic: bool = True,
         # capability truth FIRST: the runtime already knows what is live, and the model previously never
         # received it, so it denied a connected calendar to a student.
         ("capability", _P_CAPABILITY, capabilities.render() if capabilities is not None else ""),
+        ("now", _P_NOW, await _now_block(user_id)),
         ("world", _P_WORLD, await _world_block(user_id)),
         ("operational", _P_OPERATIONAL, await _operational_block(user_id)),
         ("entity", _P_ENTITY, await _entity_block(user_id)),
