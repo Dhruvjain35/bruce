@@ -76,16 +76,27 @@ def test_chat_is_only_reached_by_a_positive_reading(act):
 # --- uncertainty asks, it does not guess ---------------------------------------------------------------
 
 def test_low_confidence_asks_rather_than_silently_chatting():
-    """THE regression that made misses invisible: an unsure read used to become fast_conversation, which is
-    indistinguishable from a correct chat classification. It must become a question."""
+    """THE regression that made misses invisible: an unsure read used to become fast_conversation with no
+    trace, indistinguishable from a correct chat classification. It must become a QUESTION — which is
+    still fast_conversation as machinery, but is now marked as one."""
     d = ed.derive(turn(confidence=0.2), LIVE)
-    assert d.execution_class == "foreground_agent"
     assert d.needs_clarification and d.clarification_reason == "low_confidence"
+    assert d.execution_class == "fast_conversation"
+
+
+def test_asking_a_question_is_not_a_task_graph():
+    """Execution class describes machinery. A clarifying question needs no tool, no run and no lease, so
+    spinning up a foreground agent to say "which one?" would be pure overhead."""
+    for unclear in (turn(confidence=0.2), turn(actionability=Actionability.ambiguous),
+                    turn(domain_candidates=())):
+        d = ed.derive(unclear, LIVE)
+        assert d.execution_class == "fast_conversation" and d.needs_clarification
+        assert not d.capabilities
 
 
 def test_ambiguous_actionability_asks():
     d = ed.derive(turn(actionability=Actionability.ambiguous), LIVE)
-    assert d.needs_clarification and d.execution_class == "foreground_agent"
+    assert d.needs_clarification and d.execution_class == "fast_conversation"
 
 
 def test_the_operation_breaks_a_two_family_tie_without_asking():
@@ -184,6 +195,7 @@ def test_a_bare_reference_resolves_against_open_work():
 def test_a_bare_reference_with_nothing_open_asks_what_it_refers_to():
     d = ed.derive(turn(turn_role=TurnRole.reference_only), LIVE)
     assert d.needs_clarification and d.clarification_reason == "referent_unknown"
+    assert d.execution_class == "fast_conversation"
 
 
 def test_a_correction_carries_the_run_it_repairs():

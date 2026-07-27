@@ -93,8 +93,15 @@ def resolve_family(turn: SemanticTurn) -> tuple[Family | None, str]:
 
 
 def _clarify(reason: str, turn: SemanticTurn, rule: str) -> Derivation:
-    """An honest question beats both a wrong action and a wrong silence."""
-    return Derivation(execution_class=_FOREGROUND, action="answer", needs_clarification=True,
+    """An honest question beats both a wrong action and a wrong silence.
+
+    Asking is `fast_conversation` because execution class describes MACHINERY, and a question needs no
+    tool, no durable run, and no lease. Calling it `foreground_agent` would spin up a bounded task graph
+    to say "which one?". What makes this different from idle chat is carried by `needs_clarification` and
+    `clarification_reason`, which is where a consumer should read it rather than inferring it from a class
+    that is pretending a question is a task.
+    """
+    return Derivation(execution_class=_CHAT, action="answer", needs_clarification=True,
                       clarification_reason=reason, confidence=turn.confidence, rule=rule,
                       ambiguity=turn.uncertainty or (reason,))
 

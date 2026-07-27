@@ -154,7 +154,10 @@ class SemanticRouterModel:
             domain=d.domain, candidate_capabilities=d.capabilities,
             continuation_run_id=d.continuation_run_id, correction_of_run_id=d.correction_of_run_id,
             confidence=d.confidence, ambiguity=d.ambiguity,
-            needs_deeper_planning=d.needs_clarification)
+            # `needs_deeper_planning` means "a heavier planner would decide differently", which is exactly
+            # what Stage 1 reports in `needs_frontier`. It is NOT the same as needing a clarifying
+            # question: a question is answered by the student, not by more planning.
+            needs_deeper_planning=bool(getattr(turn, "needs_frontier", False)))
 
     async def _context(self, request: RouterModelRequest):
         """Runtime facts. Falls back to the request's own summary when there is no user to look up, so the
