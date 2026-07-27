@@ -128,6 +128,9 @@ class TurnContext:
     active_run_domain: str | None = None
     has_reply_ref: bool = False
     has_attachments: bool = False
+    # The deterministic refusal/cancellation verdict over TRUSTED user text, resolved before any model
+    # call. Typed loosely to keep this module dependency-light; see `user_action_boundary`.
+    action_boundary: object | None = None
 
 
 @dataclass(frozen=True)

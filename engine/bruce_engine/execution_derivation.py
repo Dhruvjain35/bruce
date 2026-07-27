@@ -113,6 +113,27 @@ def _chat(turn: SemanticTurn, rule: str) -> Derivation:
 def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
     """SemanticTurn + runtime facts -> execution class. Pure, total, and ordered by precedence."""
 
+    # -1. THE DETERMINISTIC VETO. Ahead of the model's reading, ahead of pending-decision continuation,
+    #     ahead of domain and operation derivation. The model drove false actions from 0.281 to 0.061 and
+    #     will never reach zero, because it is a probabilistic reader; this is the boundary it cannot
+    #     cross. Negative, withdrawal, cancellation and ambiguous are TERMINAL for the turn — nothing
+    #     downstream may upgrade them, and only a later trusted turn can create authorization.
+    boundary = ctx.action_boundary
+    if boundary is not None and getattr(boundary, "blocks_execution", None) and boundary.blocks_execution():
+        from . import user_action_boundary as uab
+        verdict = uab.reconcile(boundary, turn.decision_polarity.value)
+        if boundary.target is uab.Target.provider_entity:
+            # "cancel it and delete the event" names something that already exists on the provider.
+            # Stopping Bruce's work is not the same operation as deleting a provider entity, and that
+            # one needs its own resolution and its own authorization.
+            return _clarify("provider_entity_needs_its_own_authorization", turn, "veto_provider_entity")
+        return Derivation(execution_class=_CHAT, action="answer", decision_id=ctx.pending_decision_id,
+                          continuation_run_id=ctx.active_run_id, confidence=turn.confidence,
+                          needs_clarification=(verdict == uab.CONTRADICTION_CLARIFY),
+                          clarification_reason=("boundary_" + boundary.polarity.value),
+                          rule="deterministic_veto_" + boundary.polarity.value,
+                          ambiguity=(verdict,) if verdict != uab.AGREE else ())
+
     # 0. A REFUSAL STOPS EVERYTHING. Highest precedence, ahead of every other reading, and deliberately
     #    not conditioned on there being a pending Decision — an exhaustive sweep found that a decline with
     #    nothing pending fell straight through to the executable path and derived a write. "Don't" is the
