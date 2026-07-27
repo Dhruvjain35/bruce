@@ -82,6 +82,11 @@ async def _lifespan(_app: "FastAPI"):
     if os.environ.get("BRUCE_INPROC_WORKER", "").strip().lower() in {"1", "true", "yes", "on"}:
         _worker = IntakeWorker(PostgresJobStore())
         _worker.start()
+    # Open the routing model's connection at boot, not on a student's first message: measured, the first
+    # call after a cold start took >3000ms and breached the routing deadline while every later call sat
+    # around 1000ms. No-op unless the semantic router is enabled, and never allowed to block startup.
+    from . import semantic_triage
+    asyncio.get_running_loop().create_task(semantic_triage.warmup())
     yield
     if _worker is not None:
         await _worker.stop()

@@ -106,6 +106,88 @@ class CompactRouterModel:
         return _to_response(result.output)
 
 
+class SemanticRouterModel:
+    """M2 Stage-1 + Stage-3: read MEANING with a small fast model, then DERIVE the execution class in
+    deterministic code.
+
+    Same `RouterModelProvider` interface as `CompactRouterModel`, so the pipeline is unchanged and the two
+    can be measured head to head on identical inputs. The difference is entirely in who decides what: the
+    model is no longer asked whether something is a background mission, because it cannot see the leases,
+    the connections, or the notification guarantees that make that a mission.
+
+    The confidence floor lives in `execution_derivation.MIN_CONFIDENCE` — ONE floor, applied where the
+    routing decision is actually made. A low-confidence read here becomes a clarifying question, which is
+    a real routing outcome and must not be re-gated into the silent deterministic default; that is why
+    `semantic_policy()` sets the transport-level floor to zero.
+    """
+
+    provider = "openai"
+    model = llm.MODEL_ROUTING
+
+    def __init__(self, triage_provider=None):
+        self._triage = triage_provider
+
+    async def classify(self, request: RouterModelRequest) -> RouterModelResponse:
+        from . import execution_derivation, semantic_contracts, semantic_triage
+
+        body = semantic_triage.render_request(
+            request.text, live_families=live_capability_families(request),
+            reply_summary=request.reply_summary,
+            open_task=(f"{request.active_run.domain} — {request.active_run.goal_summary}"
+                       if request.active_run else None),
+            awaiting_decision=bool(request.pending_decision_id
+                                   or (request.active_run and request.active_run.awaiting_decision)))
+        turn = await semantic_triage.triage(body, provider=self._triage)
+        if isinstance(turn, semantic_contracts.TriageFailure):
+            # Explicit, not silent. A partial read (an unrecognised optional field) is still usable; a
+            # timeout or transport loss is not, and raising sends the caller to the deterministic default
+            # with a logged reason rather than a fabricated chat classification.
+            if turn.partial is None:
+                raise RuntimeError(f"triage_failed:{turn.reason}")
+            turn = turn.partial
+
+        ctx = await self._context(request)
+        d = execution_derivation.derive(turn, ctx)
+        return RouterModelResponse(
+            execution_class=ExecutionClass(d.execution_class),
+            action=GoalAction(d.action) if d.action else None,
+            domain=d.domain, candidate_capabilities=d.capabilities,
+            continuation_run_id=d.continuation_run_id, correction_of_run_id=d.correction_of_run_id,
+            confidence=d.confidence, ambiguity=d.ambiguity,
+            # `needs_deeper_planning` means "a heavier planner would decide differently", which is exactly
+            # what Stage 1 reports in `needs_frontier`. It is NOT the same as needing a clarifying
+            # question: a question is answered by the student, not by more planning.
+            needs_deeper_planning=bool(getattr(turn, "needs_frontier", False)))
+
+    async def _context(self, request: RouterModelRequest):
+        """Runtime facts. Falls back to the request's own summary when there is no user to look up, so the
+        harness can exercise derivation without a database."""
+        from . import execution_derivation
+        from .semantic_contracts import TurnContext
+
+        if request.user_id:
+            return await execution_derivation.build_context(UUID(request.user_id),
+                                                            has_reply_ref=request.has_reply_ref)
+        return TurnContext(
+            live_families=frozenset(), live_capabilities=frozenset(),
+            pending_decision_id=request.pending_decision_id,
+            active_run_id=request.active_run.run_id if request.active_run else None,
+            active_run_domain=request.active_run.domain if request.active_run else None,
+            has_reply_ref=request.has_reply_ref)
+
+
+def live_capability_families(request: RouterModelRequest) -> tuple[str, ...]:
+    """Registry families ("calendar", "gmail") rendered in the semantic layer's provider-free vocabulary."""
+    seen = {"gmail": "communication", "email": "communication", "calendar": "calendar"}
+    return tuple(sorted({seen.get(f, f) for f in request.live_capability_families}))
+
+
+def semantic_policy() -> RouterModelPolicy:
+    """Transport-level policy for the semantic path. min_confidence=0 on purpose — see SemanticRouterModel."""
+    from . import semantic_triage
+    return RouterModelPolicy(timeout_s=semantic_triage.TRIAGE_TIMEOUT_S, min_confidence=0.0)
+
+
 async def build_request(user_id: UUID, text: str, *, has_reply_ref: bool = False,
                         reply_summary: str | None = None) -> RouterModelRequest:
     """Assemble the COMPACT request from bounded DB reads (only runs when Stage 0 was inconclusive). Every
@@ -142,7 +224,7 @@ async def build_request(user_id: UUID, text: str, *, has_reply_ref: bool = False
 
     return RouterModelRequest(text=text or "", has_reply_ref=has_reply_ref, reply_summary=reply_summary,
                               active_run=active, pending_decision_id=pending, top_entities=entities,
-                              live_capability_families=families)
+                              live_capability_families=families, user_id=str(user_id))
 
 
 @dataclass(frozen=True)

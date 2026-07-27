@@ -165,14 +165,26 @@ async def _stage1(user_id: UUID, text: str, *, has_reply_ref: bool, model=None) 
     """The COMPACT router model (Phase C), reached only when Stage 0 was inconclusive. `model` is an injected
     RouterModelProvider (a fake in tests); in production the CompactRouterModel is used when BRUCE_ROUTER_
     STAGE1 is on. Any timeout/error/invalid/low-confidence -> the deterministic default (never blocks)."""
-    from . import router_model
-    provider = model if model is not None else (router_model.CompactRouterModel()
-                                                if router_model.stage1_enabled() else None)
+    from . import router_model, semantic_triage
+
+    # M2: when the semantic path is on, understanding and orchestration are separate layers
+    # (SemanticRouterModel), and the confidence floor lives in the derivation rather than in the transport
+    # policy — so the policy floor is zeroed rather than re-gating a deliberate clarifying question back
+    # into the silent default.
+    policy = None
+    if model is not None:
+        provider = model
+    elif semantic_triage.enabled():
+        provider, policy = router_model.SemanticRouterModel(), router_model.semantic_policy()
+    elif router_model.stage1_enabled():
+        provider = router_model.CompactRouterModel()
+    else:
+        provider = None
     if provider is None:
         return _DEFAULT
     try:
         request = await router_model.build_request(user_id, text, has_reply_ref=has_reply_ref)
-        outcome = await router_model.route_stage1(request, provider=provider)
+        outcome = await router_model.route_stage1(request, provider=provider, policy=policy)
         if outcome.response is not None:
             return outcome.response.to_router_decision()
     except Exception:
