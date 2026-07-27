@@ -70,12 +70,24 @@ async def get_run(user_id: UUID, run_id: UUID) -> dict | None:
         return _to_dict(r) if r is not None else None
 
 
-async def latest_active(user_id: UUID, *, domain: str = "calendar") -> dict | None:
-    """Most recent run not in a terminal state — resumes across messages/restarts."""
+async def latest_active(user_id: UUID, *, domain: str | None = "calendar") -> dict | None:
+    """Most recent run not in a terminal state — resumes across messages/restarts.
+
+    `domain=None` means ANY domain. The old signature defaulted to "calendar" with no way to opt out,
+    which made every gmail background mission structurally invisible to callers that did not think to
+    pass a domain — including the context the conversation model reads. A missing domain is UNKNOWN,
+    never Calendar.
+    """
     async with user_session(user_id) as s:
+        conds = [schema.AgentRun.user_id == user_id]
+        if domain is not None:
+            conds.append(schema.AgentRun.domain == domain)
         r = (await s.execute(select(schema.AgentRun).where(
-            schema.AgentRun.user_id == user_id, schema.AgentRun.domain == domain,
-            schema.AgentRun.status.notin_(("completed", "failed", "cancelled"))).order_by(
+            *conds,
+            # dead_letter IS terminal — line 231's SQL already treats it so. Omitting it here meant a
+            # dead-lettered run read as ACTIVE forever, so the runtime would report in-flight work that
+            # nothing will ever advance.
+            schema.AgentRun.status.notin_(("completed", "failed", "cancelled", "dead_letter"))).order_by(
             schema.AgentRun.created_at.desc()).limit(1))).scalar_one_or_none()
         return _to_dict(r) if r is not None else None
 
