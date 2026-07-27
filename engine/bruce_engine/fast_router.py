@@ -68,12 +68,15 @@ def _has_time_expression(text: str) -> bool:
     """A concrete date/time is present ("tmr at 3", "friday 6pm", "aug 20") — a strong create signal even
     when the deterministic verbs miss the named event. Chit-chat with no concrete time returns False."""
     import datetime as _dt
-    from zoneinfo import ZoneInfo
 
     from . import temporal
-    from .calendar_schedule import DEFAULT_TZ
     try:
-        return temporal.resolve(text or "", now=_dt.datetime.now(ZoneInfo(DEFAULT_TZ))) is not None
+        # DEFAULT_TZ is America/Los_Angeles with a TODO beside it. This only asks "is a concrete time
+        # PRESENT", which is zone-insensitive for every expression except one straddling local midnight
+        # — where a Central student's "tonight at 11" could resolve against a Pacific clock two hours
+        # behind. UTC is the honest neutral reference for a presence check; the ACTUAL resolution always
+        # happens later against the user's real timezone.
+        return temporal.resolve(text or "", now=_dt.datetime.now(_dt.timezone.utc)) is not None
     except Exception:
         return False
 
