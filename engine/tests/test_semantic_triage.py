@@ -150,6 +150,26 @@ async def test_a_failed_triage_raises_so_the_router_falls_back_with_a_reason(mon
         await provider.classify(RouterModelRequest(text="hi"))
 
 
+def test_the_agent_is_built_once_so_connections_are_reused(monkeypatch):
+    """Measured: a fresh Agent per call meant a fresh HTTP client per call, and the resulting TLS
+    handshake on the first turn took 3003ms — over the 3s deadline, and the run's only fallback."""
+    built = []
+
+    class FakeAgent:
+        def __init__(self, *a, **kw):
+            built.append(1)
+
+    monkeypatch.setattr(semantic_triage, "Agent", FakeAgent)
+    monkeypatch.setattr(semantic_triage.llm, "routing_model", lambda: object())
+    p = semantic_triage.SemanticTriage()
+    p._agent(), p._agent(), p._agent()
+    assert len(built) == 1
+
+
+def test_the_default_provider_is_shared_across_turns():
+    assert semantic_triage.default_provider() is semantic_triage.default_provider()
+
+
 def test_families_reach_the_model_in_provider_free_words():
     from bruce_engine.router_model_contract import RouterModelRequest
 

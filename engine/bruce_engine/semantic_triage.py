@@ -162,8 +162,15 @@ class SemanticTriage:
     def __init__(self, *, reasoning: str | None = None, max_tokens: int | None = None):
         self._reasoning = reasoning or TRIAGE_REASONING
         self._max_tokens = max_tokens or TRIAGE_MAX_TOKENS
+        self._cached: Agent | None = None
 
     def _agent(self) -> Agent:
+        """Built ONCE and reused. Constructing an Agent per call builds a fresh HTTP client per call, so
+        every turn paid a full TLS handshake — measured as a 3003ms first call that blew the 3s deadline
+        and became the only mechanical fallback in the run. Connection reuse is the fix, not a longer
+        deadline: a longer deadline would keep the cost and merely stop reporting it."""
+        if self._cached is not None:
+            return self._cached
         from pydantic_ai.models.openai import OpenAIChatModelSettings
         settings = OpenAIChatModelSettings(
             openai_reasoning_effort=self._reasoning,   # a classification does not need reasoning tokens
@@ -172,12 +179,25 @@ class SemanticTriage:
             # caching floor — measured cache_read_tokens is 0 today.
             openai_prompt_cache_key="bruce-semantic-triage-v1",
         )
-        return Agent(llm.routing_model(), output_type=NativeOutput(_TriageOut),
-                     system_prompt=_SYSTEM, model_settings=settings)
+        self._cached = Agent(llm.routing_model(), output_type=NativeOutput(_TriageOut),
+                             system_prompt=_SYSTEM, model_settings=settings)
+        return self._cached
 
     async def read(self, body: str) -> SemanticTurn:
         result = await self._agent().run(body)
         return to_semantic_turn(result.output)
+
+
+_DEFAULT_PROVIDER: SemanticTriage | None = None
+
+
+def default_provider() -> SemanticTriage:
+    """One process-wide provider, so the connection pool survives across turns. A per-call provider would
+    reintroduce the per-call HTTP client the cached agent exists to avoid."""
+    global _DEFAULT_PROVIDER
+    if _DEFAULT_PROVIDER is None:
+        _DEFAULT_PROVIDER = SemanticTriage()
+    return _DEFAULT_PROVIDER
 
 
 def _classify_failure(exc: Exception) -> str:
@@ -208,7 +228,7 @@ async def triage(body: str, *, provider: SemanticTriage | None = None, timeout_s
     Retry policy, deliberately narrow: a transport error is a lost packet and retrying is nearly free; a
     timeout means the budget is already spent, so retrying it would double the very latency being
     protected; a validation failure would return the same answer twice."""
-    provider = provider or SemanticTriage()
+    provider = provider or default_provider()
     deadline = timeout_s if timeout_s is not None else TRIAGE_TIMEOUT_S
     t0 = time.perf_counter()
 
