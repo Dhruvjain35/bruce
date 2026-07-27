@@ -22,6 +22,11 @@ MIGRATION_LANES: dict[str, str] = {
     "0024": "runtime",             # calendar_event_entities (R7)
     "0025": "runtime",             # agent_runs background-mission lease columns (G0.5)
     "0026": "runtime",             # gmail_sent_ledger — Gmail exactly-once send ledger (Phase G)
+    # Two lanes run in parallel from head 0026 (#121a authorization, #121b typed memory). The numbers are
+    # assigned HERE, up front, by the one owner — which is the whole point of this file. Without it both
+    # lanes cut a "0027" in separate worktrees and the chain forks into a multi-head on merge day.
+    "0027": "authorization",       # authorization_evidence + authorization_refusals — durable consent (#121a)
+    "0028": "memory",              # typed memory records (#121b)
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the

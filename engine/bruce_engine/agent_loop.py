@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Protocol
 from uuid import UUID
 
-from . import agent_run_store, execution_gate, tool_registry
+from . import agent_run_store, execution_gate, mutation_gateway, tool_registry
 from .runtime_contracts import ActionType, ExecutionClass, NextAction, ToolOutcome, ToolResult
 
 log = logging.getLogger("bruce.agent_loop")   # content-free: run ids / statuses only, never user text
@@ -109,16 +109,19 @@ async def _persist(user_id: UUID, ruid: UUID | None, **fields) -> None:
 
 async def run_direct_action(user_id: UUID, *, executor: CapabilityExecutor,
                             idempotency_key: str | None = None,
-                            authorization=None, conversation_id: str | None = None) -> AgentRunResult:
+                            authorization=None, authorization_id: str | None = None,
+                            conversation_id: str | None = None) -> AgentRunResult:
     """Tier-0 execution: run the executor's VERIFIED tool once and commit the run's terminal state from the
     ToolResult. Never claims done unless the read-back verified it. The AgentRun record is AUDIT/durability
     and strictly BEST-EFFORT — a run-store hiccup must never break, delay, or precede the actual provider
     operation or its honest reply (same discipline as calendar_schedule's best-effort entity record).
 
-    ``authorization`` is the AuthorizationEvidence permitting this exact operation. It has no default that
-    means "trusted": None is a denial, and the executor's provider call is never reached. Callers that
-    genuinely have consent mint it from the student's own trusted message; callers that do not are
-    describing something nobody agreed to.
+    Consent arrives one of two ways, and neither has a default meaning "trusted". A foreground turn
+    passes ``authorization`` — evidence just minted from the student's own trusted words, which the
+    gateway persists and then reloads. A woken background run passes ``authorization_id`` and nothing
+    else: it may not carry the verdict, only the pointer, because the whole point of the wait is that the
+    world may have changed inside it. Neither is optional; None for both is a denial and the executor's
+    provider call is never reached.
     """
     ruid = await _create_run(user_id, executor, idempotency_key)
     action = executor.build_action()
@@ -142,39 +145,51 @@ async def run_direct_action(user_id: UUID, *, executor: CapabilityExecutor,
     gate_provider = getattr(executor, "gate_provider", None)
     gate_operation = getattr(executor, "gate_operation", None)
     gate_args = executor.gate_arguments() if hasattr(executor, "gate_arguments") else None
-    if (not gate_provider or not gate_operation or gate_args is None) and not execution_gate.unchecked():
-        gate_v = execution_gate.Verdict(allowed=False, reason="executor_declares_no_gate_binding")
+
+    async def _perform():
+        # Faults are turned into a ToolResult HERE rather than escaping into the gateway. An exception
+        # crossing the gateway would leave it unable to tell "the provider failed" from "the boundary
+        # stopped it", and those two need different replies and different audit rows.
+        try:
+            return await executor.execute(user_id)
+        except execution_gate.UnauthorizedExecution as exc:
+            return ToolResult(ToolOutcome.forbidden, executor.capability, action.provider or "",
+                              action.operation or "", reason=f"backstop:{exc}"[:200])
+        except Exception:
+            return ToolResult(ToolOutcome.provider_error, executor.capability, action.provider or "",
+                              action.operation or "", reason="executor_raised")
+
+    if execution_gate.unchecked():                       # provider-semantics test; see execution_gate
+        result = mutation_gateway.GatewayResult(True, "allow", value=await _perform())
+    elif not gate_provider or not gate_operation or gate_args is None:
+        result = mutation_gateway.GatewayResult(False, "executor_declares_no_gate_binding")
     else:
-        gate_v = execution_gate.evaluate(
-            authorization, user_id=user_id, provider=gate_provider, operation=gate_operation,
-            arguments=gate_args, attempt_key=idempotency_key, conversation_id=conversation_id)
-    if gate_v.denied:
+        # The gateway is the ONE door. This loop no longer authorizes anything — it reloads by id (or
+        # persists freshly minted evidence and then reloads), rechecks the ten conditions against the
+        # world as it is now, and only then performs the call. A foreground turn and a woken mission take
+        # exactly the same path, so the durable one is not a special case only background code exercises.
+        common = dict(provider=gate_provider, operation=gate_operation, arguments=gate_args,
+                      perform=_perform, conversation_id=conversation_id, attempt_key=idempotency_key)
+        if authorization_id:
+            result = await mutation_gateway.execute(user_id, authorization_id=authorization_id, **common)
+        else:
+            result = await mutation_gateway.execute_with_evidence(user_id, authorization, **common)
+
+    if result.denied:
         tr = ToolResult(ToolOutcome.forbidden, executor.capability, action.provider or "",
-                        action.operation or "", reason=f"authorization:{gate_v.reason}")
+                        action.operation or "", reason=f"authorization:{result.reason}")
         await _persist(user_id, ruid, status="failed", current_action=_action_dict(action),
                        last_tool_result=_tool_result_dict(tr),
                        verification_result={"verified": False, "reason": tr.reason},
                        completed_at=datetime.now(timezone.utc))
-        log.warning("direct_action_forbidden cap=%s reason=%s", executor.capability, gate_v.reason)
+        log.warning("direct_action_forbidden cap=%s reason=%s", executor.capability, result.reason)
         return AgentRunResult(str(ruid) if ruid else "", "failed", tr, False)
 
     await _persist(user_id, ruid, status="executing", current_action=_action_dict(action))
-
-    # THE ACTUAL WORK — outside any audit try/except so its real ToolResult always flows back to the reply.
-    # The authorization is open only for the duration of this one call; `execution_gate.require` at the
-    # adapter re-derives the fingerprint from what is actually being sent, so a layer in between that
-    # rewrote a time or a recipient is caught there rather than here.
-    try:
-        with execution_gate.open_authorization(
-                authorization, user_id=user_id, provider=gate_provider, operation=gate_operation,
-                arguments=gate_args, attempt_key=idempotency_key, conversation_id=conversation_id):
-            tr = await executor.execute(user_id)
-    except execution_gate.UnauthorizedExecution as exc:
-        tr = ToolResult(ToolOutcome.forbidden, executor.capability, action.provider or "",
-                        action.operation or "", reason=f"backstop:{exc}"[:200])
-    except Exception:
+    tr = result.value
+    if not isinstance(tr, ToolResult):
         tr = ToolResult(ToolOutcome.provider_error, executor.capability, action.provider or "",
-                        action.operation or "", reason="executor_raised")
+                        action.operation or "", reason="executor_returned_no_tool_result")
 
     status = _status_for(tr)
     fields: dict = {

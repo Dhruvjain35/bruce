@@ -74,9 +74,13 @@ def _run(c):
 
 
 async def _seed(uid):
-    """A user with a genuinely connected, fully scoped Google account. Everything except authorization is
-    in place, so a zero count can only mean the boundary held."""
+    """A user with a genuinely connected, fully scoped Google account AND a live access grant. Everything
+    except authorization is in place, so a zero count can only mean the boundary held — and in particular
+    it does not mean the write was stopped by a missing entitlement, which is what an unenrolled fixture
+    would have measured instead."""
+    from bruce_engine import access_control
     await users.ensure(uid, auth_provider="test")
+    await access_control.enroll_staging_test(uid, actor="test", reason="authorization zero-call proof")
     async with user_session(uid) as s:
         s.add(schema.Integration(
             user_id=uid, provider=oauth_google.PROVIDER, provider_account_id=ACCOUNT,

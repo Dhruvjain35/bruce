@@ -183,7 +183,7 @@ def test_full_chain_upgrades_and_seeds_as_nonsuperuser_owner(migrated_db):
         return heads, owner, forced, admin_seed, worker_seed
 
     heads, owner, forced, admin_seed, worker_seed = asyncio.run(_check())
-    assert heads == ["0026_gmail_sent_ledger"], f"expected exactly one head at 0026, got {heads}"
+    assert heads == ["0027_authorization_evidence"], f"expected exactly one head at 0027, got {heads}"
     assert owner == MIGRATOR, f"migration role must OWN the tables, owner={owner}"  # req 2
     assert forced is True, "capability_global_state must have FORCE ROW LEVEL SECURITY"  # req 3
     assert admin_seed >= 1, "0013 capability_global_state seed missing (app_is_admin path)"  # req 5
@@ -298,7 +298,7 @@ def test_downgrade_and_reupgrade_roundtrip(migrated_db):
         finally:
             await c.close()
 
-    assert asyncio.run(_head()) == ["0026_gmail_sent_ledger"], "round-trip must return to head 0026"
+    assert asyncio.run(_head()) == ["0027_authorization_evidence"], "round-trip must return to head 0027"
 
 
 # (A3 rollback compatibility) a destructive 0018 downgrade must FAIL CLOSED once the graph is populated,
