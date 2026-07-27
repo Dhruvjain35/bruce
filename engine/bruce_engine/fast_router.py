@@ -154,6 +154,13 @@ async def _stage0(user_id: UUID, text: str, *, has_attachments: bool, has_reply_
 _DEFAULT = RouterDecision(ExecutionClass.fast_conversation, action=GoalAction.answer, source="router_default")
 
 
+def _shadow_enabled() -> bool:
+    """Miss telemetry, on by default. Off is the escape hatch, not the norm — the whole point is that
+    misses stop being invisible. Kill switch: BRUCE_ROUTER_SHADOW_OFF."""
+    import os
+    return os.environ.get("BRUCE_ROUTER_SHADOW_OFF", "").strip().lower() not in {"1", "true", "yes", "on"}
+
+
 async def _stage1(user_id: UUID, text: str, *, has_reply_ref: bool, model=None) -> RouterDecision:
     """The COMPACT router model (Phase C), reached only when Stage 0 was inconclusive. `model` is an injected
     RouterModelProvider (a fake in tests); in production the CompactRouterModel is used when BRUCE_ROUTER_
@@ -188,4 +195,17 @@ async def route(user_id: UUID, text: str, *, has_attachments: bool = False, has_
     d = await _stage1(user_id, text, has_reply_ref=has_reply_ref, model=model)
     timing.stage1_ms = (time.perf_counter() - t1) * 1000.0
     timing.total_ms = timing.stage0_ms + timing.stage1_ms
+
+    # M1B SHADOW: Stage 0 missed. Today that silently becomes fast_conversation, so a paraphrase the
+    # router does not recognise is indistinguishable from a correct chat classification and the true
+    # miss rate is unmeasurable. Record WHY the miss happened; change nothing about the decision.
+    # Deliberately makes no model call — a shadow semantic call on every miss would add exactly the
+    # latency that got Stage-1 gated off, on turns that are already falling through.
+    if _shadow_enabled():
+        try:
+            from . import router_shadow
+            if router_shadow.is_miss(d):
+                await router_shadow.classify_miss(user_id, text)
+        except Exception:
+            pass                                    # observability must never break a turn
     return d, timing
