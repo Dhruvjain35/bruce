@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from . import (capability_truth, context_compiler, conversation_context, conversation_outcomes,
+from . import (capability_snapshot, capability_truth, context_compiler, conversation_context, conversation_outcomes,
                conversation_store, messaging_outbound, response_composer, router_authority, technical_render)
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, RiskLevel
@@ -254,9 +254,19 @@ class _Runtime:
             # answered instead of the replied-to image A. World/entity/operational still ground the reply. The
             # referenced content (fenced as DATA below) stands on its own. Compilation never drops a turn.
             include_episodic = not (explicit_ref and capsule.has_reference)
+            # M1: the runtime already knows what is live. Hand that to the model instead of letting it
+            # guess — a guessed "i can't add it to your calendar" on a fully-scoped Google connection is
+            # what blocked a P0 verification. Fault-isolated: a snapshot error degrades to no block, never
+            # to a wrong one.
+            try:
+                cap_snapshot = await capability_snapshot.snapshot(user_id)
+            except Exception:
+                cap_snapshot = None
+                log.info("capability_snapshot_error pmid=%s", pmid)
             try:
                 compiled = await context_compiler.compile(
-                    user_id, recent, include_episodic=include_episodic, profile=profile)
+                    user_id, recent, include_episodic=include_episodic, profile=profile,
+                    capabilities=cap_snapshot)
                 ctx = compiled.text
                 if compiled.dropped:
                     log.info("ctx_compiled pmid=%s tokens=%s blocks=%s dropped=%s", pmid, compiled.est_tokens,
@@ -307,6 +317,17 @@ class _Runtime:
         # P0.5 capability-truth guard: never let a model reply DENY a capability that is actually live.
         # Cheap regex first; only pay for the connection lookup when the reply reads like a calendar denial.
         reply_out = outcome.reply
+
+        # M1 contradiction validator: a reply may NEVER deny a capability the snapshot says is live.
+        # Structural, not a denial-phrase regex — the previous guard was exactly that and missed
+        # "i can't" written with a curly apostrophe, so a false denial shipped to a student.
+        _snap = locals().get("cap_snapshot")
+        if _snap is not None:
+            _wrong = capability_snapshot.contradicts(reply_out, _snap)
+            if _wrong:
+                log.info("capability_contradiction pmid=%s family=%s", pmid, _wrong)
+                reply_out = capability_truth.grounded_calendar_correction(msg.text) \
+                    if _wrong == "calendar" else reply_out
 
         # C1/D: when a MISSION lane ran, the runtime's own outcome decides the words, not the reasoner.
         # The reasoner writes without knowing what was executed, and that produced BOTH live failures we

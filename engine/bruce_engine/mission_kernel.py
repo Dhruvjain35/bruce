@@ -141,7 +141,12 @@ async def create_pending_calendar_approval(
         # the EXACT event to create on approval — so approval executes what was offered, not a re-parse
         "pending_event": {"title": event.title, "start": event.start, "end": event.end,
                           "location": event.location, "source": event.source},
-        "decision": {"type": "approve_calendar_create", "status": "pending"},
+        # NO status here. The mission ROW (status + phase) is the single source of decision truth;
+        # a second copy in JSON is a divergence waiting to happen and one already occurred: a mission
+        # cancelled by a refusal still read `goal.decision.status == "pending"`. Nothing consumed it, so
+        # it was a trap rather than a live bug — removed at the source instead of kept in sync.
+        # Read `decision_status(mission)` instead.
+        "decision": {"type": "approve_calendar_create"},
     }
     phase = MissionPhase.awaiting_approval.value
     async with user_session(user_id) as s:
@@ -168,6 +173,32 @@ async def create_pending_calendar_approval(
             user_id=user_id, mission_id=mission.id, phase=phase, short_status="awaiting_approval"))
         await s.flush()
         return MissionCreation(mission_id=mission.id, created=True, phase=phase)
+
+
+# Phases/statuses that mean the decision is CLOSED. Derived in one place so callers never re-derive it.
+_RESOLVED_PHASES = {"blocked", "succeeded", "failed", "cancelled"}
+_RESOLVED_STATUSES = {"cancelled", "succeeded", "failed", "done"}
+
+
+def decision_status(mission) -> str:
+    """The ONE canonical read of a pending decision's state: pending | rejected | resolved.
+
+    Derived from the mission row, never from the embedded `goal.decision` JSON — that field carried a
+    stale "pending" on an already-cancelled mission. Accepts a row or a dict so legacy rows that still
+    contain the old field resolve correctly regardless.
+    """
+    def _g(k):
+        return mission.get(k) if isinstance(mission, dict) else getattr(mission, k, None)
+
+    phase, status = (_g("phase") or ""), (_g("status") or "")
+    short = (_g("short_status") or "").lower()
+    if "reject" in short or status == "cancelled":
+        return "rejected"
+    if phase in _RESOLVED_PHASES or status in _RESOLVED_STATUSES:
+        return "resolved"
+    if phase == MissionPhase.awaiting_approval.value:
+        return "pending"
+    return "resolved"
 
 
 async def latest_pending_calendar_mission(user_id: UUID) -> dict | None:

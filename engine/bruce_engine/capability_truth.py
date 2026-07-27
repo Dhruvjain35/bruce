@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import re
 
+from . import text_norm
+
 from . import tool_registry
 
 # "i can't (actually) schedule/add/update/put/create/delete … calendar/event", "unable to add to your
@@ -40,7 +42,10 @@ _MUTATE_RE = re.compile(r"\b(update|updating|change|changing|move|moving|resched
 def mentions_calendar_denial(text: str | None) -> bool:
     """Cheap first pass (no DB): does this reply DENY a calendar capability? Only then does the caller pay
     for a connection lookup to decide whether the denial is actually false."""
-    return bool(_CAL_DENIAL_RE.search(text or ""))
+    # fold_match FIRST: this guard missed "i can't add it to your calendar" in production purely because
+    # the model wrote a curly apostrophe and the pattern expects a straight one. The denial stood, and a
+    # student was told Bruce could not touch a calendar it has write access to.
+    return bool(_CAL_DENIAL_RE.search(text_norm.fold_match(text)))
 
 
 def grounded_calendar_correction(user_text: str | None = None) -> str:

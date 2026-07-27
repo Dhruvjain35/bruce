@@ -32,6 +32,9 @@ _MAX_TURNS = 8               # episodic window ceiling (budget may trim below th
 
 # layer priorities — higher survives truncation. World/operational are tiny and decision-critical; the raw
 # conversation window is the largest and least essential, so it yields budget first.
+# Capability sits ABOVE world state: what Bruce can do is the fact the model most often gets wrong, and
+# a truncated context that drops it returns the model to guessing — the exact defect this closes.
+_P_CAPABILITY = 105
 _P_WORLD, _P_OPERATIONAL, _P_ENTITY, _P_EPISODIC = 100, 90, 80, 50
 
 _NO_HISTORY = "No prior conversation."
@@ -162,12 +165,16 @@ def _trim_episodic(text: str, budget_tokens: int) -> str | None:
 
 async def compile(user_id, recent, *, include_episodic: bool = True,
                   profile: VoiceProfile | None = None,
+                  capabilities=None,
                   token_budget: int = DEFAULT_TOKEN_BUDGET) -> CompiledContext:
     """Build the bounded context for one turn. `recent` is the episodic window
     (conversation_store.TurnBrief list); `include_episodic=False` withholds it (an explicit reply-target
     owns the context) while world/entity/operational still ground the reply."""
     candidates: list[tuple[str, int, str]] = []
     for layer, prio, text in (
+        # capability truth FIRST: the runtime already knows what is live, and the model previously never
+        # received it, so it denied a connected calendar to a student.
+        ("capability", _P_CAPABILITY, capabilities.render() if capabilities is not None else ""),
         ("world", _P_WORLD, await _world_block(user_id)),
         ("operational", _P_OPERATIONAL, await _operational_block(user_id)),
         ("entity", _P_ENTITY, await _entity_block(user_id)),
