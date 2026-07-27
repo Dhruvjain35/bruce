@@ -38,6 +38,22 @@ _CAPABILITY: dict[tuple[Family, OperationFamily], str] = {
     (Family.communication, OperationFamily.find): "gmail.search_messages",
 }
 
+# Which operations each family NATIVELY performs — derived from the table above so the two can never
+# disagree. Used to break a tie the model itself flagged: "write to my teacher about the deadline" comes
+# back as {communication, calendar} because a deadline is date-shaped, but only one of those families can
+# `send`. Capability truth resolves the ambiguity for free, with no phrase rule and no second model call.
+_NATIVE_OPS: dict[Family, frozenset[OperationFamily]] = {}
+for _fam, _op in _CAPABILITY:
+    _NATIVE_OPS[_fam] = _NATIVE_OPS.get(_fam, frozenset()) | {_op}
+
+# Within-family operation synonyms. "draft an email" is `create` in ordinary language, and Bruce has no
+# standalone draft capability — composing, showing, and sending on approval is ONE route. So `create` in
+# the communication family IS the send route, which already requires a human approval before the write.
+# Deliberately narrow: a synonym only exists where the runtime genuinely has one road.
+_SYNONYM: dict[tuple[Family, OperationFamily], OperationFamily] = {
+    (Family.communication, OperationFamily.create): OperationFamily.send,
+}
+
 # The provider-facing domain string the rest of the pipeline already speaks.
 _DOMAIN = {Family.calendar: "calendar", Family.communication: "gmail", Family.memory: "world"}
 
@@ -53,6 +69,27 @@ _CHAT = "fast_conversation"
 _DIRECT = "direct_action"
 _FOREGROUND = "foreground_agent"
 _BACKGROUND = "background_mission"
+
+
+def resolve_family(turn: SemanticTurn) -> tuple[Family | None, str]:
+    """Pick the one family this turn is about, using the operation to break a tie.
+
+    A contested read is not automatically a question. When the model offers two families but only one of
+    them can perform the operation it also named, the runtime knows the answer and asking the student
+    would be theatre. Only a genuine tie — two families that both support the operation — is escalated.
+    """
+    seen: list[Family] = []
+    for f in turn.domain_candidates:
+        if f is not Family.unknown and f not in seen:
+            seen.append(f)
+    if not seen:
+        return None, "no_domain"
+    if len(seen) == 1:
+        return seen[0], ""
+    supporting = [f for f in seen if turn.operation_family in _NATIVE_OPS.get(f, frozenset())]
+    if len(supporting) == 1:
+        return supporting[0], ""
+    return None, "multiple_domains"
 
 
 def _clarify(reason: str, turn: SemanticTurn, rule: str) -> Derivation:
@@ -107,11 +144,9 @@ def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
 
     # 6. Executable / durable. Resolve the family before anything else — a goal aimed at a family that is
     #    not live must be answered honestly, not routed at a neighbouring tool.
-    family = turn.single_family()
+    family, why = resolve_family(turn)
     if family is None:
-        real = tuple(f for f in turn.domain_candidates if f is not Family.unknown)
-        return _clarify("multiple_domains" if len(real) > 1 else "no_domain", turn,
-                        "family_unresolved")
+        return _clarify(why, turn, "family_unresolved")
 
     if family is Family.knowledge:
         return _chat(turn, "knowledge_only")
@@ -128,7 +163,7 @@ def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
                           confidence=turn.confidence, rule="family_not_live",
                           ambiguity=("family_not_live",))
 
-    op = turn.operation_family
+    op = _SYNONYM.get((family, turn.operation_family), turn.operation_family)
     if op in (OperationFamily.none, OperationFamily.answer):
         return _clarify("operation_unknown", turn, "operation_unresolved")
 

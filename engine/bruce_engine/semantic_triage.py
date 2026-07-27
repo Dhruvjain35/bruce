@@ -12,12 +12,17 @@ WHAT CHANGED AND WHY IT IS NOT COSMETIC.
   for email, at 0.96, and was graded wrong. It was not wrong. Families are semantic and closed, and the
   provider mapping lives in the orchestrator.
 
-  Latency. The measured p95 was 6798ms against a 500ms budget. Three causes, all mechanical, all fixed
-  here: gpt-5.x defaults to medium reasoning effort and was burning reasoning tokens on a classification
-  (`minimal`); the output schema was prompted rather than provider-native, so a whole JSON object had to
-  be produced conversationally and re-parsed (`NativeOutput`); and the per-user capability list sat in the
-  system prompt, moving the cacheable prefix on every user (invariant text is now the stable prefix, with
-  a fixed cache key).
+  Latency. The measured p95 was 6798ms against a 500ms budget. Two real causes, both fixed here: the
+  model was spending reasoning tokens on a classification (`reasoning_effort: none` — measured 0 reasoning
+  tokens and 44 output tokens, against 25 reasoning tokens and 75 output at `low`), and the output was
+  prompted JSON rather than provider-native, so a whole object had to be produced conversationally and
+  re-parsed (`NativeOutput`). The invariant text is also kept as a stable prefix with a fixed cache key —
+  but honestly, at 649 input tokens the prompt sits below OpenAI's 1024-token caching threshold and
+  measured `cache_read_tokens` is 0, so that is preparation for a longer prompt, not a live saving.
+
+  What remains is a network round trip plus ~44 generated tokens, measured at p50 ~900ms. No amount of
+  prompt work takes a remote model call under the 500ms budget; that budget is only met by NOT calling a
+  model, which is what Stage 0 is for.
 
   Failure honesty. Every failure returns an explicit reason. The old path converted timeout, transport
   error, invalid schema and low confidence alike into fast_conversation, which is precisely why a missed
@@ -45,8 +50,9 @@ _TRUTHY = {"1", "true", "yes", "on"}
 
 # A hard, short deadline. Routing must be cheap; on breach the caller falls back deterministically.
 TRIAGE_TIMEOUT_S = float(os.environ.get("BRUCE_TRIAGE_TIMEOUT_S", "3.0"))
-# Reasoning effort for a classification. `minimal` is the single biggest latency lever measured.
-TRIAGE_REASONING = os.environ.get("BRUCE_TRIAGE_REASONING", "minimal")
+# Reasoning effort for a classification — the single biggest latency lever. gpt-5.4-mini accepts
+# none|low|medium|high|xhigh (NOT "minimal"; that value 400s, and the 400 arrives on every call).
+TRIAGE_REASONING = os.environ.get("BRUCE_TRIAGE_REASONING", "none")
 # The output is ~40 tokens. Capping it stops a rambling generation from eating the deadline.
 TRIAGE_MAX_TOKENS = int(os.environ.get("BRUCE_TRIAGE_MAX_TOKENS", "200"))
 
@@ -162,7 +168,9 @@ class SemanticTriage:
         settings = OpenAIChatModelSettings(
             openai_reasoning_effort=self._reasoning,   # a classification does not need reasoning tokens
             max_tokens=self._max_tokens,
-            openai_prompt_cache_key="bruce-semantic-triage-v1",   # stable: the prefix never varies
+            # Stable because the prefix never varies. Inert until the prompt exceeds OpenAI's 1024-token
+            # caching floor — measured cache_read_tokens is 0 today.
+            openai_prompt_cache_key="bruce-semantic-triage-v1",
         )
         return Agent(llm.routing_model(), output_type=NativeOutput(_TriageOut),
                      system_prompt=_SYSTEM, model_settings=settings)
@@ -170,6 +178,27 @@ class SemanticTriage:
     async def read(self, body: str) -> SemanticTurn:
         result = await self._agent().run(body)
         return to_semantic_turn(result.output)
+
+
+def _classify_failure(exc: Exception) -> str:
+    """Name the failure honestly, because the name decides whether it is retried and who has to fix it.
+
+    A 4xx from the provider is a CONFIGURATION or POLICY rejection — a bad model setting, a refused
+    request — and retrying it just spends the deadline to be told the same thing. This distinction is not
+    hypothetical: an unsupported `reasoning_effort` value 400'd on 100% of calls and the first version of
+    this classifier reported it as `invalid_schema`, which pointed the investigation at the output shape
+    instead of at one wrong string in the request.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        if status in (408, 429) or status >= 500:
+            return "transport"                      # genuinely worth one more try
+        return "provider_rejected"                  # 4xx: retrying returns the same answer
+    if isinstance(exc, (ConnectionError, OSError, asyncio.IncompleteReadError)):
+        return "transport"
+    if "connection" in type(exc).__name__.lower() or "timeout" in type(exc).__name__.lower():
+        return "transport"
+    return "invalid_schema"
 
 
 async def triage(body: str, *, provider: SemanticTriage | None = None, timeout_s: float | None = None,
@@ -192,12 +221,12 @@ async def triage(body: str, *, provider: SemanticTriage | None = None, timeout_s
             return TriageFailure("timeout", ms)
         except Exception as exc:
             ms = (time.perf_counter() - t0) * 1000.0
-            transport = isinstance(exc, (ConnectionError, OSError)) or "connection" in type(exc).__name__.lower()
-            if transport and attempt == 1:
+            reason = _classify_failure(exc)
+            if reason == "transport" and attempt == 1:
                 log.info("triage retry=transport ms=%.0f", ms)      # NO exception text: it can echo the message
                 continue
-            log.info("triage failed=%s ms=%.0f", "transport" if transport else "invalid_schema", ms)
-            return TriageFailure("transport" if transport else "invalid_schema", ms)
+            log.info("triage failed=%s ms=%.0f", reason, ms)
+            return TriageFailure(reason, ms)
 
         ms = (time.perf_counter() - t0) * 1000.0
         if turn.confidence < min_confidence:

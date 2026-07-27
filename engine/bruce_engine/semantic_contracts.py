@@ -91,11 +91,8 @@ class SemanticTurn:
     confidence: float = 0.0
     uncertainty: tuple[str, ...] = ()
     needs_frontier: bool = False               # Stage 1 asking for Stage 2, not a quality signal
-
-    def single_family(self) -> Family | None:
-        """The one family this turn is about, or None when zero or several are in play."""
-        real = tuple(f for f in self.domain_candidates if f is not Family.unknown)
-        return real[0] if len(real) == 1 else None
+    # Resolving which family this turn is about lives in `execution_derivation.resolve_family`, not here:
+    # it needs the capability tables to break a tie, and two answers to that question would drift apart.
 
 
 @dataclass(frozen=True)

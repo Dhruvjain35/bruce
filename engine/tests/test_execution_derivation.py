@@ -88,9 +88,35 @@ def test_ambiguous_actionability_asks():
     assert d.needs_clarification and d.execution_class == "foreground_agent"
 
 
-def test_two_families_asks_which_one():
-    d = ed.derive(turn(domain_candidates=(Family.calendar, Family.communication)), LIVE)
+def test_the_operation_breaks_a_two_family_tie_without_asking():
+    """Measured: 'write to my teacher about the deadline' came back as {communication, calendar} because a
+    deadline is date-shaped. Only one of those can send, so the runtime already knows the answer and
+    asking would be theatre."""
+    d = ed.derive(turn(domain_candidates=(Family.communication, Family.calendar),
+                       operation_family=OperationFamily.send), LIVE)
+    assert d.execution_class == "direct_action" and d.domain == "gmail"
+
+
+def test_the_tie_break_works_in_the_other_direction_too():
+    """'stick english essay due monday on there' -> {calendar, communication} + create. Only calendar
+    natively creates."""
+    d = ed.derive(turn(domain_candidates=(Family.calendar, Family.communication),
+                       operation_family=OperationFamily.create), LIVE)
+    assert d.execution_class == "direct_action" and d.domain == "calendar"
+
+
+def test_a_genuine_tie_still_asks():
+    """Both families support `find`, so nothing in the runtime resolves it and the student must."""
+    d = ed.derive(turn(domain_candidates=(Family.calendar, Family.communication),
+                       operation_family=OperationFamily.find), LIVE)
     assert d.needs_clarification and d.clarification_reason == "multiple_domains"
+
+
+def test_drafting_an_email_takes_the_send_route():
+    """'draft an email to my counselor' reads as create. Bruce has no standalone draft capability — one
+    compose-show-approve-send route — so create in this family IS that route, not a dead end."""
+    d = ed.derive(turn(operation_family=OperationFamily.create), LIVE)
+    assert d.execution_class == "direct_action" and d.capabilities == (SEND,)
 
 
 def test_no_family_asks():
