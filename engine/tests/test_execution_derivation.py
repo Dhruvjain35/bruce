@@ -13,8 +13,8 @@ import itertools
 import pytest
 
 from bruce_engine import execution_derivation as ed
-from bruce_engine.semantic_contracts import (Actionability, Family, OperationFamily, SemanticTurn,
-                                             TurnContext, TurnRole)
+from bruce_engine.semantic_contracts import (Actionability, DecisionPolarity, Family, GoalCount,
+                                             OperationFamily, SemanticTurn, TurnContext, TurnRole)
 
 CAL = "calendar.create_event"
 SEND = "gmail.send_message"
@@ -162,11 +162,62 @@ def test_an_operation_that_does_not_exist_in_the_family_asks():
 
 # --- conversation structure outranks sentence shape ----------------------------------------------------
 
-def test_a_decision_response_belongs_to_the_run_that_asked():
-    ctx = TurnContext(live_families=LIVE.live_families, live_capabilities=LIVE.live_capabilities,
+PENDING = TurnContext(live_families=LIVE.live_families, live_capabilities=LIVE.live_capabilities,
                       pending_decision_id="dec-1", active_run_domain="calendar")
-    d = ed.derive(turn(turn_role=TurnRole.decision_response, actionability=Actionability.executable), ctx)
+
+
+def test_an_approval_belongs_to_the_run_that_asked():
+    d = ed.derive(turn(turn_role=TurnRole.decision_response, actionability=Actionability.executable,
+                       decision_polarity=DecisionPolarity.approve), PENDING)
     assert d.execution_class == "direct_action" and d.decision_id == "dec-1"
+
+
+def test_a_refusal_never_executes_the_thing_it_refused():
+    """Measured on the open set: EVERY refusal under a pending Decision executed the proposal, because
+    this branch fired on the ROLE and never read which way the answer pointed. Same shape as the refusal
+    P0, rebuilt one layer up."""
+    d = ed.derive(turn(turn_role=TurnRole.decision_response, actionability=Actionability.executable,
+                       decision_polarity=DecisionPolarity.decline), PENDING)
+    assert not ed.derives_a_write(d)
+    assert d.rule == "decision_declined" and d.decision_id == "dec-1"
+
+
+def test_an_unreadable_answer_asks_rather_than_assuming_consent():
+    d = ed.derive(turn(turn_role=TurnRole.decision_response, decision_polarity=DecisionPolarity.unclear),
+                  PENDING)
+    assert d.needs_clarification and not ed.derives_a_write(d)
+
+
+def test_declining_never_becomes_a_delete():
+    """The worst version of the bug: "please dont schedule anything" derived action=delete, turning a
+    refusal into an unrequested destructive write."""
+    for role in (TurnRole.cancellation, TurnRole.decision_response):
+        for ctx in (PENDING, LIVE, TurnContext(active_run_id="r", active_run_domain="calendar")):
+            d = ed.derive(turn(turn_role=role, actionability=Actionability.executable,
+                               operation_family=OperationFamily.cancel,
+                               domain_candidates=(Family.calendar,),
+                               decision_polarity=DecisionPolarity.decline), ctx)
+            assert not ed.derives_a_write(d), (role, ctx.pending_decision_id, d.rule)
+
+
+def test_several_goals_are_never_half_executed():
+    """Measured: "add practice friday and email coach" ran the calendar half and dropped the email. Half
+    of what was asked, with nothing telling the student which half."""
+    d = ed.derive(turn(goal_count=GoalCount.several,
+                       domain_candidates=(Family.calendar, Family.communication)), LIVE)
+    assert d.needs_clarification and d.clarification_reason == "several_goals"
+    assert not ed.derives_a_write(d)
+
+
+def test_a_status_question_does_not_start_a_second_monitor():
+    """Measured: every status question during an active Gmail run spawned a duplicate monitor of a thread
+    already being watched."""
+    ctx = TurnContext(live_families=LIVE.live_families, live_capabilities=LIVE.live_capabilities,
+                      active_run_id="run-1", active_run_domain="gmail")
+    d = ed.derive(turn(turn_role=TurnRole.continuation, actionability=Actionability.durable_monitoring,
+                       operation_family=OperationFamily.monitor), ctx)
+    assert d.execution_class == "fast_conversation" and d.rule == "monitoring_already_running"
+    assert d.continuation_run_id == "run-1"
 
 
 def test_a_decision_response_with_nothing_pending_does_not_invent_work():
@@ -180,10 +231,12 @@ def test_cancellation_with_nothing_in_flight_is_just_talk():
     assert d.execution_class == "fast_conversation"
 
 
-def test_cancellation_against_live_work_cancels_it():
+def test_cancellation_stops_bruces_own_work_and_touches_no_provider():
     ctx = TurnContext(active_run_id="run-9", active_run_domain="gmail")
     d = ed.derive(turn(turn_role=TurnRole.cancellation), ctx)
     assert d.execution_class == "direct_action" and d.continuation_run_id == "run-9"
+    assert d.rule == "stop_inflight_work"
+    assert not d.capabilities and d.action is None      # stopping a run is not a provider operation
 
 
 def test_a_bare_reference_resolves_against_open_work():
@@ -217,11 +270,13 @@ def test_derivation_is_total_over_the_whole_vocabulary():
     n = 0
     for role, act, fam, op, ctx in itertools.product(
             TurnRole, Actionability, Family, OperationFamily, contexts):
-        d = ed.derive(SemanticTurn(turn_role=role, actionability=act, domain_candidates=(fam,),
-                                   operation_family=op, confidence=0.9), ctx)
-        assert d.execution_class in classes
-        n += 1
-    assert n == 7 * 5 * 7 * 9 * 3
+        for pol in DecisionPolarity:
+            d = ed.derive(SemanticTurn(turn_role=role, actionability=act, domain_candidates=(fam,),
+                                       operation_family=op, decision_polarity=pol,
+                                       goal_count=GoalCount.one, confidence=0.9), ctx)
+            assert d.execution_class in classes
+            n += 1
+    assert n == 7 * 5 * 7 * 9 * 3 * 4
 
 
 def test_nothing_executes_against_a_capability_that_is_not_live():
@@ -229,6 +284,19 @@ def test_nothing_executes_against_a_capability_that_is_not_live():
     the runtime did not confirm."""
     for role, act, fam, op in itertools.product(TurnRole, Actionability, Family, OperationFamily):
         d = ed.derive(SemanticTurn(turn_role=role, actionability=act, domain_candidates=(fam,),
-                                   operation_family=op, confidence=0.95), LIVE)
+                                   operation_family=op, goal_count=GoalCount.one, confidence=0.95), LIVE)
         if d.execution_class in ("direct_action", "background_mission"):
             assert all(c in LIVE.live_capabilities for c in d.capabilities)
+
+
+def test_no_refusal_anywhere_in_the_vocabulary_produces_a_write():
+    """Exhaustive rather than case-by-case: a refusal is the one input where a wrong answer is
+    destructive, so every combination that carries one is checked."""
+    contexts = [LIVE, PENDING, TurnContext(active_run_id="r", active_run_domain="gmail")]
+    for role, act, fam, op, ctx in itertools.product(
+            (TurnRole.cancellation, TurnRole.decision_response), Actionability, Family,
+            OperationFamily, contexts):
+        d = ed.derive(SemanticTurn(turn_role=role, actionability=act, domain_candidates=(fam,),
+                                   operation_family=op, decision_polarity=DecisionPolarity.decline,
+                                   goal_count=GoalCount.one, confidence=0.95), ctx)
+        assert not ed.derives_a_write(d), (role, act, fam, op, d.rule)

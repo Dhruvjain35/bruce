@@ -46,6 +46,26 @@ class Actionability(str, Enum):
     ambiguous = "ambiguous"                    # plausibly work, but underspecified
 
 
+class DecisionPolarity(str, Enum):
+    """Which way a decision_response points. Its ABSENCE was a safety hole: the derivation treated every
+    decision_response under a pending Decision as consent, so "no", "nah dont", and a forwarded "yes add
+    it" from someone else all executed the proposal. Polarity is meaning, so the model reads it — but it
+    can only ever authorize when it says `approve`, and everything else declines or asks."""
+    approve = "approve"
+    decline = "decline"
+    unclear = "unclear"
+    none = "none"                  # not a response to anything Bruce asked
+
+
+class GoalCount(str, Enum):
+    """How many distinct things the turn asks for. Measured: on "add practice friday and email coach",
+    the model returned ONE family and one operation, and the runtime happily executed half the request.
+    Doing half of what was asked, silently, is worse than asking."""
+    none = "none"
+    one = "one"
+    several = "several"
+
+
 class Family(str, Enum):
     """Capability FAMILIES — semantic, provider-free, closed. The model picks from these; the
     orchestrator maps them onto live capabilities. Adding Drive/Canvas later adds a family here, never a
@@ -78,6 +98,8 @@ class SemanticTurn:
     and no idempotency concern — none of those are things a language model should be deciding."""
     turn_role: TurnRole
     actionability: Actionability
+    decision_polarity: DecisionPolarity = DecisionPolarity.none
+    goal_count: GoalCount = GoalCount.none
     domain_candidates: tuple[Family, ...] = ()
     operation_family: OperationFamily = OperationFamily.none
     desired_outcome: str | None = None

@@ -18,8 +18,8 @@ exactly what made a missed executable goal indistinguishable from correct chat.
 
 from __future__ import annotations
 
-from .semantic_contracts import (Actionability, Derivation, Family, OperationFamily, SemanticTurn,
-                                 TurnContext, TurnRole)
+from .semantic_contracts import (Actionability, DecisionPolarity, Derivation, Family, GoalCount,
+                                 OperationFamily, SemanticTurn, TurnContext, TurnRole)
 
 # Below this, a semantic read is not trusted to route work. It becomes a clarifying question rather than
 # a guess in either direction — a wrong action and a wrongly-silent chat reply are both failures.
@@ -113,19 +113,37 @@ def _chat(turn: SemanticTurn, rule: str) -> Derivation:
 def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
     """SemanticTurn + runtime facts -> execution class. Pure, total, and ordered by precedence."""
 
-    # 1. Answering a question Bruce asked outranks everything the sentence looks like. "yeah do it" is a
-    #    decision response, not a new goal, and it belongs to the run that asked.
-    if turn.turn_role is TurnRole.decision_response and ctx.pending_decision_id:
-        return Derivation(execution_class=_DIRECT, action="create", domain=ctx.active_run_domain or "calendar",
-                          decision_id=ctx.pending_decision_id, confidence=turn.confidence,
-                          rule="decision_response")
+    # 0. A REFUSAL STOPS EVERYTHING. Highest precedence, ahead of every other reading, and deliberately
+    #    not conditioned on there being a pending Decision — an exhaustive sweep found that a decline with
+    #    nothing pending fell straight through to the executable path and derived a write. "Don't" is the
+    #    one input where being wrong is destructive, so it is answered before anything else is considered.
+    if turn.decision_polarity is DecisionPolarity.decline:
+        return Derivation(execution_class=_CHAT, action="answer", decision_id=ctx.pending_decision_id,
+                          confidence=turn.confidence, rule="decision_declined")
 
-    # 2. Calling something off. Only meaningful against real in-flight work; otherwise it is just talk.
+    # 1. Answering a question Bruce asked outranks everything the sentence looks like — but ONLY an
+    #    explicit approval authorizes the work. Measured on the open set, every refusal under a pending
+    #    Decision executed the proposal, because this branch fired on the ROLE and never looked at which
+    #    way the answer pointed. That is the same shape as the refusal P0, rebuilt one layer up.
+    if turn.turn_role is TurnRole.decision_response and ctx.pending_decision_id:
+        if turn.decision_polarity is DecisionPolarity.approve:
+            return Derivation(execution_class=_DIRECT, action="create",
+                              domain=ctx.active_run_domain or "calendar",
+                              decision_id=ctx.pending_decision_id, confidence=turn.confidence,
+                              rule="decision_approved")
+        return _clarify("decision_unclear", turn, "decision_polarity_unclear")
+
+    # 2. Calling something off stops BRUCE'S OWN WORK. It never reaches a provider. Measured, this branch
+    #    used to derive action="delete", so "please dont schedule anything" produced a delete against the
+    #    calendar — an unrequested destructive write out of a refusal.
     if turn.turn_role is TurnRole.cancellation:
-        if ctx.pending_decision_id or ctx.active_run_id:
-            return Derivation(execution_class=_DIRECT, action="delete", domain=ctx.active_run_domain,
-                              decision_id=ctx.pending_decision_id, continuation_run_id=ctx.active_run_id,
-                              confidence=turn.confidence, rule="cancellation")
+        if ctx.pending_decision_id:
+            return Derivation(execution_class=_CHAT, action="answer", decision_id=ctx.pending_decision_id,
+                              confidence=turn.confidence, rule="decision_declined")
+        if ctx.active_run_id:
+            return Derivation(execution_class=_DIRECT, action=None, domain=None, capabilities=(),
+                              continuation_run_id=ctx.active_run_id, confidence=turn.confidence,
+                              rule="stop_inflight_work")
         return _chat(turn, "cancellation_nothing_pending")
 
     # 3. Deixis with no content of its own resolves against in-flight work, or it is a question.
@@ -148,6 +166,13 @@ def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
 
     if turn.actionability is Actionability.ambiguous:
         return _clarify("underspecified", turn, "ambiguous_actionability")
+
+    # 5b. Several goals in one message. The semantic layer resolves ONE operation, so executing on it
+    #     would silently do half of what was asked — measured on "add practice friday and email coach",
+    #     which ran the calendar half and dropped the email. Half is not a partial success; it is a wrong
+    #     answer the student has no way to see. Sequencing several goals is a planner's job.
+    if turn.goal_count is GoalCount.several:
+        return _clarify("several_goals", turn, "multiple_goals")
 
     # 6. Executable / durable. Resolve the family before anything else — a goal aimed at a family that is
     #    not live must be answered honestly, not routed at a neighbouring tool.
@@ -189,6 +214,21 @@ def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
     #    durable run, a lease, and exactly-once notification. This is precisely the judgement the model was
     #    being asked for and could not make.
     if turn.actionability is Actionability.durable_monitoring or op is OperationFamily.monitor:
+        # Already watching this domain? Then "any update", "still waiting?", "did they reply" is asking
+        # ABOUT the mission, not requesting a second one. Measured: every status question during an
+        # active Gmail run spawned a duplicate monitor of a thread already being monitored.
+        #
+        # Gating this on `goal_count` was tried and measured WORSE: it let status questions through as
+        # new missions and took the false-action rate from 0.012 to 0.117. No semantic field separates
+        # "watch for a reply from coach" from "did they reply" — the model marks both as a continuation
+        # wanting monitoring — so the guard stays strict and errs toward not starting a second mission.
+        # The cost is real and accepted: an explicit second watch request during an active run in the
+        # same domain is answered conversationally instead of spawning a run. A missed request is a
+        # recall miss; a spurious durable mission is an unrequested action.
+        if ctx.active_run_id and ctx.active_run_domain == domain:
+            return Derivation(execution_class=_CHAT, action="answer", domain=domain,
+                              continuation_run_id=ctx.active_run_id, confidence=turn.confidence,
+                              rule="monitoring_already_running")
         caps = (capability,)
         if op is not OperationFamily.monitor and family is Family.communication:
             # "send it and watch for a reply" is one send plus a monitor; the send is verified inside the
@@ -207,6 +247,12 @@ def derive(turn: SemanticTurn, ctx: TurnContext) -> Derivation:
     return Derivation(execution_class=_DIRECT, action=action, domain=domain, capabilities=(capability,),
                       continuation_run_id=ctx.active_run_id if turn.turn_role is TurnRole.continuation else None,
                       confidence=turn.confidence, rule="executable_single_operation")
+
+
+def derives_a_write(d: Derivation) -> bool:
+    """Does this derivation propose touching the world? Used by the refusal invariant below and by the
+    evaluation, so both ask the question the same way."""
+    return d.execution_class in (_DIRECT, _BACKGROUND) and bool(d.capabilities)
 
 
 # --- runtime facts -------------------------------------------------------------------------------------
