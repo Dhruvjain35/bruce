@@ -151,3 +151,19 @@ def test_disconnected_reply_before_any_send():
     spec = response_render.spec_from_unavailable(tool_broker.INSUFFICIENT_SCOPE, provider="gmail")
     text, _used, _ms = _run(response_render.compose(spec))
     assert "connect" in text and "✅" not in text
+
+
+# --- execution boundary -------------------------------------------------------------------------------
+# THIS FILE DOES NOT EXERCISE AUTHORIZATION. Every test above is about provider semantics — read-back
+# verification, 409 handling, idempotent retry, account binding, run bookkeeping — and calls the verified
+# I/O directly rather than through the turn that would mint consent for it. Suspending the gate keeps
+# those assertions about the thing they are actually testing.
+#
+# The boundary itself is proven in test_authorization_evidence.py and test_authorization_zero_call.py,
+# which never import this seam. `unchecked_provider_writes_for_test` raises outside pytest, so this is a
+# statement about a test file, not a hole in the engine.
+@pytest.fixture(autouse=True)
+def _provider_semantics_not_authorization():
+    from bruce_engine import execution_gate
+    with execution_gate.unchecked_provider_writes_for_test():
+        yield

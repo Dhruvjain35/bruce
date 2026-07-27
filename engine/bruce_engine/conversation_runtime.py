@@ -180,7 +180,7 @@ class _Runtime:
             # rest of this block: a planner fault must never cost the student their reply.
             if mission_planner.is_enqueueable(rd):
                 plan = await mission_planner.plan_mission(
-                    user_id, rd, text=msg.text or "",
+                    user_id, rd, text=msg.text or "", source_message_id=pmid,
                     idempotency_key=mission_planner.mission_idempotency_key(ch, pmid))
                 mission_plan = plan
                 # surface the broker's shortlist for the MISSION lane too: the block above only computes

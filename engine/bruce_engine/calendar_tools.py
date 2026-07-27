@@ -12,7 +12,7 @@ from uuid import UUID
 
 import httpx
 
-from . import calendar_adapter, entity_store, oauth_google
+from . import calendar_adapter, entity_store, execution_gate, oauth_google
 from .models import CalendarEvent
 from .runtime_contracts import ToolOutcome, ToolResult
 
@@ -61,6 +61,12 @@ async def update_event(
     ev = CalendarEvent(title=entity["title"], start=new_start, end=new_end,
                        location=entity.get("location"), timezone=new_timezone)
     src = (entity.get('source_message_ids') or [None])[0]
+    # The execution boundary. Nothing below this line runs without an open authorization bound to this
+    # exact event and this exact new time.
+    execution_gate.require(user_id, provider=_PROVIDER, operation="update_event",
+                           arguments=execution_gate.calendar_update_args(
+                               provider_event_id=eid, new_start=new_start, new_end=new_end,
+                               new_timezone=new_timezone))
     try:
         await a.update(ev, eid, source_message_id=src)
     except calendar_adapter.CalendarError as exc:
@@ -94,6 +100,10 @@ async def delete_event(
     cal = entity.get("calendar_id") or "primary"
     a = _adapter(user_id, cal, http_client, adapter)
     eid = entity["provider_event_id"]
+    # Destructive: `authorization_evidence.DESTRUCTIVE` additionally forbids a standing policy or an
+    # inferred request from ever standing behind this one.
+    execution_gate.require(user_id, provider=_PROVIDER, operation="delete_event",
+                           arguments=execution_gate.calendar_delete_args(provider_event_id=eid))
     try:
         await a.delete(eid)
     except calendar_adapter.CalendarError as exc:

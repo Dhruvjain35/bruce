@@ -13,7 +13,8 @@ import re
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from . import agent_loop, calendar_executor, entity_resolution, temporal, world_state
+from . import agent_loop, authorization_evidence as ae
+from . import calendar_executor, entity_resolution, temporal, world_state
 from .calendar_schedule import DEFAULT_TZ
 from .runtime_contracts import ToolOutcome
 
@@ -38,6 +39,21 @@ def classify(text: str | None) -> str | None:
         return "repair"
     if _UPDATE_RE.search(t):
         return "update"
+    return None
+
+
+def classify_span(text: str | None) -> str | None:
+    """The exact words in the STUDENT's message that made `classify` say what it said.
+
+    The authorization layer will not take "there is a mutation here" on trust; it asks which words. Same
+    three matchers, same precedence — returning the span rather than the label means the boundary can
+    check that those words are the student's own and not a line from a pasted email.
+    """
+    t = text or ""
+    for pattern in (_DELETE_RE, _CORRECTION_RE, _UPDATE_RE):
+        m = pattern.search(t)
+        if m:
+            return m.group(0)
     return None
 
 
@@ -99,7 +115,8 @@ def _human(iso: str, *, now: _dt.datetime) -> str:
     return human_when(ev, now=now)
 
 
-async def handle(user_id: UUID, kind: str, text: str, *, adapter=None) -> str:
+async def handle(user_id: UUID, kind: str, text: str, *, adapter=None,
+                 source_message_id: str | None = None, conversation_id: str | None = None) -> str:
     """Resolve the entity, perform the verified mutation, and return the honest reply text."""
     tz = await world_state.resolve_timezone(user_id, default=DEFAULT_TZ)
     now = _dt.datetime.now(ZoneInfo(tz))
@@ -120,13 +137,25 @@ async def handle(user_id: UUID, kind: str, text: str, *, adapter=None) -> str:
     # contracts), which delegates to the SAME calendar_tools I/O — so behavior/verification are unchanged,
     # the reply branches below are byte-identical, and every mutation leaves an auditable run.
     if kind == "delete":
-        result = await agent_loop.run_direct_action(
-            user_id, executor=calendar_executor.CalendarMutationExecutor("delete", entity, adapter=adapter))
+        ex = calendar_executor.CalendarMutationExecutor("delete", entity, adapter=adapter)
+        # A DESTRUCTIVE operation, so rule 12 applies: it needs the student to have named it. They did —
+        # `classify()` above matched a delete verb in their own trusted text, and entity resolution failed
+        # closed on ambiguity, so both the operation and the target came from them rather than from an
+        # inference. That is exactly the claim `explicit_operation_request` records.
+        authz = ae.try_grant(
+            user_id=user_id, provider="google_calendar", operation="delete_event",
+            arguments=ex.gate_arguments(), authorization_type=ae.AuthorizationType.direct_explicit,
+            text=text, trusted_message_id=source_message_id, conversation_id=conversation_id,
+            request_span=classify_span(text))
+        result = await agent_loop.run_direct_action(user_id, executor=ex, authorization=authz,
+                                                    conversation_id=conversation_id)
         tr = result.tool_result
         if tr.verified:
             return f"done, deleted {entity['title'].lower()} from ur calendar ✅"
         if tr.outcome is ToolOutcome.unauthorized:
             return "ur google calendar isn't connected, so i can't delete anything."
+        if tr.outcome is ToolOutcome.forbidden:
+            return f"i'm not deleting {entity['title'].lower()} off that — tell me plainly to delete it and i will."
         return f"i tried to delete {entity['title'].lower()} but couldn't confirm it's gone, so i'm not calling it done."
 
     # update / repair -> recompute the time and PUT (through the loop)
@@ -134,9 +163,19 @@ async def handle(user_id: UUID, kind: str, text: str, *, adapter=None) -> str:
     if recomputed is None:
         return f"what time should i move {entity['title'].lower()} to?"
     start, end, new_tz = recomputed
-    result = await agent_loop.run_direct_action(
-        user_id, executor=calendar_executor.CalendarMutationExecutor(
-            kind, entity, new_start=start, new_end=end, new_timezone=new_tz, adapter=adapter))
+    ex = calendar_executor.CalendarMutationExecutor(
+        kind, entity, new_start=start, new_end=end, new_timezone=new_tz, adapter=adapter)
+    # A repair confirms an operation the student already authorized; a move is a fresh explicit request.
+    # Both bind to the RECOMPUTED time, so an authorization for 9pm cannot be spent writing 10pm.
+    authz = ae.try_grant(
+        user_id=user_id, provider="google_calendar", operation="update_event",
+        arguments=ex.gate_arguments(),
+        authorization_type=(ae.AuthorizationType.correction_confirmation if kind == "repair"
+                            else ae.AuthorizationType.direct_explicit),
+        text=text, trusted_message_id=source_message_id, conversation_id=conversation_id,
+        request_span=classify_span(text))
+    result = await agent_loop.run_direct_action(user_id, executor=ex, authorization=authz,
+                                                conversation_id=conversation_id)
     tr = result.tool_result
     if tr.verified:
         when = _human(start, now=now)
@@ -144,4 +183,6 @@ async def handle(user_id: UUID, kind: str, text: str, *, adapter=None) -> str:
         return f"{verb}, {entity['title'].lower()} is now {when} ✅"
     if tr.outcome is ToolOutcome.unauthorized:
         return "ur google calendar isn't connected, so i can't update anything."
+    if tr.outcome is ToolOutcome.forbidden:
+        return f"i didn't move {entity['title'].lower()} — say the word and i will."
     return f"google rejected the update, so {entity['title'].lower()} is still at its old time. i'm looking into it."

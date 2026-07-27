@@ -51,6 +51,17 @@ class GmailSendExecutor:
         return {"action": self.kind, "to": self.to, "subject": self.subject,
                 "thread_id": self.thread_id, "desired_outcome": f"email {self.to}"}
 
+    # A reply and a fresh send are ONE provider operation (`send_and_verify` performs both), so the gate
+    # names it that way at both ends. Authorizing "reply_to_thread" and then spending it on a
+    # "send_message" at the adapter would deny every legitimate reply.
+    gate_provider = "gmail"
+    gate_operation = "send_message"
+
+    def gate_arguments(self) -> dict:
+        from . import execution_gate
+        return execution_gate.gmail_send_args(to=self.to, subject=self.subject, body=self.body,
+                                              thread_id=self.thread_id)
+
     def build_action(self) -> NextAction:
         return NextAction(
             type=ActionType.call_tool, capability=self.capability, provider=_PROVIDER,

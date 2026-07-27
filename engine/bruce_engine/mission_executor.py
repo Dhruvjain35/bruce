@@ -24,8 +24,19 @@ class MissionExecutor:
     """A StepExecutor over NextActions — execute() performs the action's verified provider call. `adapter`
     is an injection seam (a fake provider in tests)."""
 
-    def __init__(self, *, adapter=None) -> None:
+    def __init__(self, *, adapter=None, authorization=None) -> None:
         self._adapter = adapter
+        # A background step executes minutes or days after the turn that planned it, which is exactly when
+        # a stale authorization is most dangerous and least visible. There is no default that means
+        # "trusted": a runner with nothing to present gets a `forbidden` ToolResult, and the mission stops
+        # honestly instead of acting on consent nobody can point to.
+        self._authorization = authorization
+
+    def _gate(self, user_id: UUID, *, provider: str, operation: str, arguments: dict,
+              attempt_key: str | None):
+        from . import execution_gate
+        return execution_gate.evaluate(self._authorization, user_id=user_id, provider=provider,
+                                       operation=operation, arguments=arguments, attempt_key=attempt_key)
 
     async def execute(self, user_id: UUID, action: NextAction, *, idempotency_key: str | None = None) -> ToolResult:
         # idempotency_key is the runner's exactly-once contract for NON-idempotent hands (Gmail send). Calendar
@@ -37,12 +48,31 @@ class MissionExecutor:
             if entity is None:
                 return ToolResult(ToolOutcome.not_found, cap, "google_calendar", action.operation or "",
                                   reason="target entity not found")
+            from . import execution_gate
+            eid_p = str(entity.get("provider_event_id") or "")
             if cap == "calendar.delete_event":
-                return await calendar_tools.delete_event(user_id, entity, adapter=self._adapter)
-            a = action.arguments or {}
-            return await calendar_tools.update_event(
-                user_id, entity, new_start=a.get("new_start"), new_end=a.get("new_end"),
-                new_timezone=a.get("new_timezone"), adapter=self._adapter)
+                args = execution_gate.calendar_delete_args(provider_event_id=eid_p)
+                op = "delete_event"
+            else:
+                a = action.arguments or {}
+                args = execution_gate.calendar_update_args(
+                    provider_event_id=eid_p, new_start=a.get("new_start"), new_end=a.get("new_end"),
+                    new_timezone=a.get("new_timezone"))
+                op = "update_event"
+            v = self._gate(user_id, provider="google_calendar", operation=op, arguments=args,
+                           attempt_key=idempotency_key)
+            if v.denied:
+                return ToolResult(ToolOutcome.forbidden, cap, "google_calendar", op,
+                                  reason=f"authorization:{v.reason}")
+            with execution_gate.open_authorization(
+                    self._authorization, user_id=user_id, provider="google_calendar", operation=op,
+                    arguments=args, attempt_key=idempotency_key):
+                if cap == "calendar.delete_event":
+                    return await calendar_tools.delete_event(user_id, entity, adapter=self._adapter)
+                a = action.arguments or {}
+                return await calendar_tools.update_event(
+                    user_id, entity, new_start=a.get("new_start"), new_end=a.get("new_end"),
+                    new_timezone=a.get("new_timezone"), adapter=self._adapter)
         if cap in ("gmail.send_message", "gmail.reply_to_thread"):
             # The non-idempotent hand: the runner's per-step idempotency_key (run_id:stepN) is what makes a
             # lease-retry send exactly once. A missing key would risk duplicate mail, so refuse rather than
@@ -50,11 +80,22 @@ class MissionExecutor:
             if not idempotency_key:
                 return ToolResult(ToolOutcome.provider_error, cap, "gmail", action.operation or "",
                                   reason="gmail send requires an idempotency_key")
+            from . import execution_gate
             a = action.arguments or {}
+            args = execution_gate.gmail_send_args(to=a.get("to"), subject=a.get("subject"),
+                                                  body=a.get("body"), thread_id=a.get("thread_id"))
+            v = self._gate(user_id, provider="gmail", operation="send_message", arguments=args,
+                           attempt_key=idempotency_key)
+            if v.denied:
+                return ToolResult(ToolOutcome.forbidden, cap, "gmail", "send_message",
+                                  reason=f"authorization:{v.reason}")
             adapter = self._adapter or gmail_adapter.real_adapter(user_id)
-            return await gmail_adapter.send_and_verify(
-                adapter, user_id, to=a.get("to"), subject=a.get("subject"), body=a.get("body"),
-                idempotency_key=idempotency_key, thread_id=a.get("thread_id"))
+            with execution_gate.open_authorization(
+                    self._authorization, user_id=user_id, provider="gmail", operation="send_message",
+                    arguments=args, attempt_key=idempotency_key):
+                return await gmail_adapter.send_and_verify(
+                    adapter, user_id, to=a.get("to"), subject=a.get("subject"), body=a.get("body"),
+                    idempotency_key=idempotency_key, thread_id=a.get("thread_id"))
         if cap == "gmail.find_reply":
             # a READ: detect an inbound reply in the thread. No write, no idempotency — `read_back` carries the
             # reply (or None), which the advancer inspects to decide continue-vs-keep-waiting.

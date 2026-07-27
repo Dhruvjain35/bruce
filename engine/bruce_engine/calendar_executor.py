@@ -44,6 +44,24 @@ class CalendarMutationExecutor:
             g["new_start"], g["new_end"] = self.new_start, self.new_end
         return g
 
+    gate_provider = "google_calendar"
+
+    @property
+    def gate_operation(self) -> str:
+        return self._operation
+
+    def gate_arguments(self) -> dict:
+        """The canonical arguments the execution gate binds an authorization to. Distinct from
+        `build_action().arguments`, which carries the CANONICAL entity id for the run record; the gate
+        binds to the PROVIDER entity id, because that is the thing that actually gets changed."""
+        from . import execution_gate
+        eid = str(self.entity.get("provider_event_id") or "")
+        if self._is_delete:
+            return execution_gate.calendar_delete_args(provider_event_id=eid)
+        return execution_gate.calendar_update_args(
+            provider_event_id=eid, new_start=self.new_start, new_end=self.new_end,
+            new_timezone=self.new_timezone)
+
     def build_action(self) -> NextAction:
         args: dict = {} if self._is_delete else {
             "new_start": self.new_start, "new_end": self.new_end, "new_timezone": self.new_timezone}

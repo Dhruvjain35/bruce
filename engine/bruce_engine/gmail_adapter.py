@@ -194,6 +194,12 @@ async def send_and_verify(adapter, user_id: UUID, *, to: str, subject: str, body
     from .runtime_contracts import ToolOutcome, ToolResult
     marker = deterministic_marker(user_id, idempotency_key)
     cap, prov, op = "gmail.send_message", "gmail", "send_message"
+    from . import execution_gate
+    # Destructive and the least forgiving of the five: there is no read-back that can un-send. The
+    # fingerprint covers the BODY, so a message rewritten between approval and send stops here.
+    execution_gate.require(user_id, provider="gmail", operation="send_message",
+                           arguments=execution_gate.gmail_send_args(
+                               to=to, subject=subject, body=body, thread_id=thread_id))
     try:
         ref = await adapter.send(to=to, subject=subject, body=body, thread_id=thread_id, marker=marker)
     except (GmailAuthError,) as exc:

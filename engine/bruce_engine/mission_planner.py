@@ -136,7 +136,8 @@ def derive_intent(text: str, how: str) -> tuple[str, str] | None:
 
 
 async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: str,
-                       sender_name: str | None = None) -> MissionPlan:
+                       sender_name: str | None = None,
+                       source_message_id: str | None = None) -> MissionPlan:
     """Router decision -> broker capability truth -> composed email -> exactly-once durable enqueue.
 
     Returns without enqueueing (and says why) whenever the honest answer is "I can't do this yet": no
@@ -204,7 +205,23 @@ async def plan_mission(user_id: UUID, decision, *, text: str, idempotency_key: s
     from .gmail_executor import GmailSendExecutor
     send_key = f"{idempotency_key}:send"
     ex = GmailSendExecutor(to=to, subject=composed.subject, body=composed.body, idempotency_key=send_key)
-    res = await agent_loop.run_direct_action(user_id, executor=ex, idempotency_key=send_key)
+    # A send is DESTRUCTIVE — no read-back un-sends mail — so rule 12 requires the student to have named
+    # it. They did: this whole path is only reached because their own message asked for an email to a
+    # resolved recipient. What they did NOT write is the body, which Bruce just composed, so the
+    # authorization binds to the composed text: a rewrite between here and the adapter fails the
+    # fingerprint at `execution_gate.require` rather than mailing something nobody read.
+    from . import authorization_evidence as ae, fast_router
+    # The span is the router's OWN send-verb match over the student's text — the same deterministic
+    # matcher that decided this was a send in the first place, reused rather than duplicated. No match
+    # means nothing in the student's words asked for mail to go out, and no authorization is minted.
+    send_span = fast_router._SEND_INTENT.search(text or "")
+    authz = ae.try_grant(
+        user_id=user_id, provider="gmail", operation="send_message", arguments=ex.gate_arguments(),
+        authorization_type=ae.AuthorizationType.direct_explicit, text=text,
+        request_span=send_span.group(0) if send_span else None,
+        trusted_message_id=source_message_id or idempotency_key)
+    res = await agent_loop.run_direct_action(user_id, executor=ex, idempotency_key=send_key,
+                                             authorization=authz)
     if not res.verified:
         # NOTHING durable is created: no mission, no monitoring, and the caller says so plainly.
         log.warning("mission_send_unverified user=%s outcome=%s reason=%s", user_id,
