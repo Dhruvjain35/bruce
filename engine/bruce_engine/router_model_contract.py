@@ -53,6 +53,9 @@ class RouterModelRequest:
     pending_decision_id: str | None = None
     top_entities: tuple[EntityRef, ...] = ()
     live_capability_families: tuple[str, ...] = ()   # ("calendar", "email") — families, not tools
+    # Carried so a provider can resolve THIS user's live capability truth through the broker. Never shown
+    # to a model; the model sees families, never an identity.
+    user_id: str | None = None
 
 
 # --- response: the structured routing decision ---------------------------------------------------
