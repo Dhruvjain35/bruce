@@ -96,12 +96,29 @@ def _client() -> TestClient:
     return TestClient(api.app, base_url="https://testserver")
 
 
+_TOKENS: dict[tuple, str] = {}
+
+
 def _token(uid: UUID) -> str:
-    payload = {"sub": str(uid), "exp": int(time.time()) + 3600}
-    aud = os.environ.get("BRUCE_JWT_AUDIENCE")
-    if aud:
-        payload["aud"] = aud
-    return jwt.encode(payload, os.environ["BRUCE_JWT_SECRET"], algorithm="HS256")
+    """ONE token per (user, audience, secret) for the life of the process.
+
+    It used to mint a fresh JWT on every call, and `exp` is `int(time.time()) + 3600` — so two calls
+    that straddle a second boundary produce DIFFERENT tokens. The CSRF token is an HMAC over the session
+    token, so a test that logs in with one and then asserts against the other fails, and only when the
+    two calls happen to land either side of a tick.
+
+    That is exactly what it did: green locally where the test takes milliseconds, green on the previous
+    CI run, red on the next one, in `test_page_dashboard_embeds_csrf_when_internal`. Eight call sites in
+    this file call `_token(uid)` more than once per test, so memoizing here fixes all of them rather
+    than the one that happened to surface.
+    """
+    key = (str(uid), os.environ.get("BRUCE_JWT_AUDIENCE"), os.environ.get("BRUCE_JWT_SECRET"))
+    if key not in _TOKENS:
+        payload = {"sub": str(uid), "exp": int(time.time()) + 3600}
+        if key[1]:
+            payload["aud"] = key[1]
+        _TOKENS[key] = jwt.encode(payload, os.environ["BRUCE_JWT_SECRET"], algorithm="HS256")
+    return _TOKENS[key]
 
 
 def _make_internal(monkeypatch, uid: UUID) -> None:
