@@ -55,12 +55,17 @@ LINKED_TEXT = "you're in 🎉 text me a flyer, screenshot, pdf, link, or just a 
 BAD_CODE_TEXT = ("that code isn't valid or it expired. reply with a current one, or grab a fresh code "
                  "from the bruce team.")
 RATE_LIMITED_TEXT = "too many tries, give it a few mins before trying another code."
+# A redemption that FAILED for an infrastructure reason. Deliberately not the bad-code copy: telling
+# someone their code is invalid when the database was unreachable sends them to mint another one that
+# will fail the same way, and it hides an operator problem behind a user-facing explanation.
+LINK_TEMP_FAIL_TEXT = "something on my end broke while checking that code. try again in a minute."
 _CODE_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 
 
 @dataclasses.dataclass
 class InboundOutcome:
-    status: str            # processed | duplicate | linked | bad_code | rate_limited | unlinked_prompt |
+    status: str            # processed | duplicate | linked | bad_code | rate_limited | link_error |
+                           # unlinked_prompt |
     #                        blocked | no_runtime (gate denied AND nothing real to do -> honest refusal)
     user_id: UUID | None = None
     mission_id: UUID | None = None
@@ -132,7 +137,25 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
     if user_id is None:
         text = (msg.text or "").strip()
         if _CODE_RE.match(text):
-            r = await messaging_store.redeem_link_code(text, msg.channel, msg.channel_identity, now=now)
+            try:
+                r = await messaging_store.redeem_link_code(
+                    text, msg.channel, msg.channel_identity, now=now)
+            except Exception:
+                # AN UNLINKED SENDER NEVER REACHES CONVERSATION INTAKE, INCLUDING ON FAILURE.
+                #
+                # Every branch below already returns, so the only way this path could fall through was an
+                # exception escaping redemption — and it would have escaped `handle_inbound` entirely,
+                # leaving the caller to decide what an unrecognised number gets told. Nothing here is
+                # allowed to become a conversation turn, a mission, an AgentRun, or a claim that Bruce is
+                # working on something.
+                #
+                # Logged at exception level with no message content and no handle: this is an operator
+                # alert, and the operator needs to know it happened without being handed the text.
+                log.exception("link_redemption_failed channel=%s", msg.channel.value)
+                await _send(channel, to=reply_target, user_id=None, kind="prompt",
+                            text=LINK_TEMP_FAIL_TEXT,
+                            dedup_key=f"linkfail:{msg.provider_message_id}")
+                return InboundOutcome(status="link_error")
             if r.status == "linked":
                 await _send(channel, to=reply_target, user_id=r.user_id, kind="acknowledged",
                             text=LINKED_TEXT, dedup_key=f"linked:{msg.provider_message_id}")
