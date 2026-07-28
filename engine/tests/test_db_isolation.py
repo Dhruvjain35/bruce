@@ -71,11 +71,11 @@ def test_writes_and_reads_its_own_database(clean_db, i):
 
 def _session(tag: str, probe: Path) -> subprocess.CompletedProcess:
     """One full pytest session with its own worker identity — which is what picks the database name."""
-    env = {**os.environ, "PYTEST_XDIST_WORKER": tag}
-    # The parent session already rewrote these to point at ITS database. A child must start from the
-    # real cluster URLs, or both children would inherit one name and the test would prove nothing.
-    for key in ("BRUCE_DATABASE_URL", "BRUCE_APP_DATABASE_URL"):
-        env.pop(key, None)
+    # The parent session already rewrote these to point at ITS database, so a child must start from the
+    # CLUSTER urls captured at conftest import — otherwise both children inherit one name and the test
+    # proves nothing. Deleting them instead was the first attempt: it passed locally, where the child
+    # recovers them from engine/.env, and made CI skip every test and report green.
+    env = {**os.environ, "PYTEST_XDIST_WORKER": tag, **ct.ORIGINAL_DB_URLS}
     return subprocess.run(
         [sys.executable, "-m", "pytest", str(probe), "-q", "-p", "no:randomly", "--no-header"],
         cwd=str(ENGINE), env=env, capture_output=True, text=True, timeout=600)

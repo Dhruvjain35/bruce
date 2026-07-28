@@ -44,6 +44,13 @@ os.environ.setdefault("BRUCE_LINK_CODE_PEPPER", "test-link-code-pepper-not-a-rea
 _WORKER = os.environ.get("PYTEST_XDIST_WORKER") or f"p{os.getpid()}"
 TEST_DB = f"bruce_test_{_WORKER}"
 
+# The CLUSTER urls, captured before `pg_test_db` rewrites them to point at this session's database.
+# A child process must start from these, not from the parent's rewritten values — and not from nothing:
+# locally the URLs come from engine/.env and can be recovered, but in CI they come from the environment
+# and stripping them makes the child skip every test and exit 0, which reads as green.
+ORIGINAL_DB_URLS = {k: os.environ[k] for k in ("BRUCE_DATABASE_URL", "BRUCE_APP_DATABASE_URL")
+                    if os.environ.get(k)}
+
 # How long cleanup will wait for a lock before giving up. The old `TRUNCATE users ... CASCADE` took an
 # ACCESS EXCLUSIVE lock on every child table and could block behind a connection the previous test had
 # not finished with — observed as an intermittent hang, not an error. A bounded wait turns that into a
