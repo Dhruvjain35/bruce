@@ -22,6 +22,8 @@ from uuid import UUID
 
 import httpx
 
+from . import provider_http
+
 log = logging.getLogger("bruce.gmail_adapter")   # content-free: status codes / ids, never message text
 
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
@@ -347,7 +349,7 @@ class GoogleGmailAdapter:
         return await oauth_google.access_token_for(self.user_id, http_client=self._client)
 
     async def _request(self, method: str, path: str, *, token: str, **kw) -> httpx.Response:
-        client = self._client or httpx.AsyncClient(timeout=30)
+        client = self._client or provider_http.shared()
         try:
             return await client.request(method, f"{GMAIL_API}{path}",
                                         headers={"Authorization": f"Bearer {token}"}, **kw)

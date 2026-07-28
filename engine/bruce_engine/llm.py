@@ -77,12 +77,53 @@ def featherless(model_id: str) -> OpenAIChatModel:
     )
 
 
+# ONE provider per (api key) for the life of the process, and one model object per (provider, model id).
+#
+# MEASURED, not assumed: constructing `OpenAIChatModel(..., OpenAIProvider(...))` costs 5.45ms, and an
+# `Agent` built over a fresh model costs 7.04ms against 1.52ms over a shared one. That is the cheap half.
+# The expensive half is that each provider builds its own HTTP client, and the client connects lazily —
+# so a per-call provider makes every first request pay a TLS handshake. `semantic_triage` measured that
+# at 3003ms in Cloud Run, where it blew the deadline and produced the run's only mechanical fallback.
+#
+# SAFE TO SHARE because nothing user-scoped lives here. The OpenAI key is process configuration, not a
+# student's credential; there is no account binding, no conversation state and no request argument on
+# the provider. The Google path is different and is handled in `oauth_google` — there the token is
+# request-scoped and only the transport is shared.
+_PROVIDERS: dict[str, "OpenAIProvider"] = {}
+_MODELS: dict[tuple[str, int], OpenAIChatModel] = {}
+
+
+def _openai_provider(api_key: str) -> "OpenAIProvider":
+    provider = _PROVIDERS.get(api_key)
+    if provider is None:
+        provider = OpenAIProvider(api_key=api_key)
+        _PROVIDERS[api_key] = provider
+    return provider
+
+
 def openai_model(model_id: str) -> OpenAIChatModel:
-    """OpenAI-backed model. Reads OPENAI_API_KEY from the environment."""
+    """OpenAI-backed model over the process-lifetime provider. Reads OPENAI_API_KEY from the environment.
+
+    Keyed by the key's identity as well as the model id: a test that swaps `OPENAI_API_KEY` gets a fresh
+    provider rather than silently reusing a transport authenticated with the old one.
+    """
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set — load engine/.env at your entrypoint.")
-    return OpenAIChatModel(model_id, provider=OpenAIProvider(api_key=api_key))
+    provider = _openai_provider(api_key)
+    key = (model_id, id(provider))
+    model = _MODELS.get(key)
+    if model is None:
+        model = OpenAIChatModel(model_id, provider=provider)
+        _MODELS[key] = model
+    return model
+
+
+def reset_clients() -> None:
+    """Drop the shared provider and model objects. Tests only — a process never needs this, and calling
+    it in production would reintroduce the per-call handshake this exists to avoid."""
+    _PROVIDERS.clear()
+    _MODELS.clear()
 
 
 def vision_client():

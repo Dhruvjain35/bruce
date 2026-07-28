@@ -44,6 +44,8 @@ from uuid import UUID
 
 import httpx
 
+from . import provider_http
+
 from .models import CalendarEvent
 
 GOOGLE_CALENDAR_API = "https://www.googleapis.com/calendar/v3"
@@ -287,7 +289,7 @@ class GoogleCalendarAdapter:
         self._calendar_id = calendar_id
 
     async def _http(self) -> httpx.AsyncClient:
-        return self._client or httpx.AsyncClient(timeout=30)
+        return self._client or provider_http.shared()
 
     async def _calendar(self) -> str:
         if self._calendar_id:

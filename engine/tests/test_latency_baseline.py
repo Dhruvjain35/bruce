@@ -12,6 +12,15 @@ call is measured separately and honestly in `#129`, against the real provider. R
 number as a semantic p95 would be the "measuring a different path from production" failure the
 acceleration program names.
 
+ONE RUN IS NOT A BASELINE, and #126 proved it the expensive way. The first frozen figures (warm p50
+221.1ms, p95 305.5ms) were taken while the machine was running the full suite repeatedly. Re-measured
+idle, the SAME unchanged code gives p50 130.7-152.2 and p95 159.7-178.8. A later PR comparing itself
+against the loaded number would have credited itself with a 33% improvement it did not cause.
+
+So a before-and-after must re-measure the base back to back with the change, on the same machine, in the
+same state — `git stash`, three runs, unstash, three runs. Comparing against a stored number from
+another day measures the day.
+
 COLD AND WARM ARE NEVER MIXED. The first traced turn in a process pays imports, pool construction and
 first-query planning; every later turn does not. On this system that gap has been measured at 4.5s in
 Cloud Run. They are reported as separate distributions.
