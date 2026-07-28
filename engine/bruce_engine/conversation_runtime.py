@@ -112,17 +112,25 @@ class _Runtime:
     async def handle(self, channel: MessagingChannel, msg: InboundMessage, *,
                      user_id: UUID, reply_target: str) -> InboundOutcome:
         ch, ident, pmid = msg.channel.value, msg.channel_identity, msg.provider_message_id
+        # ONE ROOT TRACE PER INBOUND MESSAGE. Opened before any work, so `received` is when the turn
+        # actually arrived rather than when instrumentation got to it. Every exit finishes it —
+        # including the early returns, which are the turns whose timing matters most.
+        from . import turn_trace
+        trace = turn_trace.start(user_id=user_id, conversation_id=ident, message_id=pmid)
 
         if msg.is_group:                                        # 1:1 only in Bite 1 (privacy)
+            turn_trace.record(trace.finish())
             return InboundOutcome(status="skipped_group", user_id=user_id)
 
         if await self._already_answered(user_id, ch, pmid):     # webhook redelivery -> no 2nd reply
+            turn_trace.record(trace.finish())
             return InboundOutcome(status="duplicate", user_id=user_id)
         recent = await conversation_store.load_recent_turns(user_id, channel=ch, channel_identity=ident)
 
         await conversation_store.persist_user_turn(
             user_id, channel=ch, channel_identity=ident, provider_message_id=pmid, text=msg.text)
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
+        turn_trace.guard(trace, "trusted_input_ready")
 
         # INVALIDATE CONFLICTING AUTHORIZATION — step 3 of the authoritative execution order, and it runs
         # here rather than inside the router because it must hold whether or not semantic routing is on.
@@ -155,10 +163,20 @@ class _Runtime:
         mission_plan = None                # C1: set when a routed background mission was durably enqueued
         authoritative_decision = None      # G0 Activation Phase A: set -> skip the reasoner, dispatch on it
         try:
+            turn_trace.guard(trace, "state_reads_started")
+            # A MEASUREMENT GAP, recorded rather than faked. The pending-Decision read happens inside
+            # `fast_router.route` -> `execution_derivation.build_context`, which has no trace to mark, so
+            # its cost is folded into `router_finished` and cannot be attributed on its own. Marking it
+            # here would attribute a read to the wrong place; leaving it silently null would make the gap
+            # invisible.
+            trace.absent("decisions_ready", turn_trace.NOT_APPLICABLE)
+            turn_trace.guard(trace, "router_started")
             rd, rt = await fast_router.route(
                 user_id, msg.text or "", has_attachments=bool(msg.attachments),
                 has_reply_ref=bool(msg.reply_to_message_id or msg.thread_root_message_id))
+            turn_trace.guard(trace, "router_finished")
             router_ec, router_ms = rd.execution_class.value, rt.total_ms
+            turn_trace.note(trace, execution_path=router_ec)
             log.info("router pmid=%s ec=%s action=%s domain=%s conf=%.2f src=%s stage0_ms=%.1f "
                      "stage1_ms=%.1f total_ms=%.1f", pmid, router_ec,
                      rd.action.value if rd.action else None, rd.domain, rd.confidence, rd.source,
@@ -238,21 +256,24 @@ class _Runtime:
             if not capsule.referenced_images and not images:
                 if capsule.attachment_pending:                      # replied to an image/file, not downloaded
                     reply = self.style.template("reply_attachment_pending")
-                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
                                          decision=None, intent="image_understanding")
+                    turn_trace.record(trace.finish())
                     return InboundOutcome(status="processed", user_id=user_id)
                 if capsule.attachment_load_failed:                  # the exact file EXISTS but we couldn't load
                     # P0.2: fail closed honestly — we KNOW which image, we just couldn't load its bytes. Never
                     # tell the user to resend a file that is genuinely there, and never fall through to answer
                     # from the newest/nearest image.
                     reply = self.style.template("reply_image_unavailable")
-                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
                                          decision=None, intent="image_understanding")
+                    turn_trace.record(trace.finish())
                     return InboundOutcome(status="processed", user_id=user_id)
                 if explicit_ref and not (capsule.referenced_text or capsule.prior_answer):
                     reply = self.style.template("reply_target_unavailable")        # target lost / nothing to show
-                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                    await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
                                          decision=None, intent="image_understanding")
+                    turn_trace.record(trace.finish())
                     return InboundOutcome(status="processed", user_id=user_id)
 
             images = capsule.referenced_images + images     # the referenced attachment is authoritative -> first
@@ -261,8 +282,9 @@ class _Runtime:
             # on -> honest resend ask. (A healthy HEIC no longer lands here — it's normalized to JPEG above.)
             if (msg.attachment_unavailable or unreadable) and not (msg.text and msg.text.strip()) and not images:
                 reply = self.style.template("could_not_read_attachment")
-                await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
                                      decision=None, intent="image_understanding")
+                turn_trace.record(trace.finish())
                 return InboundOutcome(status="processed", user_id=user_id)
 
             # G0.2 ContextCompiler: assemble a BOUNDED, prioritized context from layered memory (world tz +
@@ -278,6 +300,7 @@ class _Runtime:
             # to a wrong one.
             try:
                 cap_snapshot = await capability_snapshot.snapshot(user_id)
+                turn_trace.guard(trace, "capabilities_ready")
             except Exception:
                 cap_snapshot = None
                 log.info("capability_snapshot_error pmid=%s", pmid)
@@ -305,7 +328,7 @@ class _Runtime:
             try:
                 compiled = await context_compiler.compile(
                     user_id, recent, include_episodic=include_episodic, profile=profile,
-                    capabilities=cap_snapshot, memory_cue=memory_cue)
+                    capabilities=cap_snapshot, memory_cue=memory_cue, trace=trace)
                 ctx = compiled.text
                 if compiled.dropped:
                     log.info("ctx_compiled pmid=%s tokens=%s blocks=%s dropped=%s", pmid, compiled.est_tokens,
@@ -317,7 +340,10 @@ class _Runtime:
             if _ev:
                 ctx = ctx + "\n\n" + _ev
             try:
+                turn_trace.note(trace, model_role="reasoner")
+                turn_trace.guard(trace, "model_started")
                 rr = await self.reasoner.decide(text=msg.text, images=images, context=ctx)
+                turn_trace.guard(trace, "model_finished")
             except Exception:
                 # A model/backend glitch is OUR fault, not the image's. Never say "couldn't read that" for
                 # a healthy photo (the exact false-negative we're fixing) — own it and ask for a retry.
@@ -325,10 +351,11 @@ class _Runtime:
                 # followed by a reasoner error must not tell the student "something glitched" while a
                 # real email is already in their inbox and monitoring is running.
                 reply = mission_planner.reply_for(mission_plan) or _FALLBACK
-                await self._finalize(user_id, ch, ident, pmid, reply, reply_target,
+                await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
                                      decision=None, intent="unsupported")
                 log.info("conv_model_error pmid=%s mission=%s", pmid,
                          mission_plan.status if mission_plan else None)
+                turn_trace.record(trace.finish())
                 return InboundOutcome(
                     status="model_error", user_id=user_id,
                     mission_run_id=(mission_plan.run_id if mission_plan and mission_plan.enqueued else None),
@@ -341,13 +368,15 @@ class _Runtime:
         # runtime-owned. A handler-collision (two claims at the same top priority) is a config bug: it fails
         # loudly (error telemetry inside select_owner) but degrades the USER to a safe honest reply.
         try:
+            turn_trace.guard(trace, "response_generation_started")
             outcome = await self._resolve_outcome(decision=decision, capsule=capsule, msg=msg,
                                                   profile=profile, channel=ch, user_id=user_id, pmid=pmid)
         except conversation_outcomes.OutcomeCollision:
             log.error("conv_outcome_collision pmid=%s", pmid)      # loud; details already logged, no content
             await self._finalize(user_id, ch, ident, pmid,
                                  mission_planner.reply_for(mission_plan) or _FALLBACK, reply_target,
-                                 decision=None, intent="unsupported")
+                                 decision=None, intent="unsupported", trace=trace)
+            turn_trace.record(trace.finish())
             return InboundOutcome(
                 status="outcome_collision", user_id=user_id,
                 mission_run_id=(mission_plan.run_id if mission_plan and mission_plan.enqueued else None),
@@ -405,6 +434,7 @@ class _Runtime:
                  pmid, decision.intent.value, decision.response_type.value,
                  outcome.event_candidate_id is not None, outcome.mission_id is not None, outcome.handler,
                  router_ec, None if router_ms is None else round(router_ms, 1))
+        turn_trace.record(trace.finish())
         return InboundOutcome(status="processed", user_id=user_id,
                               execution_class=router_ec, router_ms=router_ms,
                               shortlisted_capabilities=shortlisted,
@@ -454,7 +484,8 @@ class _Runtime:
                 schema.ConversationTurn.role == "assistant"))).scalar_one_or_none() is not None
 
     async def _finalize(self, user_id, ch, ident, pmid, reply, reply_target, *,
-                        decision: ConversationDecision | None, event_candidate_id=None, intent=None):
+                        decision: ConversationDecision | None, event_candidate_id=None, intent=None,
+                        trace=None):
         # persist the assistant turn, then enqueue EXACTLY ONE outbound (idempotent on conv:{pmid}).
         if decision is not None:
             await conversation_store.persist_assistant_turn(
@@ -471,6 +502,14 @@ class _Runtime:
                         user_id=user_id, channel=ch, channel_identity=ident, provider_message_id=pmid,
                         role="assistant", intent=intent, text=reply))
             kind = "acknowledged"
+        from . import turn_trace
+        # `relay_send_started` is the ENQUEUE, not the send. The relay hands back a GUID asynchronously,
+        # so `relay_guid_received` belongs to the delivery path and is marked there — leaving it null
+        # here rather than pretending this turn observed it.
+        turn_trace.guard(trace, "response_ready")
+        turn_trace.guard(trace, "relay_send_started")
+        if trace is not None:
+            trace.absent("relay_guid_received", turn_trace.NOT_APPLICABLE)
         await messaging_outbound.enqueue(
             user_id=user_id, to_handle=reply_target, channel=ChannelKind.self_hosted_imessage,
             kind=kind, text=reply, idempotency_key=f"conv:{pmid}")
