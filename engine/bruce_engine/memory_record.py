@@ -475,3 +475,27 @@ def _evidence_json(text):
         # Evidence that cannot be parsed is evidence Bruce cannot explain. Returning empty is honest;
         # raising would make one bad row un-hydratable forever.
         return {}
+
+
+# --- claim identity ------------------------------------------------------------------------------------
+
+def claim_key(*, kind, subject: str | None, predicate: str | None) -> str:
+    """The stable identity of a CLAIM, independent of its value or its version.
+
+    "who is my ap bio teacher" is one claim whether the answer is mr smith or ms smith, so the key is
+    computed from kind, folded subject and predicate — never from the value. Two consequences follow, and
+    both are the point:
+
+      * the database can hold at most one ACTIVE row per key (`uq_memory_active_claim`), which makes two
+        active contradictory facts structurally impossible rather than merely unlikely;
+      * every version of the claim is addressable together, so "forget that" reaches the superseded
+        spelling as well as the current one. #122 forgot only the newest row and left the previous value
+        readable through provenance and correction history.
+
+    Hashed rather than concatenated because subjects are free text and a delimiter collision ("a.b" +
+    "c" vs "a" + "b.c") would silently merge two different claims into one.
+    """
+    import hashlib
+    k = kind.value if hasattr(kind, "value") else str(kind or "")
+    blob = "\x1f".join((k, entity_key(subject or ""), (predicate or "").strip().lower()))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()

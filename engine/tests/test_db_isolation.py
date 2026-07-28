@@ -81,7 +81,7 @@ def _session(tag: str, probe: Path) -> subprocess.CompletedProcess:
         cwd=str(ENGINE), env=env, capture_output=True, text=True, timeout=600)
 
 
-@pytest.mark.slow
+
 def test_two_concurrent_sessions_do_not_interfere(pg_test_db, tmp_path):
     probe = ENGINE / "tests" / "_isolation_probe.py"
     probe.write_text(_PROBE)

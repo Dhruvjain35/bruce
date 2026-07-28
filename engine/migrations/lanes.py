@@ -28,6 +28,7 @@ MIGRATION_LANES: dict[str, str] = {
     "0027": "authorization",       # authorization_evidence + authorization_refusals — durable consent (#121a)
     "0028": "memory",              # typed memory records (#121b)
     "0029": "memory",              # memory reshaped to the canonical ORM model (#122)
+    "0030": "memory",              # claim lineage + active-claim uniqueness (#123)
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the

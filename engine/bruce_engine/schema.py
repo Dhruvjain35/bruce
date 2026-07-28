@@ -456,6 +456,16 @@ class MemoryRecordRow(Base, TSV):
     # computed. Derived by the writer and by nothing else.
     entity_key: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
     domain: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+
+    # CLAIM LINEAGE. Every version of one claim shares a `claim_root_id` (the first version's id) and a
+    # `claim_key` (a digest of kind + subject + predicate). Without them "forget that" reaches only the
+    # newest row, and the value the student asked Bruce to forget survives one superseded row below it —
+    # readable through provenance, correction history and any audit view.
+    #
+    # `claim_key` is also what the partial unique index keys on, so the database, not a read-then-compare,
+    # is what guarantees at most one active version of a claim.
+    claim_root_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    claim_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # The future question this memory answers, captured at write time because it cannot be recovered
     # later. Redacted on forget along with the rest of the content: "so Bruce knows who her therapist
     # is" is itself content.

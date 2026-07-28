@@ -1,62 +1,69 @@
-"""The write policy — the decision about whether something is worth remembering AT ALL.
+"""THE ONE DOOR into `memory_records`. Every stored belief in the system is inserted by this module.
 
 A memory store's failure mode is not forgetting. It is remembering too much, and remembering the wrong
 kind of thing. Every row written here is served back to the model on future turns, so a store that
-accepts whatever passed through the conversation becomes a slow-growing pile of half-true statements that
-the model cannot distinguish from the true ones, and that the student never agreed to keep.
+accepts whatever passed through the conversation becomes a slow-growing pile of half-true statements the
+model cannot distinguish from the true ones, and that the student never agreed to keep.
 
-So writing is a REFUSAL by default. Five things must all hold, and the module is built so that the ones
-that matter most cannot be waived by a caller in a hurry:
+WHY THIS MODULE IS A CHOKE POINT AND NOT A HELPER. #121b's policy was a function callers were expected to
+call. That is a convention, and a convention is not a boundary: a second module that builds its own row
+is one commit away and looks like ordinary code in review. Here the SQL that creates a memory exists
+exactly once, in `_insert`, and `tests/test_memory_write_policy.py` walks the AST of every module in the
+package to prove no other one constructs an insert against that table. The proof is on the syntax tree,
+not on the source text — grepping for the table name matches the docstrings that discuss it, which has
+already produced two false failures in this repo.
 
-    useful later      the caller must state which future question this answers, and that sentence is
-                      stored — it becomes `MemoryContext.reason_it_matters_now`. A memory nobody could
-                      say the use of has no use.
-    reasonably stable a `profile`/`relationships` fact may not be given a transient lifetime, and an
-                      `episodic` one may not claim to be durable. A layer and a lifetime that disagree
-                      means one of them is wrong.
-    user-specific     anchored to the student (`SELF`) or to a resolved thing in their world.
-    evidence-backed   the exact span of the student's own trusted words, VERIFIED to be present in that
-                      text and absent from the pasted/forwarded material around it.
-    not filler        a namespaced `domain.relation` predicate and a value short enough to be a fact.
-                      Chatter cannot supply either, which is a cheaper filter than trying to recognise it.
+WHAT THE WRITER DECIDES, WHICH IS ALMOST NOTHING. `memory_policy.decide` is pure and total and makes
+every judgement: the kind's floor, the registry, the retention, the sensitivity, the confidence ceiling.
+This module's remaining jobs are the three that need I/O or identity, and they are the three that cannot
+be decided from the candidate alone:
 
-THE FOUR HARD RULES, and where each one actually lives:
+    claim lineage      `claim_key` and `claim_root_id`, so every version of one claim is addressable
+                       together and `uq_memory_active_claim` can make two active contradictory versions
+                       a database error rather than a race (#122 forgot only the newest row and left the
+                       previous value readable through provenance).
+    duplicate claims   an active row already exists for this claim key. Refused rather than inserted:
+                       replacing a belief is `memory_correction`'s job, and it writes an audit row. A
+                       writer that quietly superseded would make corrections unattributable.
+    forgotten sources  "forget that" does not mean "forget it until you re-read the message it came
+                       from".
 
-  1. ONLY TRUSTED TEXT MAKES A MEMORY. Enforced three times, deliberately: `MemoryRecord.__post_init__`
-     refuses to construct one, the `ck_memory_trusted_source` CHECK refuses to store one, and `assess`
-     refuses before either. Quoted / forwarded / attachment / provider / model content is recordable as
-     `EvidenceRef` and can never be the source.
-  2. A GUESS IS NEVER A FACT. `Basis` has no `inferred` member, and `assess` requires a span. An
-     inference has no span to point at, so it has no way to be written. Uncertainty about something the
-     student DID say is different and is kept: `hedged=True`, confidence capped at `HEDGED_CEILING`.
-  3. CORRECTIONS SUPERSEDE. This module only ever INSERTs. Supersession is `memory_correction`'s job and
-     the table's UPDATE trigger allows only the four lifecycle columns to change.
-  4. IDENTITY IS NEVER INFERRED. `remember` writes facts and `record_style_signal` writes style, and
-     there is no argument to either that crosses them. A stylistic observation is forced to
-     `MemoryKind.style`, which no factual query can reach — so "she uses this slang, therefore she is X"
-     has no expressible destination. `SENSITIVE_TRAITS` is a second, independent net for a mislabelled
-     ordinary write, and it is a taxonomy of traits rather than a list of words.
+WHY THE ROW IS BUILT HERE RATHER THAN VIA `MemoryRecord`. `MemoryRecord.__post_init__` refuses to be
+constructed with any source but the student's own text — correct for the facts it models, and it makes
+the type unable to express the attributed records #122 deliberately enabled when it dropped
+`ck_memory_trusted_source`. "Practice is at six, per an email you forwarded" is a legitimate world fact
+with forwarded provenance. It is not a fact about the student, and the thing that guarantees that is
+`memory_policy.SUBJECT_KIND_MATRIX`, not the source column.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
 from . import decision_resolver
+from . import memory_policy as policy
 from . import memory_record as mr
 from .db import user_session
+from .memory_candidate import PROVENANCE_TO_SOURCE, MemoryCandidate, ProvenanceClass, SubjectType
+from .memory_policy import Outcome, names_sensitive_trait
 from .memory_record import (
-    FACTUAL, MEMORY_RECORDS, SELF, SENSITIVE_TRAIT_STEMS, SENSITIVE_TRAITS, TRUSTED_FOR_MEMORY, Basis,
-    DURABLE_LAYERS, Evidence, EvidenceRef, MemoryKind, MemoryRecord, RetentionPolicy, Sensitivity,
-    SourceType,
+    DURABLE_LAYERS, FACTUAL, HALF_LIFE, MEMORY_RECORDS, SELF, TRUSTED_FOR_MEMORY, Basis, Evidence,
+    EvidenceRef, MemoryKind, MemoryRecord, RetentionPolicy, Sensitivity, SourceType,
 )
 
 log = logging.getLogger("bruce.memory")   # CONTENT-FREE: ids, kinds, verdicts — never subject or value
+
+__all__ = [
+    "MemoryWriter", "WriteReceipt", "MemoryWriteError", "MemoryProposal", "WriteDecision",
+    "assess", "build", "remember", "record_style_signal", "names_sensitive_trait",
+]
 
 
 # --- verdicts --------------------------------------------------------------------------------------
@@ -76,10 +83,11 @@ UNSTABLE_FOR_LAYER = "lifetime_contradicts_layer"
 NO_REASON_IT_MATTERS = "no_reason_it_matters"
 FILLER = "conversational_filler"
 SOURCE_WAS_FORGOTTEN = "source_was_forgotten"
+DUPLICATE_CLAIM = "claim_already_active"
 
 REFUSALS = frozenset({UNTRUSTED_SOURCE, NO_SPAN, SPAN_NOT_IN_TRUSTED_TEXT, SPAN_FROM_UNTRUSTED_CONTENT,
                       SENSITIVE_TRAIT, STYLE_IS_NOT_A_FACT, NOT_USER_SPECIFIC, UNSTABLE_FOR_LAYER,
-                      NO_REASON_IT_MATTERS, FILLER, SOURCE_WAS_FORGOTTEN})
+                      NO_REASON_IT_MATTERS, FILLER, SOURCE_WAS_FORGOTTEN, DUPLICATE_CLAIM})
 
 HEDGED_CEILING = 0.7
 """What a hedge is worth. "i think it's ms delgado" is a real observation and is kept, but it may never
@@ -88,18 +96,233 @@ to decide whether to say a thing or ask about it."""
 
 
 class MemoryWriteError(Exception):
-    """Raised when a CALLER asks for a write that could never be legitimate — a style signal submitted
-    through the fact door, a proposal for another user. Not used for ordinary refusals, which are typed
-    verdicts: a refusal is a normal outcome, a bad call is a programming error."""
+    """Raised when a CALLER asks for a write that could never be legitimate — a candidate for another
+    user, a style signal submitted through the fact door. Not used for ordinary refusals, which are typed
+    outcomes: a refusal is a normal result, a bad call is a programming error."""
 
 
-# --- the proposal ------------------------------------------------------------------------------------
+# --- the receipt -----------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WriteReceipt:
+    """What `evaluate` did. Returned for every candidate including the refused ones, because a caller
+    that cannot tell "refused" from "stored" will eventually assume the second."""
+
+    outcome: Outcome
+    reason: str
+    candidate_id: UUID | None = None
+    memory_id: UUID | None = None
+    claim_key: str | None = None
+    confidence: float = 0.0
+
+    @property
+    def stored(self) -> bool:
+        """Stored AND believed. False for a quarantined row, which exists but is unreachable by every
+        retrieval path — a caller checking this flag cannot mistake one for knowledge."""
+        return self.outcome is Outcome.store
+
+    @property
+    def persisted(self) -> bool:
+        return self.outcome in (Outcome.store, Outcome.quarantine)
+
+
+# --- the writer ------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MemoryWriter:
+    """Bound to one student for its whole life, like `MemoryRetriever` and for the same reason.
+
+    There is no method here that accepts another user's id, so a cross-user write is not a thing this
+    type can express. `db.user_session` sets `app.user_id` transaction-locally and `memory_records` runs
+    FORCE ROW LEVEL SECURITY underneath, so the guarantee does not rest on this class alone.
+    """
+
+    user_id: UUID
+
+    async def evaluate(self, candidate: MemoryCandidate) -> WriteReceipt:
+        """THE write path. Decide, then persist what the decision permits — never what the candidate asked
+        for.
+
+        Every stored term is taken from `PolicyDecision` rather than from the candidate: confidence is the
+        provenance-capped number, retention and sensitivity come from the registry. A caller's opinion
+        about those three is advisory and can only make them stricter, which is what stops a confident
+        extractor from choosing its own terms.
+
+        NOT ENFORCED HERE, and it needs a schema change rather than a check: "a style memory must be a
+        behavioural aggregate over several messages". A `MemoryCandidate` describes ONE observation and
+        carries no occurrence count, so a first sighting and a fiftieth are the same object. What is
+        enforced is the half that is expressible — a style value may not be a verbatim copy of the
+        student's words (`memory_policy._style_gate`) — and the kind separation means even a premature
+        style row cannot become a claim about who someone is.
+        """
+        if candidate.user_id != self.user_id:
+            raise MemoryWriteError("a writer bound to one student cannot write another's memory")
+
+        decision = policy.decide(candidate)
+        if decision.outcome is Outcome.reject:
+            log.info("memory_refused reason=%s kind=%s subject_type=%s domain=%s", decision.reason,
+                     candidate.kind.value, candidate.subject_type.value,
+                     mr.domain_of(candidate.predicate))
+            return WriteReceipt(Outcome.reject, decision.reason, candidate_id=candidate.candidate_id)
+
+        subject = _subject_of(candidate)
+        key = mr.claim_key(kind=candidate.kind, subject=subject, predicate=candidate.predicate)
+        memory_id = uuid4()
+        status = "active" if decision.outcome is Outcome.store else "quarantined"
+        values = _row_values(candidate, decision, memory_id=memory_id, subject=subject, claim_key=key,
+                             status=status)
+
+        async with user_session(self.user_id) as s:
+            if candidate.source_id and await _source_was_forgotten(s, self.user_id, candidate.source_id):
+                log.info("memory_refused reason=%s kind=%s", SOURCE_WAS_FORGOTTEN, candidate.kind.value)
+                return WriteReceipt(Outcome.reject, SOURCE_WAS_FORGOTTEN,
+                                    candidate_id=candidate.candidate_id)
+            if status == "active" and await _claim_is_active(s, self.user_id, key):
+                # Replacing a belief is `memory_correction`'s job — it supersedes in one transaction and
+                # writes an audit row. Silently superseding here would make the change unattributable.
+                log.info("memory_refused reason=%s kind=%s", DUPLICATE_CLAIM, candidate.kind.value)
+                return WriteReceipt(Outcome.reject, DUPLICATE_CLAIM, candidate_id=candidate.candidate_id)
+            try:
+                await _insert(s, values)
+            except IntegrityError:
+                # `uq_memory_active_claim` firing means another transaction won the same claim between
+                # the check above and this insert. The database is the authority, not the read.
+                log.info("memory_refused reason=%s kind=%s", DUPLICATE_CLAIM, candidate.kind.value)
+                return WriteReceipt(Outcome.reject, DUPLICATE_CLAIM, candidate_id=candidate.candidate_id)
+
+        log.info("memory_%s id=%s kind=%s domain=%s confidence=%.2f",
+                 "stored" if status == "active" else "quarantined", memory_id, candidate.kind.value,
+                 mr.domain_of(candidate.predicate), decision.confidence)
+        return WriteReceipt(decision.outcome, decision.reason, candidate_id=candidate.candidate_id,
+                            memory_id=memory_id, claim_key=key, confidence=decision.confidence)
+
+
+async def _insert(session, values: dict) -> None:
+    """THE ONLY INSERT INTO `memory_records` IN THE ENGINE.
+
+    Kept as its own one-statement function so the AST proof in `tests/test_memory_write_policy.py` has a
+    single, obvious thing to point at, and so a future edit that adds a second write path has to look
+    like what it is.
+    """
+    await session.execute(sa.insert(MEMORY_RECORDS).values(**values))
+
+
+def _subject_of(candidate: MemoryCandidate) -> str:
+    """`SELF` for anything about the student, their own subject otherwise.
+
+    Folded here rather than trusted from the caller so "me", "myself" and a display name cannot become
+    three different students inside one account — and so `claim_key` is stable across the spellings.
+    """
+    if candidate.subject_type is SubjectType.user or candidate.kind is MemoryKind.style:
+        return SELF
+    return mr.normalize(candidate.subject_id)
+
+
+def _row_values(candidate: MemoryCandidate, decision, *, memory_id: UUID, subject: str, claim_key: str,
+                status: str) -> dict:
+    """The candidate and the decision as columns. Nothing the caller set is copied without a decision
+    behind it, except the value, the subject and the evidence — the three things only the caller knows."""
+    value = candidate.proposed_value.strip()
+    normalized = (candidate.normalized_value or "").strip() or mr.normalize(value)
+    return {
+        "memory_id": memory_id,
+        "user_id": candidate.user_id,
+        "kind": candidate.kind.value,
+        "subject": subject,
+        "predicate": candidate.predicate,
+        "value_json": {"value": value},
+        "normalized_value": normalized[:300],
+        "evidence_text": _evidence_json(candidate),
+        "source_message_id": candidate.source_id,
+        "source_type": PROVENANCE_TO_SOURCE[candidate.provenance_class].value,
+        "confidence": decision.confidence,
+        "observed_at": candidate.observed_at,
+        "last_confirmed_at": None,
+        "expires_at": _expires_at(candidate.observed_at, decision.retention),
+        "freshness_class": "fresh",
+        "retention_policy": decision.retention.value,
+        "sensitivity": decision.sensitivity.value,
+        "user_editable": True,
+        "status": status,
+        "contradicted_by_id": None,
+        "superseded_by_id": None,
+        "entity_key": mr.entity_key(subject),
+        "domain": mr.domain_of(candidate.predicate),
+        # A brand-new claim is its own root. Every later version copies this id, so "forget that" reaches
+        # the superseded spellings as well as the current one.
+        "claim_root_id": memory_id,
+        "claim_key": claim_key,
+        "reason_it_matters": candidate.usefulness_reason.strip()[:300],
+        "created_at": sa.func.now(),
+    }
+
+
+def _evidence_json(candidate: MemoryCandidate) -> str:
+    """The evidence blob, carrying the FULL provenance class alongside the span.
+
+    `source_type` cannot express the nine provenance classes — three trusted ones collapse into
+    `trusted_user_text` and `system_derived` has no spelling at all (see
+    `memory_candidate.PROVENANCE_TO_SOURCE`). Recording it here keeps provenance recoverable for
+    `memory_provenance` without a schema change. `Evidence.from_json` ignores keys it does not know, so
+    this round-trips harmlessly through the existing reader.
+    """
+    return json.dumps({
+        "stated_span": candidate.evidence_text,
+        "basis": Basis.stated.value,
+        "hedged": bool(candidate.is_inferred),
+        "corroboration": [],
+        "provenance_class": candidate.provenance_class.value,
+        "explicitly_stated_by_user": bool(candidate.explicitly_stated_by_user),
+    })
+
+
+def _expires_at(observed_at: datetime, retention: RetentionPolicy) -> datetime | None:
+    """When retrieval should stop returning this, computed to agree with `compute_freshness`.
+
+    Twice the half-life, which is where `Freshness.expired` begins. Derived from that one table rather
+    than a second constant, because a read-time expiry that disagreed with the freshness a record reports
+    would make "why did Bruce stop using this" unanswerable.
+    """
+    half_life = HALF_LIFE[retention]
+    if half_life is None:
+        return None
+    return observed_at + half_life * 2
+
+
+async def _claim_is_active(session, user_id: UUID, key: str) -> bool:
+    """Is a version of this claim already believed? The partial unique index is the real guarantee; this
+    read exists so the ordinary case returns a typed refusal instead of an IntegrityError."""
+    found = (await session.execute(sa.select(MEMORY_RECORDS.c.memory_id).where(
+        MEMORY_RECORDS.c.user_id == user_id, MEMORY_RECORDS.c.claim_key == key,
+        MEMORY_RECORDS.c.status == "active").limit(1))).first()
+    return found is not None
+
+
+async def _source_was_forgotten(session, user_id: UUID, source_message_id: str) -> bool:
+    """Has the student forgotten anything derived from this message? The tombstone keeps the message id
+    (content-free lineage, exactly what `retention.py` preserves after erasing raw text) precisely so
+    this question is answerable after the content is gone."""
+    found = (await session.execute(sa.select(MEMORY_RECORDS.c.memory_id).where(
+        MEMORY_RECORDS.c.user_id == user_id,
+        MEMORY_RECORDS.c.source_message_id == source_message_id,
+        MEMORY_RECORDS.c.forgotten_at.isnot(None)).limit(1))).first()
+    return found is not None
+
+
+# --- the legacy proposal API ---------------------------------------------------------------------------
+# `MemoryProposal` and `assess` are the #121b surface. `assess` is kept because it is a pure, total
+# statement of the older rules that is still worth having under test. The two coroutines below are kept
+# because they are the named entry points — and both now go through `MemoryWriter.evaluate`, building a
+# candidate and handing it over. They are ADAPTERS, not a second door, which is what makes the "one door"
+# claim in the module docstring true rather than aspirational.
 
 
 @dataclass(frozen=True)
 class MemoryProposal:
-    """A candidate memory plus everything needed to judge it. Nothing here is taken on faith except the
-    caller's claim about which words it rests on, and that claim is checked."""
+    """A candidate memory plus everything needed to judge it, in the #121b shape. Nothing here is taken
+    on faith except the caller's claim about which words it rests on, and that claim is checked."""
 
     user_id: UUID
     kind: MemoryKind
@@ -147,9 +370,6 @@ class WriteDecision:
         return self.verdict == STORE
 
 
-# --- grounding ---------------------------------------------------------------------------------------
-
-
 def _grounded(span: str | None, trusted_text: str | None, untrusted: str | None) -> str:
     """Are these the STUDENT's words? Returns STORE or the specific reason they are not.
 
@@ -170,21 +390,6 @@ def _grounded(span: str | None, trusted_text: str | None, untrusted: str | None)
         # The words exist, but they also exist in someone else's message. Provenance is unprovable.
         return SPAN_FROM_UNTRUSTED_CONTENT
     return STORE
-
-
-def names_sensitive_trait(predicate: str | None) -> bool:
-    """Does this predicate claim one of the identity traits Bruce does not store?
-
-    Token-wise on the namespaced predicate, so `profile.religion`, `profile.religious_practice` and
-    `world.household_immigration` all land. It reads the predicate — the CLAIM being made — and never the
-    student's words, which is why it cannot be defeated by phrasing, slang or the language they type in.
-    """
-    tokens = set(mr.normalize(predicate).replace(".", " ").replace("_", " ").split())
-    return bool(tokens & SENSITIVE_TRAITS) or any(
-        t.startswith(stem) for t in tokens for stem in SENSITIVE_TRAIT_STEMS)
-
-
-# --- the policy ----------------------------------------------------------------------------------------
 
 
 def assess(p: MemoryProposal) -> WriteDecision:
@@ -208,8 +413,8 @@ def assess(p: MemoryProposal) -> WriteDecision:
     if names_sensitive_trait(p.predicate):
         # Refused whatever the source, including the student stating it flatly. Bruce has no feature that
         # needs a student's religion or health on file, and the only thing storing one buys is a way to
-        # leak it. If a feature ever genuinely needs one it gets its own consented surface, and it will
-        # be obvious in review that it is doing so — which it would not be if this door were left ajar.
+        # leak it. `memory_policy.PROFILE_REGISTRY` is the primary defence now; this is the backstop for
+        # a caller with a genuine write who LABELS it as a trait.
         log.info("memory_refused reason=%s domain=%s", SENSITIVE_TRAIT, mr.domain_of(p.predicate))
         return WriteDecision(SENSITIVE_TRAIT, "identity traits are not stored by the general writer")
 
@@ -247,11 +452,10 @@ def assess(p: MemoryProposal) -> WriteDecision:
 
 def build(p: MemoryProposal, *, basis: Basis = Basis.stated,
           now: datetime | None = None) -> MemoryRecord:
-    """The proposal as a record. Raises if `assess` refused — every field that could be forged is derived
-    here rather than accepted, so there is no path from a refused proposal to a stored row.
+    """The proposal as an in-memory record. Raises if `assess` refused.
 
-    `basis` is a parameter only so `memory_correction` can mark a repair as such. It cannot be widened
-    into an inference: `Basis` has no member that means one.
+    NOT A WRITE PATH — it returns a value, and only `MemoryWriter.evaluate` reaches the table. Kept
+    because the tests and `memory_provenance` need a way to talk about a record without one existing.
     """
     decision = assess(p)
     if not decision.stores:
@@ -268,15 +472,28 @@ def build(p: MemoryProposal, *, basis: Basis = Basis.stated,
         contradicted_by=None, superseded_by=None)
 
 
-# --- persistence -----------------------------------------------------------------------------------------
+_KIND_TO_SUBJECT_TYPE: dict[MemoryKind, SubjectType] = {
+    MemoryKind.profile: SubjectType.user,
+    MemoryKind.relationships: SubjectType.relationship,
+    MemoryKind.world: SubjectType.world,
+    MemoryKind.entity: SubjectType.provider_entity,
+    MemoryKind.episodic: SubjectType.conversation,
+    MemoryKind.style: SubjectType.style,
+}
+"""The inverse of `memory_policy.SUBJECT_KIND_MATRIX`, used ONLY to lift a legacy `MemoryProposal` —
+which predates subject types — into a candidate. Deriving the subject type from the kind is exactly the
+conflation the two-field split exists to stop; it is acceptable here and nowhere else because `assess`
+has already established that the proposal is grounded in the student's own trusted words. New callers
+state the subject type themselves."""
 
 
 async def remember(p: MemoryProposal, *, reason_it_matters: str | None = None,
                    now: datetime | None = None) -> MemoryRecord | None:
-    """Store the fact, or return None with the refusal logged. The only write path for factual memory.
+    """Store the fact, or return None with the refusal logged.
 
-    Also refuses to re-learn from a source the student has already forgotten. "forget that" does not mean
-    "forget it until you re-read the message it came from" — see `memory_correction.MemoryForget`.
+    Runs the #121b `assess` rules first, so a caller written against the old contract still gets the old
+    refusals, then submits a candidate that the registry and the kind floors judge again. Both must pass:
+    the adapter can only be stricter than either policy alone.
     """
     decision = assess(p)
     if not decision.stores:
@@ -285,27 +502,22 @@ async def remember(p: MemoryProposal, *, reason_it_matters: str | None = None,
         return None
 
     rec = build(p, now=now)
-    async with user_session(p.user_id) as s:
-        if p.source_message_id and await _source_was_forgotten(s, p.user_id, p.source_message_id):
-            log.info("memory_refused reason=%s kind=%s", SOURCE_WAS_FORGOTTEN, p.kind.value)
-            return None
-        await s.execute(sa.insert(MEMORY_RECORDS).values(
-            **mr.to_row(rec), reason_it_matters=(reason_it_matters or p.reason_it_matters).strip(),
-            created_at=sa.func.now()))
-    log.info("memory_stored id=%s kind=%s domain=%s confidence=%.2f", rec.memory_id, rec.kind.value,
-             rec.domain, rec.confidence)
+    observed = p.observed_at or now or datetime.now(timezone.utc)
+    receipt = await MemoryWriter(p.user_id).evaluate(MemoryCandidate(
+        user_id=p.user_id, subject_type=_KIND_TO_SUBJECT_TYPE[p.kind], subject_id=rec.subject,
+        kind=p.kind, predicate=p.predicate, proposed_value=rec.value,
+        normalized_value=mr.normalize(rec.value), evidence_text=p.stated_span,
+        source_type=SourceType.trusted_user_text, source_id=p.source_message_id,
+        provenance_class=ProvenanceClass.trusted_user_statement,
+        explicitly_stated_by_user=True, inferred=False, confidence=p.effective_confidence,
+        expected_stability=p.retention_policy,
+        usefulness_reason=(reason_it_matters or p.reason_it_matters),
+        sensitivity_class=p.sensitivity, retention_recommendation=p.retention_policy,
+        observed_at=observed))
+    if not receipt.stored:
+        return None
+    object.__setattr__(rec, "memory_id", receipt.memory_id)
     return rec
-
-
-async def _source_was_forgotten(session, user_id: UUID, source_message_id: str) -> bool:
-    """Has the student forgotten anything derived from this message? The tombstone keeps the message id
-    (content-free lineage, exactly what `retention.py` preserves after erasing raw text) precisely so
-    this question is answerable after the content is gone."""
-    found = (await session.execute(sa.select(MEMORY_RECORDS.c.memory_id).where(
-        MEMORY_RECORDS.c.user_id == user_id,
-        MEMORY_RECORDS.c.source_message_id == source_message_id,
-        MEMORY_RECORDS.c.forgotten_at.isnot(None)).limit(1))).first()
-    return found is not None
 
 
 async def record_style_signal(*, user_id: UUID, relation: str, value: str, trusted_text: str,
@@ -317,7 +529,7 @@ async def record_style_signal(*, user_id: UUID, relation: str, value: str, trust
     `kind` is hard-coded, not a parameter. There is no argument to this function that produces a factual
     record, and no argument to `remember` that produces a style one — so an observation about vocabulary,
     slang, punctuation or name cannot become a claim about who someone is, no matter what a caller
-    intended. That absence of a path is the enforcement; `SENSITIVE_TRAITS` is only the backstop.
+    intended. `memory_policy.SUBJECT_KIND_MATRIX` says the same thing a second time, from the other side.
 
     Style is re-observed constantly, so `last_confirmed_at` (not a new row per message) is what keeps it
     current — see `memory_correction.confirm`.
@@ -327,18 +539,24 @@ async def record_style_signal(*, user_id: UUID, relation: str, value: str, trust
         log.info("style_refused reason=%s", grounding)
         return None
     now = now or datetime.now(timezone.utc)
-    rec = MemoryRecord(
-        memory_id=uuid4(), user_id=user_id, kind=MemoryKind.style, subject=SELF,
+    observed = observed_at or now
+    receipt = await MemoryWriter(user_id).evaluate(MemoryCandidate(
+        user_id=user_id, subject_type=SubjectType.style, subject_id=SELF, kind=MemoryKind.style,
+        predicate=f"style.{relation}", proposed_value=value.strip(),
+        normalized_value=mr.normalize(value), evidence_text=stated_span,
+        source_type=SourceType.trusted_user_text, source_id=source_message_id,
+        provenance_class=ProvenanceClass.trusted_user_statement, explicitly_stated_by_user=True,
+        inferred=False, confidence=1.0, expected_stability=RetentionPolicy.season,
+        usefulness_reason="how this student writes, so replies sound like the person they are talking to",
+        sensitivity_class=Sensitivity.ordinary, retention_recommendation=RetentionPolicy.season,
+        observed_at=observed))
+    if not receipt.stored:
+        return None
+    return MemoryRecord(
+        memory_id=receipt.memory_id, user_id=user_id, kind=MemoryKind.style, subject=SELF,
         predicate=f"style.{relation}", value=value.strip(),
         evidence=Evidence(stated_span=stated_span, basis=Basis.stated),
         source_message_id=source_message_id, source_type=SourceType.trusted_user_text,
-        confidence=1.0, observed_at=observed_at or now, last_confirmed_at=None,
+        confidence=1.0, observed_at=observed, last_confirmed_at=None,
         retention_policy=RetentionPolicy.season, sensitivity=Sensitivity.ordinary,
         user_editable=True, contradicted_by=None, superseded_by=None)
-    async with user_session(user_id) as s:
-        await s.execute(sa.insert(MEMORY_RECORDS).values(
-            **mr.to_row(rec),
-            reason_it_matters="how this student writes, so replies sound like the person they are talking to",
-            created_at=sa.func.now()))
-    log.info("style_stored id=%s relation=%s", rec.memory_id, relation)
-    return rec
