@@ -207,7 +207,7 @@ def _trim_episodic(text: str, budget_tokens: int) -> str | None:
 async def compile(user_id, recent, *, include_episodic: bool = True,
                   profile: VoiceProfile | None = None,
                   capabilities=None,
-                  memory_cue=None,
+                  memory_cue=None, trace=None,
                   token_budget: int = DEFAULT_TOKEN_BUDGET) -> CompiledContext:
     """Build the bounded context for one turn. `recent` is the episodic window
     (conversation_store.TurnBrief list); `include_episodic=False` withholds it (an explicit reply-target
@@ -219,14 +219,20 @@ async def compile(user_id, recent, *, include_episodic: bool = True,
     is actually live. A retrieval fault degrades to no memory, never to a blocked turn: a student whose
     memory lookup times out should get an answer that knows less, not no answer.
     """
+    from . import turn_trace
     memory_ctx = None
     if memory_cue is not None:
         try:
             from . import memory_retrieval
             memory_ctx = await memory_retrieval.retrieve(user_id, memory_cue)
+            turn_trace.note(trace, cache_state=("memory_hit" if memory_ctx.cache_hit
+                                                else "memory_miss"))
         except Exception:
             log.info("memory_retrieval_failed user=%s", user_id)
             memory_ctx = None
+        turn_trace.guard(trace, "memory_ready")
+    elif trace is not None:
+        trace.absent("memory_ready", turn_trace.NOT_APPLICABLE)
 
     candidates: list[tuple[str, int, str]] = []
     for layer, prio, text in (
@@ -235,6 +241,8 @@ async def compile(user_id, recent, *, include_episodic: bool = True,
         ("capability", _P_CAPABILITY, capabilities.render() if capabilities is not None else ""),
         ("now", _P_NOW, await _now_block(user_id)),
         ("world", _P_WORLD, await _world_block(user_id)),
+        # `_operational_block` is the AgentRun read and `_entity_block` is the entity read; the marks sit
+        # after each so the baseline attributes their cost separately rather than to "context".
         ("operational", _P_OPERATIONAL, await _operational_block(user_id)),
         ("memory", _P_MEMORY, memory_ctx.render() if memory_ctx is not None else ""),
         ("entity", _P_ENTITY, await _entity_block(user_id)),
@@ -242,6 +250,9 @@ async def compile(user_id, recent, *, include_episodic: bool = True,
     ):
         if text:
             candidates.append((layer, prio, text))
+
+    turn_trace.guard(trace, "agent_runs_ready")
+    turn_trace.guard(trace, "entities_ready")
 
     included: list[ContextBlock] = []
     dropped: list[str] = []
@@ -263,6 +274,7 @@ async def compile(user_id, recent, *, include_episodic: bool = True,
         else:
             dropped.append(layer)
 
+    turn_trace.guard(trace, "conversation_state_ready")
     body = "\n\n".join(b.text for b in included) if included else _NO_HISTORY
     return CompiledContext(text=body, blocks=tuple(included), dropped=tuple(dropped),
                            est_tokens=used, profile=profile, memory=memory_ctx)
