@@ -151,30 +151,36 @@ def test_the_ast_proof_can_actually_see_an_insert():
         f"memory_writer must contain exactly one insert; found {creators['memory_writer']}")
 
 
-def test_only_the_writer_and_the_correction_lane_can_create_a_memory_row():
-    """No module may grow its own write path.
+def test_only_the_writer_can_create_a_memory_row():
+    """ONE DOOR, and it is now literally one.
 
-    `memory_correction` is the one other creator and is deliberately so: a correction inserts the
-    REPLACEMENT version of a claim that already exists, and it does that in the same transaction as the
-    supersession plus an audit row (see its own module docstring). It cannot originate a belief —
-    `test_the_correction_lane_cannot_originate_a_claim` proves that structurally.
+    #123 shipped with two: `memory_correction` inserted its own replacement rows, so an untrusted
+    "correction" reached the table without meeting the write policy, the provenance rules or the
+    per-kind confidence floor. This assertion could only name the two modules and say the second was
+    deliberate — which is a description of a hole, not a boundary.
 
-    Anything else appearing here is a second door and this assertion is the thing that stops it.
+    #124A moved supersession into the writer. A correction now proposes a `MemoryCandidate` and gets
+    judged exactly like a first-time fact; `memory_correction` coordinates and writes an audit row to a
+    different table, and has nothing left that puts a row in `memory_records`.
+
+    Anything appearing here is a second door, and this is the thing that stops it.
     """
-    assert set(_row_creators()) == {"memory_writer", "memory_correction"}
+    assert set(_row_creators()) == {"memory_writer"}
 
 
-def test_the_correction_lane_cannot_originate_a_claim():
-    """A correction copies kind, subject and predicate from the row it replaces, so it can only ever
-    restate an existing claim. Asserted on the import graph: `memory_correction` does not import
-    `MemoryCandidate`, so it has no way to express a new one and no access to the policy that would be
-    needed to admit it."""
-    tree = ast.parse((ENGINE_PKG / "memory_correction.py").read_text(encoding="utf-8"))
-    imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) for a in n.names}
-    imported |= {a.name.split(".")[-1] for n in ast.walk(tree) if isinstance(n, ast.Import)
-                 for a in n.names}
-    assert "MemoryCandidate" not in imported
-    assert "memory_candidate" not in imported and "memory_policy" not in imported
+def test_a_correction_is_judged_by_the_same_policy_as_a_first_time_fact():
+    """The property the second door was hiding. A correction carrying untrusted provenance is refused by
+    the writer itself, not only by the caller that happens to check first — so a future path that reaches
+    the writer without going through `memory_correction` is refused for the same reason."""
+    import inspect
+
+    from bruce_engine import memory_writer
+
+    src = inspect.getsource(memory_writer.MemoryWriter.evaluate)
+    tree = ast.parse(inspect.cleandoc(src.split('"""', 2)[-1]) if False else src.lstrip())
+    names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert "trusted_user_correction" in names, "supersession does not check correction provenance"
+    assert "supersedes" in inspect.signature(memory_writer.MemoryWriter.evaluate).parameters
 
 
 def test_no_module_reaches_around_the_writer_for_its_row_builder():

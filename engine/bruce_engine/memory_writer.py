@@ -81,13 +81,16 @@ STYLE_IS_NOT_A_FACT = "style_is_not_a_fact"
 NOT_USER_SPECIFIC = "not_user_specific"
 UNSTABLE_FOR_LAYER = "lifetime_contradicts_layer"
 NO_REASON_IT_MATTERS = "no_reason_it_matters"
+NO_SUCH_VERSION = "no_such_active_version"
+NOT_A_CORRECTION = "correction_requires_trusted_user_correction_provenance"
 FILLER = "conversational_filler"
 SOURCE_WAS_FORGOTTEN = "source_was_forgotten"
 DUPLICATE_CLAIM = "claim_already_active"
 
 REFUSALS = frozenset({UNTRUSTED_SOURCE, NO_SPAN, SPAN_NOT_IN_TRUSTED_TEXT, SPAN_FROM_UNTRUSTED_CONTENT,
                       SENSITIVE_TRAIT, STYLE_IS_NOT_A_FACT, NOT_USER_SPECIFIC, UNSTABLE_FOR_LAYER,
-                      NO_REASON_IT_MATTERS, FILLER, SOURCE_WAS_FORGOTTEN, DUPLICATE_CLAIM})
+                      NO_REASON_IT_MATTERS, FILLER, SOURCE_WAS_FORGOTTEN, DUPLICATE_CLAIM,
+                      NO_SUCH_VERSION, NOT_A_CORRECTION})
 
 HEDGED_CEILING = 0.7
 """What a hedge is worth. "i think it's ms delgado" is a real observation and is kept, but it may never
@@ -141,7 +144,8 @@ class MemoryWriter:
 
     user_id: UUID
 
-    async def evaluate(self, candidate: MemoryCandidate) -> WriteReceipt:
+    async def evaluate(self, candidate: MemoryCandidate, *,
+                       supersedes: UUID | str | None = None) -> WriteReceipt:
         """THE write path. Decide, then persist what the decision permits — never what the candidate asked
         for.
 
@@ -149,6 +153,15 @@ class MemoryWriter:
         provenance-capped number, retention and sensitivity come from the registry. A caller's opinion
         about those three is advisory and can only make them stricter, which is what stops a confident
         extractor from choosing its own terms.
+
+        `supersedes` is how a CORRECTION arrives. #123 left `memory_correction` inserting its own
+        replacement rows, which meant "only MemoryWriter creates active memory" was true of origination
+        and false of insertion — the AST proof had to name two modules. So supersession moved here: the
+        writer retires the named version and inserts the replacement in ONE transaction, and the caller
+        is left coordinating and writing its audit row. It cannot put a row in the table.
+
+        Retire-before-insert is load-bearing rather than stylistic. `uq_memory_active_claim` permits one
+        active row per claim, so inserting first is an integrity error, not a brief window.
 
         NOT ENFORCED HERE, and it needs a schema change rather than a check: "a style memory must be a
         behavioural aggregate over several messages". A `MemoryCandidate` describes ONE observation and
@@ -179,9 +192,29 @@ class MemoryWriter:
                 log.info("memory_refused reason=%s kind=%s", SOURCE_WAS_FORGOTTEN, candidate.kind.value)
                 return WriteReceipt(Outcome.reject, SOURCE_WAS_FORGOTTEN,
                                     candidate_id=candidate.candidate_id)
-            if status == "active" and await _claim_is_active(s, self.user_id, key):
-                # Replacing a belief is `memory_correction`'s job — it supersedes in one transaction and
-                # writes an audit row. Silently superseding here would make the change unattributable.
+
+            if supersedes is not None:
+                old = await _active_version(s, self.user_id, supersedes)
+                if old is None:
+                    return WriteReceipt(Outcome.reject, NO_SUCH_VERSION,
+                                        candidate_id=candidate.candidate_id)
+                if candidate.provenance_class is not ProvenanceClass.trusted_user_correction:
+                    # A forwarded email that contradicts something the student said is EVIDENCE that one
+                    # of the two is wrong, never an instruction about which. Only the student may retire
+                    # their own belief.
+                    log.info("memory_refused reason=%s", NOT_A_CORRECTION)
+                    return WriteReceipt(Outcome.reject, NOT_A_CORRECTION,
+                                        candidate_id=candidate.candidate_id)
+                # The replacement is a new VERSION of the same claim, so it inherits the root and the
+                # key. `old.claim_key or key` backfills a row written before lineage existed — the unique
+                # index is partial on `claim_key IS NOT NULL`, so a NULL key means the database's
+                # active-claim guarantee silently does not cover exactly this moment.
+                values["claim_root_id"] = old.claim_root_id or old.memory_id
+                values["claim_key"] = old.claim_key or key
+                await _retire_claim(s, self.user_id, superseded_by=memory_id, old=old)
+            elif status == "active" and await _claim_is_active(s, self.user_id, key):
+                # A second belief about the same claim, arriving without a correction to justify it.
+                # Silently superseding would make the change unattributable.
                 log.info("memory_refused reason=%s kind=%s", DUPLICATE_CLAIM, candidate.kind.value)
                 return WriteReceipt(Outcome.reject, DUPLICATE_CLAIM, candidate_id=candidate.candidate_id)
             try:
@@ -197,6 +230,39 @@ class MemoryWriter:
                  mr.domain_of(candidate.predicate), decision.confidence)
         return WriteReceipt(decision.outcome, decision.reason, candidate_id=candidate.candidate_id,
                             memory_id=memory_id, claim_key=key, confidence=decision.confidence)
+
+
+async def _active_version(session, user_id: UUID, memory_id) -> object | None:
+    """The row a correction names, or None. Scoped to this writer's student — RLS underneath, and an
+    explicit filter here, because a correction that silently retired someone else's belief is the one
+    failure this whole module exists to make unspellable."""
+    try:
+        mid = UUID(str(memory_id))
+    except (ValueError, TypeError):
+        return None
+    return (await session.execute(sa.select(MEMORY_RECORDS).where(
+        MEMORY_RECORDS.c.memory_id == mid,
+        MEMORY_RECORDS.c.user_id == user_id,
+        MEMORY_RECORDS.c.status == "active"))).first()
+
+
+async def _retire_claim(session, user_id: UUID, *, superseded_by: UUID, old) -> None:
+    """Close out the named version AND anything else still active for the same claim.
+
+    The second half matters for rows that predate `uq_memory_active_claim`: a duplicate that slipped in
+    before the index existed would otherwise outlive the correction and leave retrieval choosing between
+    two beliefs.
+    """
+    await session.execute(sa.update(MEMORY_RECORDS).where(
+        MEMORY_RECORDS.c.memory_id == old.memory_id,
+        MEMORY_RECORDS.c.user_id == user_id).values(
+            status="superseded", superseded_by_id=superseded_by))
+    await session.execute(sa.update(MEMORY_RECORDS).where(
+        MEMORY_RECORDS.c.user_id == user_id,
+        MEMORY_RECORDS.c.status == "active",
+        MEMORY_RECORDS.c.entity_key == old.entity_key,
+        MEMORY_RECORDS.c.predicate == old.predicate).values(
+            status="superseded", superseded_by_id=superseded_by))
 
 
 async def _insert(session, values: dict) -> None:

@@ -29,6 +29,25 @@ from sqlalchemy import select, update
 from . import memory_cache
 from . import memory_record as mr
 from . import schema
+from .memory_candidate import MemoryCandidate, ProvenanceClass, SubjectType
+from .memory_record import MemoryKind, RetentionPolicy, Sensitivity, SourceType
+from .memory_writer import MemoryWriter
+
+# Only a trusted correction may retire a belief; everything else is mapped to its honest provenance so
+# the writer refuses it for the stated reason rather than for a generic one.
+_PROVENANCE_FOR = {
+    "quoted": ProvenanceClass.quoted_content,
+    "forwarded": ProvenanceClass.forwarded_content,
+    "attachment": ProvenanceClass.attachment_content,
+    "provider": ProvenanceClass.provider_verified,
+    "model": ProvenanceClass.model_inference,
+}
+
+_SUBJECT_TYPE = {
+    "profile": SubjectType.user, "relationships": SubjectType.relationship,
+    "world": SubjectType.world, "entity": SubjectType.provider_entity,
+    "episodic": SubjectType.conversation, "style": SubjectType.style,
+}
 from .db import user_session
 
 log = logging.getLogger("bruce.memory.correction")   # CONTENT-FREE: ids, predicates, counts
@@ -78,6 +97,10 @@ async def apply(user_id: UUID, *, target_id: UUID | str, new_value: str,
     wrong, not an instruction about which.
     """
     if source_type != "trusted_user_text":
+        # Checked here AND independently by the writer, which refuses any `supersedes` whose provenance
+        # is not `trusted_user_correction`. Two checks because they answer to different callers: this one
+        # keeps a stable, specific reason for the conversation layer, and the writer's is what holds if a
+        # future path reaches it without coming through here.
         log.info("correction_refused reason=%s source=%s", UNTRUSTED, source_type)
         return CorrectionResult(False, UNTRUSTED)
 
@@ -86,58 +109,47 @@ async def apply(user_id: UUID, *, target_id: UUID | str, new_value: str,
     tid = UUID(str(target_id))
 
     async with user_session(user_id) as s:
-        old = (await s.execute(select(R).where(R.memory_id == tid, R.user_id == user_id))).scalar_one_or_none()
-        if old is None or old.status != "active":
-            return CorrectionResult(False, NOT_FOUND)
+        old = (await s.execute(select(R).where(R.memory_id == tid,
+                                               R.user_id == user_id))).scalar_one_or_none()
+    if old is None or old.status != "active":
+        return CorrectionResult(False, NOT_FOUND)
 
-        replacement_id = uuid4()
-        # THE LINEAGE. The replacement is a new VERSION of the same claim, not a new claim, so it
-        # inherits the root and the key. Without this a corrected fact becomes two unrelated rows and a
-        # later "forget that" reaches only the newest — leaving the previous value readable through
-        # provenance and correction history, which is what #122 shipped.
-        root = old.claim_root_id or old.memory_id
-        # Backfill the key when the original row predates claim lineage or was written by a path that
-        # did not set one. `uq_memory_active_claim` is partial on `claim_key IS NOT NULL`, so a NULL key
-        # means the database's active-claim uniqueness guarantee silently does not cover this claim —
-        # and a correction is exactly when a second active version would appear.
-        key = old.claim_key or mr.claim_key(kind=old.kind, subject=old.subject,
-                                            predicate=old.predicate)
+    # THE CANDIDATE. A correction is a memory write like any other, so it is proposed rather than
+    # performed: the writer applies the same policy, the same provenance validation and the same
+    # per-kind confidence floor it applies to a first-time fact. Before #124A this module inserted its
+    # own row, which meant an untrusted "correction" bypassed every one of those checks — and made
+    # "only MemoryWriter creates active memory" a claim the AST proof had to name two modules to state.
+    provenance = (ProvenanceClass.trusted_user_correction if source_type == "trusted_user_text"
+                  else _PROVENANCE_FOR.get(source_type, ProvenanceClass.model_inference))
+    candidate = MemoryCandidate(
+        user_id=user_id, subject_type=_SUBJECT_TYPE.get(old.kind, SubjectType.user),
+        subject_id=old.subject or mr.SELF, kind=MemoryKind(old.kind), predicate=old.predicate or "",
+        proposed_value=new_value, normalized_value=mr.normalize(new_value)[:300],
+        evidence_text=evidence_text or new_value, source_type=SourceType(source_type),
+        source_id=source_message_id, provenance_class=provenance,
+        explicitly_stated_by_user=(source_type == "trusted_user_text"), inferred=False,
+        confidence=confidence, expected_stability=RetentionPolicy(old.retention_policy),
+        usefulness_reason=old.reason_it_matters or "the student corrected this",
+        sensitivity_class=Sensitivity(old.sensitivity),
+        retention_recommendation=RetentionPolicy(old.retention_policy), observed_at=now)
 
-        # RETIRE BEFORE INSERTING. Since 0030 the database holds at most one ACTIVE row per claim, so
-        # inserting the replacement while the old one is still active is an integrity error rather than
-        # a brief window. That ordering is now load-bearing, not stylistic — and it is the same
-        # invariant either way: two active versions of one claim never exist, and the transaction makes
-        # the pair atomic.
-        await s.execute(update(R).where(R.memory_id == tid, R.user_id == user_id)
-                        .values(status="superseded", superseded_by_id=replacement_id))
-        # Anything ELSE still active for the same claim goes too — how a duplicate that predates the
-        # unique index gets cleaned up instead of quietly outliving the correction.
-        await s.execute(update(R).where(
-            R.user_id == user_id, R.status == "active", R.predicate == old.predicate,
-            R.entity_key == old.entity_key, R.memory_id != replacement_id)
-            .values(status="superseded", superseded_by_id=replacement_id))
+    receipt = await MemoryWriter(user_id=user_id).evaluate(candidate, supersedes=tid)
+    if not receipt.stored:
+        log.info("correction_refused reason=%s predicate=%s", receipt.reason, old.predicate)
+        return CorrectionResult(False, receipt.reason, superseded_memory_id=str(tid))
 
-        s.add(R(
-            memory_id=replacement_id, user_id=user_id, kind=old.kind, subject=old.subject,
-            claim_root_id=root, claim_key=key,
-            predicate=old.predicate, value_json=value_json or {"value": new_value},
-            normalized_value=mr.normalize(new_value)[:300], evidence_text=evidence_text,
-            source_message_id=source_message_id, source_type=source_type, confidence=confidence,
-            observed_at=now, last_confirmed_at=now, expires_at=old.expires_at,
-            freshness_class="fresh", retention_policy=old.retention_policy,
-            sensitivity=old.sensitivity, user_editable=old.user_editable, status="active",
-            entity_key=old.entity_key, domain=old.domain, reason_it_matters=old.reason_it_matters))
-        await s.flush()
-
+    # The audit row is a DIFFERENT table, and coordinating it is what this module still owns. It records
+    # that a correction happened and links both sides; it never carries either value.
+    async with user_session(user_id) as s:
         s.add(schema.MemoryCorrectionRow(
-            user_id=user_id, memory_id=tid, replacement_memory_id=replacement_id,
+            user_id=user_id, memory_id=tid, replacement_memory_id=UUID(str(receipt.memory_id)),
             source_message_id=source_message_id, reason=(reason or "")[:200] or None,
             corrected_at=now))
 
     memory_cache.invalidate(user_id, reason="correction")
-    log.info("correction_applied old=%s new=%s predicate=%s", tid, replacement_id, old.predicate)
+    log.info("correction_applied old=%s new=%s predicate=%s", tid, receipt.memory_id, old.predicate)
     return CorrectionResult(True, APPLIED, superseded_memory_id=str(tid),
-                            replacement_memory_id=str(replacement_id))
+                            replacement_memory_id=str(receipt.memory_id))
 
 
 async def contradict(user_id: UUID, *, target_id: UUID | str, by_memory_id: UUID | str | None = None,

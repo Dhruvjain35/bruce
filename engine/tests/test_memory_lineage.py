@@ -65,8 +65,13 @@ def _user():
     return uid
 
 
-def _write(uid, *, kind="profile", subject=mr.SELF, predicate="profile.teacher_name",
-           value="mr smith", status="active", claim_root=None, source_message_id="m-1"):
+def _write(uid, *, kind="relationships", subject="ap bio teacher",
+           predicate="relationships.name", value="mr smith", status="active", claim_root=None,
+           source_message_id="m-1"):
+    # A RELATIONSHIP, not a profile fact. Corrections now run through the write policy, and
+    # `profile.teacher_name` is not an allowlisted user-profile predicate — so a fixture using it would
+    # be testing the registry rather than the lineage. That the default-deny registry caught this fixture
+    # is the registry working.
     mid = uuid4()
     key = mr.claim_key(kind=kind, subject=subject, predicate=predicate)
 
@@ -402,3 +407,97 @@ def test_no_memory_module_declares_its_own_table_metadata():
                 assert name != "MetaData", f"{path.name} declares its own MetaData"
                 if name == "Table":
                     raise AssertionError(f"{path.name} declares a private Table")
+
+
+# --- #124A: THE CORRECTION PATH IS THE WRITE PATH --------------------------------------------------------
+# Before this, `memory_correction` inserted its own rows, so a correction met none of the write policy.
+# Each case below is a way an untrusted "correction" used to reach the table.
+
+def _correct(uid, target, value, *, source_type="trusted_user_text", message="m-2"):
+    return _run(memory_correction.apply(uid, target_id=target, new_value=value,
+                                        source_message_id=message, source_type=source_type))
+
+
+def test_a_trusted_correction_succeeds_and_is_retrievable_immediately():
+    uid = _user()
+    v1 = _write(uid, value="mr smith")
+    res = _correct(uid, v1, "ms smith")
+    assert res.applied and res.replacement_memory_id
+    ctx = _run(ret.retrieve(uid, TurnCue(text="who teaches ap bio",
+                                         entities=("ap bio teacher",))))
+    facts = " ".join(i.fact for i in ctx.items)
+    assert "ms smith" in facts and "mr smith" not in facts
+
+
+@pytest.mark.parametrize("source", ["quoted", "forwarded", "attachment", "provider", "model"])
+def test_an_untrusted_correction_cannot_retire_a_belief(source):
+    """A forwarded email that contradicts something the student said is EVIDENCE that one of the two is
+    wrong, never an instruction about which."""
+    uid = _user()
+    v1 = _write(uid, value="mr smith")
+    res = _correct(uid, v1, "ms smith", source_type=source)
+    assert not res.applied
+    rows = _run(_rows(uid))
+    assert len(rows) == 1 and rows[0].status == "active"
+    assert rows[0].normalized_value == "mr smith"
+
+
+def test_a_correction_of_an_unregistered_user_profile_predicate_is_refused():
+    """The default-deny registry applies to corrections too. `profile.mood` is not a predicate the
+    product has a reason to hold, and a correction is not a way in through the side."""
+    uid = _user()
+    v1 = _write(uid, kind="profile", subject=mr.SELF, predicate="profile.mood", value="fine")
+    res = _correct(uid, v1, "tired")
+    assert not res.applied and res.reason == "unregistered_user_predicate"
+    assert _run(_rows(uid))[0].normalized_value == "fine"
+
+
+def test_a_correction_naming_a_version_that_is_not_active_is_refused():
+    uid = _user()
+    v1 = _write(uid, value="mr smith")
+    _correct(uid, v1, "ms smith")
+    assert not _correct(uid, v1, "mrs smith", message="m-3").applied     # v1 is superseded now
+
+
+def test_a_correction_cannot_reach_another_students_belief():
+    a, b = _user(), _user()
+    v1 = _write(a, value="mr smith")
+    assert not _correct(b, v1, "ms smith").applied
+    assert _run(_rows(a))[0].normalized_value == "mr smith"
+
+
+def test_after_a_correction_exactly_one_version_is_active_and_lineage_holds():
+    uid = _user()
+    v1 = _write(uid, value="mr smith")
+    res = _correct(uid, v1, "ms smith")
+    rows = _run(_rows(uid))
+    assert len([r for r in rows if r.status == "active"]) == 1
+    assert {str(r.claim_root_id) for r in rows} == {str(v1)}
+    assert len({r.claim_key for r in rows}) == 1
+    assert _run(memory_correction.active_conflicts(uid)) == []
+
+
+def test_forget_after_a_correction_removes_the_whole_lineage():
+    uid = _user()
+    v1 = _write(uid, value="mr smith")
+    res = _correct(uid, v1, "ms smith")
+    _run(memory_forget.forget(uid, scope=memory_forget.CLAIM, target=res.replacement_memory_id))
+    for row in _run(_rows(uid)):
+        assert row.status == "forgotten" and row.normalized_value is None
+    assert "smith" not in " ".join(str(r.value_json) for r in _run(_rows(uid))).lower()
+
+
+def test_the_correction_audit_row_still_links_both_sides():
+    uid = _user()
+    v1 = _write(uid, value="mr smith")
+    res = _correct(uid, v1, "ms smith")
+
+    async def _audit():
+        async with user_session(uid) as s:
+            return (await s.execute(select(schema.MemoryCorrectionRow).where(
+                schema.MemoryCorrectionRow.user_id == uid))).scalars().all()
+    rows = _run(_audit())
+    assert len(rows) == 1
+    assert str(rows[0].memory_id) == res.superseded_memory_id
+    assert str(rows[0].replacement_memory_id) == res.replacement_memory_id
+    assert "smith" not in (rows[0].reason or "")
