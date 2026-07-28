@@ -18,7 +18,11 @@ from __future__ import annotations
 import datetime as _dt
 from dataclasses import dataclass, field
 
+import logging
+
 from . import agent_run_store, entity_store, world_state
+
+log = logging.getLogger("bruce.context")   # CONTENT-FREE: ids and layer names only
 from .calendar_schedule import DEFAULT_TZ
 from .conversation_style import VoiceProfile
 
@@ -41,6 +45,12 @@ _P_CAPABILITY = 105
 # only ever told a timezone, never the date. "tomorrow at 3" had nothing to be relative to.
 _P_NOW = 102
 _P_WORLD, _P_OPERATIONAL, _P_ENTITY, _P_EPISODIC = 100, 90, 80, 50
+# Memory sits above the entity list and below operational state. What Bruce KNOWS about the student
+# changes more answers than which events are on the calendar this week, and fewer than what is running
+# right now. It is already budgeted by the retriever, so it is small by construction — but it must still
+# yield before capability truth and the clock, which are the two things a wrong context makes Bruce lie
+# about rather than merely lose.
+_P_MEMORY = 85
 
 _NO_HISTORY = "No prior conversation."
 
@@ -64,6 +74,11 @@ class CompiledContext:
     dropped: tuple[str, ...] = ()
     est_tokens: int = 0
     profile: VoiceProfile | None = None
+    # The MemoryContext this turn was given, carried structurally as well as flattened into `text`. The
+    # object is what a trace, the harness and a provenance reply read; the prose is only what the model
+    # sees. Keeping both is how "Bruce forgot my teacher's name" can be told apart from "Bruce was never
+    # shown it" after the fact.
+    memory: object | None = None
 
 
 def _est_tokens(s: str) -> int:
@@ -192,10 +207,27 @@ def _trim_episodic(text: str, budget_tokens: int) -> str | None:
 async def compile(user_id, recent, *, include_episodic: bool = True,
                   profile: VoiceProfile | None = None,
                   capabilities=None,
+                  memory_cue=None,
                   token_budget: int = DEFAULT_TOKEN_BUDGET) -> CompiledContext:
     """Build the bounded context for one turn. `recent` is the episodic window
     (conversation_store.TurnBrief list); `include_episodic=False` withholds it (an explicit reply-target
-    owns the context) while world/entity/operational still ground the reply."""
+    owns the context) while world/entity/operational still ground the reply.
+
+    `memory_cue` is a `memory_retrieval.TurnCue`. When present, the deterministic memory shortlist runs
+    HERE — after capability truth and active state are known, before the model reasons — which is the
+    order the acceleration program specifies and the only order in which retrieval can be scoped by what
+    is actually live. A retrieval fault degrades to no memory, never to a blocked turn: a student whose
+    memory lookup times out should get an answer that knows less, not no answer.
+    """
+    memory_ctx = None
+    if memory_cue is not None:
+        try:
+            from . import memory_retrieval
+            memory_ctx = await memory_retrieval.retrieve(user_id, memory_cue)
+        except Exception:
+            log.info("memory_retrieval_failed user=%s", user_id)
+            memory_ctx = None
+
     candidates: list[tuple[str, int, str]] = []
     for layer, prio, text in (
         # capability truth FIRST: the runtime already knows what is live, and the model previously never
@@ -204,6 +236,7 @@ async def compile(user_id, recent, *, include_episodic: bool = True,
         ("now", _P_NOW, await _now_block(user_id)),
         ("world", _P_WORLD, await _world_block(user_id)),
         ("operational", _P_OPERATIONAL, await _operational_block(user_id)),
+        ("memory", _P_MEMORY, memory_ctx.render() if memory_ctx is not None else ""),
         ("entity", _P_ENTITY, await _entity_block(user_id)),
         ("episodic", _P_EPISODIC, _episodic_block(recent, include=include_episodic)),
     ):
@@ -232,4 +265,4 @@ async def compile(user_id, recent, *, include_episodic: bool = True,
 
     body = "\n\n".join(b.text for b in included) if included else _NO_HISTORY
     return CompiledContext(text=body, blocks=tuple(included), dropped=tuple(dropped),
-                           est_tokens=used, profile=profile)
+                           est_tokens=used, profile=profile, memory=memory_ctx)
