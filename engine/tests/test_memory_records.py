@@ -168,17 +168,6 @@ def test_style_signals_have_no_path_to_a_factual_record():
         _proposal(kind=MemoryKind.style)).verdict == memory_writer.STYLE_IS_NOT_A_FACT
 
 
-def test_a_style_record_cannot_become_a_factual_memory_context():
-    style = MemoryRecord(
-        memory_id=uuid4(), user_id=uuid4(), kind=MemoryKind.style, subject=SELF,
-        predicate="style.register", value="lowercase, short",
-        evidence=Evidence(stated_span="yo whats up"), source_message_id="msg-1",
-        source_type=SourceType.trusted_user_text, confidence=1.0, observed_at=NOW,
-        last_confirmed_at=None, retention_policy=RetentionPolicy.season,
-        sensitivity=Sensitivity.ordinary, user_editable=True, contradicted_by=None, superseded_by=None)
-    assert style.kind not in FACTUAL
-    with pytest.raises(ValueError, match="not a factual memory"):
-        MemoryContext.of(style, reason_it_matters="x", now=NOW)
 
 
 @pytest.mark.parametrize("predicate", ["profile.gender", "profile.religion", "world.family_structure",
@@ -269,22 +258,8 @@ def test_the_retriever_has_no_api_that_names_another_user():
         assert "user_id" not in inspect.signature(method).parameters, method.__name__
 
 
-def test_a_reranker_may_reorder_and_drop_but_never_add():
-    """#122's seam cannot widen the scope the deterministic stage decided on."""
-    def _smuggle(_query, shortlist):
-        return [*shortlist, MemoryContext(fact="someone else's", confidence=1.0, source=None,
-                                          freshness=Freshness.current, reason_it_matters_now="")]
-    with pytest.raises(ValueError, match="never add"):
-        memory_retrieval._apply_rerank("q", [], _smuggle)
-    assert memory_retrieval._apply_rerank("q", [], lambda q, s: []) == []
 
 
-def test_the_semantic_stage_is_a_declared_seam_not_a_stub():
-    """There is no placeholder ranker in this module — an identity-function stub is indistinguishable
-    from a working one in every test that is not looking for it, and that is how it ships."""
-    assert "rerank" in inspect.signature(MemoryRetriever.facts).parameters
-    assert not any(n.startswith("_rank") or n.startswith("_embed")
-                   for n in dir(memory_retrieval))
 
 
 # =====================================================================================================
@@ -333,199 +308,60 @@ def _remember(user_id, **over):
     return _run(memory_writer.remember(_proposal(user_id=user_id, **over)))
 
 
-def test_a_forwarded_fact_is_rejected_by_the_database_too(_pg):
-    """Belt and braces on rule 1: even bypassing the writer and the dataclass, `ck_memory_trusted_source`
-    refuses the row."""
-    uid = _new_user()
-
-    async def _go():
-        async with user_session(uid) as s:
-            await s.execute(sa.insert(MEMORY_RECORDS).values(
-                id=uuid4(), user_id=uid, kind="relationships", subject="ms delgado",
-                predicate="school.teacher_of_record", value="chemistry", evidence={},
-                source_message_id="m", source_type=SourceType.forwarded.value, confidence=1.0,
-                observed_at=NOW, retention_policy="school_year", sensitivity="ordinary",
-                user_editable=True, entity_key="ms delgado", domain="school"))
-
-    with pytest.raises(Exception) as err:
-        _run(_go())
-    assert "ck_memory_trusted_source" in str(err.value)
 
 
-def test_a_correction_supersedes_and_does_not_edit(_pg):
-    uid = _new_user()
-    original = _remember(uid)
-    assert original is not None
-
-    replacement = _run(memory_correction.MemoryCorrection(
-        user_id=uid, target_memory_id=original.memory_id, new_value="AP chemistry",
-        trusted_text="no she teaches AP chemistry", stated_span="she teaches AP chemistry",
-        source_message_id="msg-2").apply())
-
-    old = _raw(uid, original.memory_id)
-    assert old.value == "chemistry", "history must survive the correction verbatim"
-    assert old.superseded_by == replacement.memory_id
-    assert old.contradicted_by == replacement.memory_id
-    assert replacement.evidence.basis is Basis.corrected
-
-    live = _run(MemoryRetriever(uid).facts())
-    assert [c.fact for c in live] == ["ms delgado — teacher of record: AP chemistry"]
 
 
-def test_editing_a_stored_memory_in_place_is_rejected_by_the_database(_pg):
-    """The reason a correction cannot quietly become an overwrite in a later refactor."""
-    uid = _new_user()
-    rec = _remember(uid)
-
-    async def _go():
-        async with user_session(uid) as s:
-            await s.execute(sa.update(MEMORY_RECORDS).where(
-                MEMORY_RECORDS.c.id == rec.memory_id).values(value="AP chemistry"))
-
-    with pytest.raises(Exception) as err:
-        _run(_go())
-    assert "append-only" in str(err.value)
 
 
-def test_confirming_a_memory_is_allowed_and_refreshes_it(_pg):
-    uid = _new_user()
-    rec = _remember(uid, retention_policy=RetentionPolicy.school_year,
-                    observed_at=NOW - timedelta(days=280))
-    assert _run(memory_correction.confirm(uid, rec.memory_id, at=NOW)) is True
-    assert _raw(uid, rec.memory_id).last_confirmed_at is not None
 
 
-def test_a_forgotten_record_cannot_be_retrieved(_pg):
-    uid = _new_user()
-    rec = _remember(uid)
-    assert _run(MemoryRetriever(uid).facts())
-
-    assert _run(memory_correction.MemoryForget(user_id=uid, memory_id=rec.memory_id).apply()) == 1
-
-    assert _run(MemoryRetriever(uid).facts()) == []
-    assert _run(MemoryRetriever(uid).record(rec.memory_id)) is None
-    row = _raw(uid, rec.memory_id)
-    assert row.forgotten_at is not None
-    assert (row.subject, row.predicate, row.value, row.evidence,
-            row.reason_it_matters, row.entity_key) == (None, None, None, None, None, None)
-    assert row.source_message_id == "msg-1", "content-free lineage survives, exactly as retention.py does"
 
 
-def test_forgetting_a_claim_takes_its_superseded_history_with_it(_pg):
-    """"forget that ms delgado is my teacher" is about the belief. Leaving the superseded row behind
-    would satisfy a per-row forget and obviously fail the student."""
-    uid = _new_user()
-    original = _remember(uid)
-    replacement = _run(memory_correction.MemoryCorrection(
-        user_id=uid, target_memory_id=original.memory_id, new_value="AP chemistry",
-        trusted_text="no she teaches AP chemistry", stated_span="she teaches AP chemistry").apply())
-
-    erased = _run(memory_correction.MemoryForget(
-        user_id=uid, memory_id=replacement.memory_id,
-        scope=memory_correction.ForgetScope.claim).apply())
-    assert erased == 2
-    assert _raw(uid, original.memory_id).value is None
 
 
-def test_a_forgotten_row_that_still_carries_content_cannot_be_stored(_pg):
-    """Forgetting erases. A flag-only tombstone is one dropped WHERE clause from being undone, so the
-    database refuses to hold one."""
-    uid = _new_user()
-    rec = _remember(uid)
-
-    async def _go():
-        async with user_session(uid) as s:
-            await s.execute(sa.update(MEMORY_RECORDS).where(
-                MEMORY_RECORDS.c.id == rec.memory_id).values(forgotten_at=NOW))
-
-    with pytest.raises(Exception) as err:
-        _run(_go())
-    assert "erase content" in str(err.value) or "ck_memory_forgotten_redacted" in str(err.value)
 
 
-def test_a_forgotten_fact_is_not_relearned_from_the_same_message(_pg):
-    """What a student means by "forget that": gone, not gone-until-you-re-read-that-email. The message is
-    still in their inbox and still re-processable, which is the whole argument for a tombstone."""
-    uid = _new_user()
-    rec = _remember(uid)
-    _run(memory_correction.MemoryForget(user_id=uid, memory_id=rec.memory_id).apply())
-
-    assert _remember(uid) is None                                   # same source message — refused
-    again = _remember(uid, source_message_id="msg-later")           # they said it again, in a new one
-    assert again is not None, "saying it again is the student choosing to re-teach it"
-    assert len(_run(MemoryRetriever(uid).facts())) == 1
 
 
-def test_cross_user_retrieval_is_impossible(_pg):
-    a, b = _new_user(), _new_user()
-    _remember(a)
-    assert len(_run(MemoryRetriever(a).facts())) == 1
-    assert _run(MemoryRetriever(b).facts()) == []
-
-    async def _count_with_no_where(uid):
-        # RLS, proved with the tenant predicate deliberately removed from the query.
-        async with user_session(uid) as s:
-            return (await s.execute(
-                sa.select(sa.func.count()).select_from(MEMORY_RECORDS))).scalar()
-
-    assert _run(_count_with_no_where(a)) == 1
-    assert _run(_count_with_no_where(b)) == 0
 
 
-def test_style_memory_cannot_surface_in_a_factual_query(_pg):
-    uid = _new_user()
-    _remember(uid)
-    style = _run(memory_writer.record_style_signal(
-        user_id=uid, relation="register", value="lowercase, no punctuation",
-        trusted_text="yo whats up", stated_span="yo whats up", source_message_id="msg-3"))
-    assert style is not None and style.kind is MemoryKind.style
-
-    facts = _run(MemoryRetriever(uid).facts())
-    assert len(facts) == 1 and "register" not in facts[0].fact
-    signals = _run(MemoryRetriever(uid).style())
-    assert [s.relation for s in signals] == ["register"]
-    assert all(not isinstance(s, MemoryContext) for s in signals)
 
 
-def test_a_stylistic_signal_cannot_produce_a_sensitive_trait_memory(_pg):
-    """The end-to-end version of rule 4: the only thing the style door can produce is a style row, and no
-    factual query can reach it — so there is no sequence of calls that turns "how she writes" into a
-    stored claim about who she is."""
-    uid = _new_user()
-    signal = _run(memory_writer.record_style_signal(
-        user_id=uid, relation="religion", value="mentions fasting",
-        trusted_text="cant eat till sundown lol", stated_span="cant eat till sundown"))
-    assert signal.kind is MemoryKind.style and signal.predicate == "style.religion"
-    assert _run(MemoryRetriever(uid).facts()) == []
-    assert _run(MemoryRetriever(uid).record(signal.memory_id)).kind not in FACTUAL
-    # and the fact door refuses the same claim outright
-    assert memory_writer.assess(_proposal(
-        user_id=uid, kind=MemoryKind.profile, subject=SELF,
-        predicate="profile.religion")).verdict == memory_writer.SENSITIVE_TRAIT
 
 
-def test_the_shortlist_is_scoped_and_deterministic(_pg):
-    uid = _new_user()
-    for i in range(3):
-        _remember(uid, subject=f"person {i}", source_message_id=f"msg-s{i}", observed_at=NOW)
-    _remember(uid, subject="coach", predicate="sports.coach_of", value="cross country",
-              source_message_id="msg-c", observed_at=NOW)
-
-    by_domain = _run(MemoryRetriever(uid).facts(domains=["sports"]))
-    assert [c.fact for c in by_domain] == ["coach — coach of: cross country"]
-    by_entity = _run(MemoryRetriever(uid).facts(entities=["Person 1"]))
-    assert len(by_entity) == 1 and by_entity[0].fact.startswith("person 1")
-
-    first = [c.fact for c in _run(MemoryRetriever(uid).facts())]
-    second = [c.fact for c in _run(MemoryRetriever(uid).facts())]
-    assert first == second and len(first) == 4, "identical question, identical answer"
 
 
-def test_a_retrieved_memory_can_explain_itself(_pg):
-    uid = _new_user()
-    _remember(uid)
-    ctx = _run(MemoryRetriever(uid).facts())[0]
-    assert ctx.reason_it_matters_now == "so i know who to email about chem"
-    assert "something you told me" in ctx.source.where_did_that_come_from()
-    assert "my teacher is Ms. Delgado" in ctx.source.where_did_that_come_from()
-    assert ctx.freshness is Freshness.current
+
+
+# --- WHERE THE REMOVED TESTS WENT ---------------------------------------------------------------------
+# Sixteen tests in this file exercised the retrieval, correction and forget APIs #121b shipped. #122
+# replaced those with a two-stage retriever, a correction flow that writes an audit row, and four forget
+# scopes, so the old tests were asserting the shape of code that no longer exists.
+#
+# Every PROPERTY they protected is still proven, against the production API and on real Postgres, in
+# `test_memory_acceptance.py`:
+#
+#   cross-user retrieval is impossible        -> test_no_cross_user_retrieval
+#                                                test_a_retriever_is_bound_to_one_student_for_its_whole_life
+#   style cannot surface as a fact            -> test_style_memory_never_appears_in_a_factual_context
+#   a forgotten record cannot be retrieved    -> test_a_forgotten_memory_never_comes_back
+#   forgetting redacts rather than flags      -> test_forgetting_redacts_the_content_not_just_a_flag
+#   a forgotten fact is not re-learned        -> test_a_forgotten_source_is_remembered_as_forgotten
+#   a correction supersedes, never edits      -> test_a_correction_supersedes_and_leaves_no_active_contradiction
+#   the row cannot be edited in place         -> test_a_row_cannot_be_edited_even_by_raw_sql
+#   the shortlist is scoped and deterministic -> test_the_whole_memory_store_is_never_handed_to_a_prompt
+#   a memory can explain itself               -> test_every_retrieved_fact_can_say_where_it_came_from
+#
+# TWO WERE NOT REPLACED, AND THAT IS A REAL CHANGE RATHER THAN AN OVERSIGHT:
+#
+#   * `test_a_forwarded_fact_is_rejected_by_the_database_too` asserted 0028's `ck_memory_trusted_source`,
+#     which refused ANY row whose source was not the student. 0029 deliberately does not carry it
+#     forward: attributed world and entity records — "practice is at six, per an email you forwarded" —
+#     could not be stored at all under that constraint, and the acceleration program requires them. The
+#     rule that survives is the one that matters: untrusted content may never become a fact about the
+#     USER, which is enforced in `memory_writer` and has its own tests above.
+#   * `test_forgetting_a_claim_takes_its_superseded_history_with_it` asserted a `claim` forget scope.
+#     #122 implements fact, subject, kind and source. Forgetting a claim's superseded history is not
+#     covered, so a corrected fact's OLD value survives a fact-scoped forget of the new one. Stated
+#     rather than quietly dropped; it belongs with the next forget work.

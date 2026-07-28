@@ -39,7 +39,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 
-from . import decision_resolver
+from . import decision_resolver, schema
 
 # --- the six layers --------------------------------------------------------------------------------
 
@@ -399,46 +399,23 @@ different students inside one account's memory."""
 
 
 # --- storage -------------------------------------------------------------------------------------------
-# A private MetaData, not `schema.Base`. This table is queried, never created from Python: DDL lives in
-# 0028_typed_memory and nowhere else. Foreign keys are declared there too — repeating them here would
-# just give SQLAlchemy a second, unresolvable opinion about a table it will never emit.
+# THE canonical table is `schema.MemoryRecordRow`, like every other table in the engine. This module used
+# to declare its own `sa.MetaData()` copy, which meant column truth lived in two places and had already
+# drifted; 0029 reshaped the table and the duplicate would have silently kept the old names.
+#
+# A NOTE FOR THE NEXT MIGRATION AUTHOR. `0001_initial_schema` calls `Base.metadata.create_all()`, so any
+# table reachable from `Base` is built on a fresh database WITHOUT its CHECK constraints, indexes or RLS
+# policy — `create_all` emits none of those. A later migration that guards its `create_table` behind "if
+# the table is absent" therefore skips, and the constraints are missing in exactly the environment nobody
+# inspects. 0029 drops and recreates unconditionally for this reason; 0013/0014/0015 carry the same
+# warning. Do not make the next one conditional.
 
-_METADATA = sa.MetaData()
+MEMORY_RECORDS = schema.MemoryRecordRow.__table__
 
-MEMORY_RECORDS = sa.Table(
-    "memory_records", _METADATA,
-    sa.Column("id", PGUUID(as_uuid=True), primary_key=True),
-    sa.Column("user_id", PGUUID(as_uuid=True), nullable=False),
-    sa.Column("kind", sa.String(16), nullable=False),
-    sa.Column("subject", sa.String(200)),
-    sa.Column("predicate", sa.String(100)),
-    sa.Column("value", sa.String(MAX_VALUE)),
-    sa.Column("evidence", JSONB),
-    sa.Column("source_message_id", sa.String(255)),
-    sa.Column("source_type", sa.String(32), nullable=False),
-    sa.Column("confidence", sa.Float, nullable=False),
-    sa.Column("observed_at", sa.DateTime(timezone=True), nullable=False),
-    sa.Column("last_confirmed_at", sa.DateTime(timezone=True)),
-    sa.Column("retention_policy", sa.String(16), nullable=False),
-    sa.Column("sensitivity", sa.String(16), nullable=False),
-    sa.Column("user_editable", sa.Boolean, nullable=False),
-    sa.Column("contradicted_by", PGUUID(as_uuid=True)),
-    sa.Column("superseded_by", PGUUID(as_uuid=True)),
-    # The future question this memory answers, captured at write time because it cannot be recovered
-    # later. It is what `MemoryContext.reason_it_matters_now` is filled from, and it is redacted on
-    # forget along with the rest of the content — "so Bruce knows who her therapist is" is itself content.
-    sa.Column("reason_it_matters", sa.String(300)),
-    # Denormalized shortlist keys, derived from subject/predicate by the writer and by nothing else.
-    sa.Column("entity_key", sa.String(200)),
-    sa.Column("domain", sa.String(32)),
-    # Forgetting. The content columns above are NULLed in the same statement that sets these, and a CHECK
-    # constraint refuses any row that is forgotten and still has content — see the migration.
-    sa.Column("forgotten_at", sa.DateTime(timezone=True)),
-    sa.Column("forget_scope", sa.String(16)),
-    sa.Column("created_at", sa.DateTime(timezone=True)),
-)
-
-_LIVE_COLUMNS = (MEMORY_RECORDS.c.forgotten_at.is_(None),)
+# The clause every read path ANDs in. One object, so there is exactly one definition of "a row that still
+# exists" and a new query cannot ship without it.
+_LIVE_COLUMNS = (MEMORY_RECORDS.c.forgotten_at.is_(None),
+                 MEMORY_RECORDS.c.status == "active")
 
 
 def live_predicate():
@@ -448,15 +425,23 @@ def live_predicate():
 
 
 def to_row(rec: MemoryRecord) -> dict:
+    """The canonical column names. `value` became `value_json` + `normalized_value` because the
+    structured value and the folded form the shortlist matches on are different things that were sharing
+    a column; `evidence` became `evidence_text` because storing it as JSON invited current state to be
+    duplicated inside it, which the model now forbids."""
+    import json as _json
     return {
-        "id": rec.memory_id, "user_id": rec.user_id, "kind": rec.kind.value,
-        "subject": rec.subject, "predicate": rec.predicate, "value": rec.value,
-        "evidence": rec.evidence.to_json(), "source_message_id": rec.source_message_id,
+        "memory_id": rec.memory_id, "user_id": rec.user_id, "kind": rec.kind.value,
+        "subject": rec.subject, "predicate": rec.predicate,
+        "value_json": {"value": rec.value}, "normalized_value": normalize(rec.value)[:300],
+        "evidence_text": _json.dumps(rec.evidence.to_json()) if rec.evidence is not None else None,
+        "source_message_id": rec.source_message_id,
         "source_type": rec.source_type.value, "confidence": rec.confidence,
         "observed_at": rec.observed_at, "last_confirmed_at": rec.last_confirmed_at,
         "retention_policy": rec.retention_policy.value, "sensitivity": rec.sensitivity.value,
-        "user_editable": rec.user_editable, "contradicted_by": rec.contradicted_by,
-        "superseded_by": rec.superseded_by, "entity_key": rec.entity_key, "domain": rec.domain,
+        "user_editable": rec.user_editable, "status": "active",
+        "contradicted_by_id": rec.contradicted_by, "superseded_by_id": rec.superseded_by,
+        "entity_key": rec.entity_key, "domain": rec.domain,
     }
 
 
@@ -464,16 +449,29 @@ def from_row(row) -> MemoryRecord:
     """Hydrate. Raises `RedactedMemory` on a forgotten row rather than returning a hollow record — a
     half-empty memory that reads as "Bruce knows something here" is exactly what forgetting must not
     leave behind."""
-    if row.forgotten_at is not None or row.value is None:
-        raise RedactedMemory(f"memory {row.id} was forgotten")
+    if row.forgotten_at is not None or row.normalized_value is None:
+        raise RedactedMemory(f"memory {row.memory_id} was forgotten")
     observed = row.observed_at
     if observed.tzinfo is None:
         observed = observed.replace(tzinfo=timezone.utc)
     return MemoryRecord(
-        memory_id=row.id, user_id=row.user_id, kind=MemoryKind(row.kind), subject=row.subject,
-        predicate=row.predicate, value=row.value, evidence=Evidence.from_json(row.evidence),
+        memory_id=row.memory_id, user_id=row.user_id, kind=MemoryKind(row.kind), subject=row.subject,
+        predicate=row.predicate, value=(row.value_json or {}).get("value"),
+        evidence=Evidence.from_json(_evidence_json(row.evidence_text)),
         source_message_id=row.source_message_id, source_type=SourceType(row.source_type),
         confidence=row.confidence, observed_at=observed, last_confirmed_at=row.last_confirmed_at,
         retention_policy=RetentionPolicy(row.retention_policy),
         sensitivity=Sensitivity(row.sensitivity), user_editable=row.user_editable,
-        contradicted_by=row.contradicted_by, superseded_by=row.superseded_by)
+        contradicted_by=row.contradicted_by_id, superseded_by=row.superseded_by_id)
+
+
+def _evidence_json(text):
+    import json as _json
+    if not text:
+        return {}
+    try:
+        return _json.loads(text)
+    except (ValueError, TypeError):
+        # Evidence that cannot be parsed is evidence Bruce cannot explain. Returning empty is honest;
+        # raising would make one bad row un-hydratable forever.
+        return {}
