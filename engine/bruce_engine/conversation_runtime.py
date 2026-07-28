@@ -141,14 +141,15 @@ class _Runtime:
         # Best-effort, like the rest of intake — but note the direction it fails in. A store fault leaves
         # an authorization ALIVE, which is the unsafe direction, so it is logged at warning rather than
         # swallowed silently. The durable recheck at execution is the second line for exactly this case.
+        envelope = None            # hoisted: semantic rescue below needs the SAME separation, not a copy
         try:
             from . import authorization_store, input_envelope as _env
             from . import user_action_boundary as _uab
             # TRUSTED TEXT ONLY. The envelope keeps OCR, attachment, quoted, forwarded and provider
             # content beside the student's own words rather than joined to them — a screenshot in which
             # someone else says "yes add it" has approved a pending proposal in this codebase before.
-            _envelope = _env.from_message(msg)
-            _boundary = _uab.evaluate(_envelope.authorizing_text())
+            envelope = _env.from_message(msg)
+            _boundary = _uab.evaluate(envelope.authorizing_text())
             if _boundary.blocks_execution():
                 await authorization_store.record_refusal(
                     user_id, _boundary, message_id=pmid, conversation_id=ident)
@@ -164,6 +165,11 @@ class _Runtime:
         from .runtime_contracts import ExecutionClass
         router_ec: str | None = None
         router_ms: float | None = None
+        # Bound before the try, not inside it: a router fault must leave these READABLE rather than
+        # unbound, because everything below this block asks "what did the router say" and a NameError
+        # raised while answering that would cost the student their reply.
+        rd = None
+        rt = None
         shortlisted: tuple[str, ...] | None = None
         mission_plan = None                # C1: set when a routed background mission was durably enqueued
         authoritative_decision = None      # G0 Activation Phase A: set -> skip the reasoner, dispatch on it
@@ -234,6 +240,46 @@ class _Runtime:
         except Exception:
             log.info("router_error pmid=%s", pmid)     # classification never blocks a reply
             authoritative_decision = None
+
+        # SEMANTIC RESCUE (founder alpha; default off, allowlisted, kill-switchable). Stage 0 returned
+        # UNKNOWN, which today silently becomes generic chat — so a real request phrased in a way nobody
+        # anticipated gets a friendly reply and no work, and the student cannot tell "Bruce decided not
+        # to" from "Bruce didn't understand". Rescue reads exactly those turns and either OWNS the reply
+        # (a proposal, one question, a named block, a resolved confirmation) or hands the turn straight
+        # back untouched. It never executes anything on the turn that proposes.
+        #
+        # Placed here, ahead of the vision pass, for two reasons: a rescued turn should not pay for a
+        # reasoner whose answer is going to be discarded, and the confirmation branch must settle consent
+        # from the founder's own trusted words BEFORE any model has had a chance to describe them.
+        rescue_outcome: str | None = None
+        from . import semantic_rescue_runtime
+        if semantic_rescue_runtime.applies(user_id, rt):
+            try:
+                from . import input_envelope as _env2
+                rescued = await semantic_rescue_runtime.rescue(
+                    user_id, envelope=envelope or _env2.from_message(msg),
+                    conversation_id=ident, source_message_id=pmid)
+            except Exception:
+                # Fail back to today's path, never to a wrong answer. Logged at warning because a rescue
+                # that silently stops working would look exactly like a rescue that decided not to fire.
+                log.warning("rescue_error pmid=%s", pmid)
+                rescued = None
+            if rescued is not None:
+                rescue_outcome = rescued.outcome
+                log.info("rescue pmid=%s outcome=%s owns=%s decision=%s", pmid, rescued.outcome,
+                         rescued.owns_turn, rescued.decision_id)
+                if rescued.owns_turn and rescued.reply:
+                    # The response authority still runs. `handler` is what decides whether a completion
+                    # claim is trusted, and only the executed path is named as an action handler.
+                    reply_out = response_composer.no_false_completion(
+                        enforce_no_dashes(rescued.reply), handler=rescued.handler)
+                    await self._finalize(user_id, ch, ident, pmid, reply_out, reply_target, trace=trace,
+                                         decision=None, intent="semantic_rescue")
+                    turn_trace.record(trace.finish())
+                    return InboundOutcome(status="processed", user_id=user_id, execution_class=router_ec,
+                                          router_ms=router_ms, shortlisted_capabilities=shortlisted,
+                                          rescue_outcome=rescue_outcome, mission_id=rescued.mission_id)
+
         # A3.2: resolve the EXPLICITLY-referenced message/attachment/prior-answer into a bounded capsule the
         # GENERIC reasoner consumes as evidence (no reply-specific branch). Hoisted so both the authoritative
         # and the legacy path share it (a skippable turn has no reference -> a cheap, empty capsule).
@@ -442,7 +488,7 @@ class _Runtime:
         turn_trace.record(trace.finish())
         return InboundOutcome(status="processed", user_id=user_id,
                               execution_class=router_ec, router_ms=router_ms,
-                              shortlisted_capabilities=shortlisted,
+                              shortlisted_capabilities=shortlisted, rescue_outcome=rescue_outcome,
                               mission_run_id=(mission_plan.run_id if mission_plan and mission_plan.enqueued
                                               else None),
                               mission_status=(mission_plan.status if mission_plan else None))

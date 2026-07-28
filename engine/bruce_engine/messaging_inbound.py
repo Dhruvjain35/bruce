@@ -80,6 +80,10 @@ class InboundOutcome:
     # (ok | no_tool | disconnected | insufficient_scope | no_recipient | invalid) for a mission-routed turn.
     mission_run_id: str | None = None
     mission_status: str | None = None
+    # Founder-alpha semantic rescue: what rescue made of a Stage-0 UNKNOWN turn, or None when rescue did
+    # not run at all. Present so "did rescue fire, and what did it decide" is answerable from the turn's
+    # own result instead of by reading a log line — including when it read the turn and handed it back.
+    rescue_outcome: str | None = None
 
 
 def _is_executable_goal(text: str) -> bool:
