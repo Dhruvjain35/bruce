@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import null, select, update
+from sqlalchemy import null, or_, select, update
 
 from . import memory_cache
 from . import memory_record as mr
@@ -36,8 +36,17 @@ from .db import user_session
 
 log = logging.getLogger("bruce.memory.forget")   # CONTENT-FREE: scopes, counts — never what was forgotten
 
-FACT, SUBJECT, KIND, SOURCE = "fact", "subject", "kind", "source"
-SCOPES = (FACT, SUBJECT, KIND, SOURCE)
+# VERSION forgets one row. CLAIM forgets every version of that claim — the correction history included.
+# CLAIM is the default for an ordinary "forget that", and the distinction is the defect #122 shipped: a
+# corrected fact is two rows, and forgetting the active one left the previous spelling in the table,
+# still readable through provenance and correction history. A student who asks Bruce to forget their
+# teacher's name does not mean "forget the current spelling of it".
+VERSION, CLAIM, SUBJECT, KIND, SOURCE, ALL = "version", "claim", "subject", "kind", "source", "all"
+SCOPES = (VERSION, CLAIM, SUBJECT, KIND, SOURCE, ALL)
+
+# Retained so callers written against #122 keep working; `fact` now means the LINEAGE, which is what a
+# person means by it. The old alias pointing at a single row was the bug.
+FACT = CLAIM
 
 # Above this, a forget is broad enough that a student should see what it covers first. Not a safety
 # limit — nothing here is unsafe — but "forget everything about my coach" removing a deadline they still
@@ -76,28 +85,55 @@ class ForgetResult:
     forgotten: int
 
 
-def _scope_clause(R, *, scope: str, target: str | None):
-    if scope == FACT:
+def _scope_clause(R, *, scope: str, target: str | None, roots: tuple | None = None):
+    if scope == VERSION:
         return R.memory_id == UUID(str(target))
+    if scope == CLAIM:
+        # Every version of the lineage. `roots` is resolved by the caller because a target may be given
+        # as any version's id, and the lineage is found from that row's root — a WHERE clause cannot
+        # dereference it in one statement.
+        #
+        # `memory_id.in_(roots)` is not redundant. A row written before claim lineage existed, or by a
+        # path that does not set it, has a NULL root and would be invisible to the first clause — so the
+        # forget would silently reach nothing and report success. Measured: it did, on every acceptance
+        # record, because those are inserted directly and never set a root.
+        return or_(R.claim_root_id.in_(roots or ()), R.memory_id.in_(roots or ()))
     if scope == SUBJECT:
         return R.entity_key == mr.entity_key(target or "")
     if scope == KIND:
         return R.kind == target
     if scope == SOURCE:
         return R.source_message_id == target
+    if scope == ALL:
+        # Everything. Deliberately expressible: "forget everything about me" is a thing a person is
+        # entitled to say, and making them say it one subject at a time is a way of not honouring it.
+        return R.memory_id.isnot(None)
     raise ValueError(f"unknown forget scope: {scope}")
+
+
+async def _roots_for(session, user_id: UUID, target) -> tuple:
+    """The lineage root(s) a claim-scoped forget covers, resolved from ANY version's id."""
+    R = schema.MemoryRecordRow
+    row = (await session.execute(select(R.claim_root_id, R.memory_id).where(
+        R.user_id == user_id, R.memory_id == UUID(str(target))))).first()
+    if row is None:
+        return ()
+    return (row[0] or row[1],)
 
 
 async def preview(user_id: UUID, *, scope: str, target: str | None) -> ForgetPreview:
     """What a forget would reach, without touching anything."""
     R = schema.MemoryRecordRow
     async with user_session(user_id) as s:
+        roots = await _roots_for(s, user_id, target) if scope == CLAIM else None
         rows = (await s.execute(select(R.kind).where(
             R.user_id == user_id, R.forgotten_at.is_(None), R.status != "forgotten",
-            _scope_clause(R, scope=scope, target=target)))).scalars().all()
+            _scope_clause(R, scope=scope, target=target, roots=roots)))).scalars().all()
     kinds = tuple(sorted(set(rows)))
     return ForgetPreview(scope=scope, target=target, count=len(rows), kinds=kinds,
-                         needs_confirmation=scope != FACT and len(rows) > PREVIEW_THRESHOLD)
+                         needs_confirmation=(scope == ALL
+                                             or (scope not in (VERSION, CLAIM)
+                                                 and len(rows) > PREVIEW_THRESHOLD)))
 
 
 async def forget(user_id: UUID, *, scope: str, target: str | None,
@@ -112,10 +148,11 @@ async def forget(user_id: UUID, *, scope: str, target: str | None,
     now = now or datetime.now(timezone.utc)
     R = schema.MemoryRecordRow
     async with user_session(user_id) as s:
+        roots = await _roots_for(s, user_id, target) if scope == CLAIM else None
         result = await s.execute(
             update(R)
             .where(R.user_id == user_id, R.forgotten_at.is_(None),
-                   _scope_clause(R, scope=scope, target=target))
+                   _scope_clause(R, scope=scope, target=target, roots=roots))
             .values(status="forgotten", forgotten_at=now, **_CONTENT_COLUMNS))
         count = int(result.rowcount or 0)
         s.add(schema.MemoryForgetEventRow(
