@@ -96,6 +96,12 @@ async def apply(user_id: UUID, *, target_id: UUID | str, new_value: str,
         # later "forget that" reaches only the newest — leaving the previous value readable through
         # provenance and correction history, which is what #122 shipped.
         root = old.claim_root_id or old.memory_id
+        # Backfill the key when the original row predates claim lineage or was written by a path that
+        # did not set one. `uq_memory_active_claim` is partial on `claim_key IS NOT NULL`, so a NULL key
+        # means the database's active-claim uniqueness guarantee silently does not cover this claim —
+        # and a correction is exactly when a second active version would appear.
+        key = old.claim_key or mr.claim_key(kind=old.kind, subject=old.subject,
+                                            predicate=old.predicate)
 
         # RETIRE BEFORE INSERTING. Since 0030 the database holds at most one ACTIVE row per claim, so
         # inserting the replacement while the old one is still active is an integrity error rather than
@@ -113,7 +119,7 @@ async def apply(user_id: UUID, *, target_id: UUID | str, new_value: str,
 
         s.add(R(
             memory_id=replacement_id, user_id=user_id, kind=old.kind, subject=old.subject,
-            claim_root_id=root, claim_key=old.claim_key,
+            claim_root_id=root, claim_key=key,
             predicate=old.predicate, value_json=value_json or {"value": new_value},
             normalized_value=mr.normalize(new_value)[:300], evidence_text=evidence_text,
             source_message_id=source_message_id, source_type=source_type, confidence=confidence,

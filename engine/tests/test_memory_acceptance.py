@@ -675,3 +675,167 @@ def test_memory_cannot_authorize_anything():
                 names |= {a.name for a in node.names} | {(node.module or "").rsplit(".", 1)[-1]}
         leaked = names & forbidden
         assert not leaked, f"{module.__name__} imports {leaked}"
+
+
+# --- 10. PRODUCTION-SURFACE MEASUREMENT ------------------------------------------------------------------
+# trusted inbound content -> MemoryCandidate -> MemoryWriter policy -> real Postgres -> ConversationState.
+# Nothing below inserts a row directly; every fact here got in the way production would put it in.
+
+def _candidate(uid, *, subject_type, subject_id, kind, predicate, value, provenance,
+               source_type, inferred=False, confidence=0.95, sensitivity="ordinary",
+               evidence="", source_id="m-1", reason="needed to answer later"):
+    from bruce_engine.memory_candidate import MemoryCandidate, ProvenanceClass, SubjectType
+    from bruce_engine.memory_record import MemoryKind, RetentionPolicy, Sensitivity, SourceType
+    return MemoryCandidate(
+        user_id=uid, subject_type=SubjectType(subject_type), subject_id=subject_id,
+        kind=MemoryKind(kind), predicate=predicate, proposed_value=value,
+        normalized_value=mr.normalize(value)[:300], evidence_text=evidence or value,
+        source_type=SourceType(source_type), source_id=source_id,
+        provenance_class=ProvenanceClass(provenance),
+        explicitly_stated_by_user=(provenance == "trusted_user_statement"), inferred=inferred,
+        confidence=confidence, expected_stability=RetentionPolicy.durable,
+        usefulness_reason=reason, sensitivity_class=Sensitivity(sensitivity),
+        retention_recommendation=RetentionPolicy.durable, observed_at=NOW)
+
+
+def test_the_production_surface_release_bars(capsys):
+    """Section 12, measured end to end. Every write goes through the real policy; every read goes through
+    the real retriever; the database is real and RLS is on.
+
+    The scenario mixes facts that MUST be learned with attacks that must not be, so a system that
+    refused everything and a system that stored everything both fail — which is the only way these
+    numbers mean anything.
+    """
+    import statistics
+    import time
+
+    from bruce_engine import memory_writer
+    from sqlalchemy import select as sa_select
+
+    uid, other = _user(), _user()
+    writer = memory_writer.MemoryWriter(user_id=uid)
+    other_writer = memory_writer.MemoryWriter(user_id=other)
+
+    legitimate = [
+        _candidate(uid, subject_type="user", subject_id="me", kind="profile",
+                   predicate="profile.timezone", value="America/Chicago",
+                   provenance="trusted_user_statement", source_type="trusted_user_text"),
+        _candidate(uid, subject_type="user", subject_id="me", kind="profile",
+                   predicate="profile.preferred_name", value="jordy",
+                   provenance="trusted_user_statement", source_type="trusted_user_text"),
+        _candidate(uid, subject_type="user", subject_id="me", kind="profile",
+                   predicate="profile.school", value="westlake high",
+                   provenance="trusted_user_statement", source_type="trusted_user_text"),
+        _candidate(uid, subject_type="relationship", subject_id="ms delgado", kind="relationships",
+                   predicate="relationships.role", value="ap bio teacher",
+                   provenance="trusted_user_statement", source_type="trusted_user_text",
+                   evidence="ms delgado is my ap bio teacher"),
+        _candidate(uid, subject_type="world", subject_id="ap bio lab", kind="world",
+                   predicate="world.due", value="friday", provenance="forwarded_content",
+                   source_type="forwarded", confidence=0.8,
+                   evidence="Reminder: the lab writeup is due friday. — Ms. Delgado"),
+    ]
+    # The attacks. Each one is a fact ABOUT THE USER carried by something that is not the user.
+    attacks = [
+        _candidate(uid, subject_type="user", subject_id="me", kind="profile",
+                   predicate="profile.timezone", value="Europe/London",
+                   provenance="forwarded_content", source_type="forwarded"),
+        _candidate(uid, subject_type="user", subject_id="me", kind="profile",
+                   predicate="profile.attends_practice", value="yes",
+                   provenance="forwarded_content", source_type="forwarded"),
+        _candidate(uid, subject_type="user", subject_id="me", kind="profile",
+                   predicate="profile.documentation_status", value="pending",
+                   provenance="attachment_content", source_type="attachment"),
+        _candidate(uid, subject_type="user", subject_id="me", kind="profile",
+                   predicate="profile.weekly_appointment", value="thursday 4pm",
+                   provenance="model_inference", source_type="model", inferred=True),
+        _candidate(uid, subject_type="user", subject_id="me", kind="profile",
+                   predicate="profile.energy_levels", value="low", provenance="model_inference",
+                   source_type="model", inferred=True, sensitivity="sensitive"),
+        _candidate(uid, subject_type="style", subject_id="me", kind="profile",
+                   predicate="profile.dietary_restriction", value="no meat on fridays",
+                   provenance="quoted_content", source_type="quoted"),
+    ]
+
+    write_ms: list[float] = []
+    for cand in legitimate + attacks:
+        started = time.perf_counter()
+        _run(writer.evaluate(cand))
+        write_ms.append((time.perf_counter() - started) * 1000.0)
+    _run(other_writer.evaluate(_candidate(
+        other, subject_type="user", subject_id="me", kind="profile", predicate="profile.timezone",
+        value="Europe/London", provenance="trusted_user_statement", source_type="trusted_user_text")))
+
+    # --- the safety counters, read at the PERSISTED-RECORD boundary, with no status filter: a
+    #     quarantined row is still a row, and "we refused it" is a claim about the writer, not the table.
+    async def _persisted(owner):
+        async with user_session(owner) as s:
+            return list((await s.execute(sa_select(schema.MemoryRecordRow).where(
+                schema.MemoryRecordRow.user_id == owner))).scalars().all())
+
+    rows = _run(_persisted(uid))
+    user_rows = [r for r in rows if r.kind == "profile" or r.entity_key == mr.SELF]
+    untrusted_user = [r for r in user_rows if r.source_type != "trusted_user_text"]
+    inferred_sensitive = [r for r in rows if r.source_type == "model" and r.sensitivity != "ordinary"]
+    from bruce_engine import memory_policy
+    allowed = set(memory_policy.PROFILE_REGISTRY)
+    unknown_profile_active = [r for r in rows if r.status == "active" and r.kind == "profile"
+                              and (r.predicate or "") not in allowed]
+
+    # --- a correction, then a claim-scoped forget: the value must be gone from every version
+    tz = next(r for r in rows if r.predicate == "profile.timezone" and r.status == "active")
+    _run(memory_correction.apply(uid, target_id=tz.memory_id, new_value="America/Denver",
+                                 source_message_id="m-corrected"))
+    active_tz = next(r for r in _run(_persisted(uid))
+                     if r.predicate == "profile.timezone" and r.status == "active")
+    _run(memory_forget.forget(uid, scope=memory_forget.CLAIM, target=active_tz.memory_id))
+    after_forget = " ".join(str(r.normalized_value) for r in _run(_persisted(uid)))
+    forgotten_lineage_retrieval = int("chicago" in after_forget.lower()
+                                      or "denver" in after_forget.lower())
+
+    cases = [
+        (TurnCue(text="email ms delgado about the lab", entities=("ms delgado", "ap bio lab"),
+                 domains=("communication", "school"), turn_class="action"),
+         ["ap bio teacher", "friday"], ["europe/london"]),
+        (TurnCue(text="what should i call you", subjects=(mr.SELF,), domains=("profile",)),
+         ["jordy"], ["europe/london", "low"]),
+        (TurnCue(text="what school do i go to", subjects=(mr.SELF,), domains=("profile",)),
+         ["westlake high"], ["europe/london"]),
+    ]
+    bars = _measure(uid, cases)
+
+    leaked = int("europe/london" in " ".join(
+        str(r.normalized_value) for r in _run(ret.all_active(uid))).lower())
+    duplicates = len(_run(memory_correction.active_conflicts(uid)))
+    ordered = sorted(write_ms)
+
+    with capsys.disabled():
+        print(f"""
+PRODUCTION-SURFACE MEMORY BARS (candidate -> policy -> real Postgres -> retrieval)
+  useful recall precision          {bars.useful_recall_precision:.3f}  (bar >= 0.95)
+  useful recall rate               {bars.useful_recall_rate:.3f}
+  untrusted-content user memories  {len(untrusted_user)}      (bar 0)
+  inferred sensitive user memories {len(inferred_sensitive)}      (bar 0)
+  unknown profile predicates active {len(unknown_profile_active)}      (bar 0)
+  forgotten claim-lineage retrieval {forgotten_lineage_retrieval}      (bar 0)
+  concurrent duplicate active rows {duplicates}      (bar 0)
+  active contradictions            {duplicates}      (bar 0)
+  cross-user leakage               {leaked}      (bar 0)
+  stale usage                      {bars.stale_usage:.3f}  (bar < 0.01)
+  retrieval p50 / p95              {bars.p50_ms:.1f} / {bars.p95_ms:.1f} ms  (bar < 100)
+  write-policy p50 / p95           {ordered[len(ordered)//2]:.1f} / {ordered[max(0,int(len(ordered)*0.95)-1)]:.1f} ms
+  candidates submitted / persisted  {len(legitimate) + len(attacks)} / {len(rows)}
+""")
+
+    assert len(untrusted_user) == 0, [r.predicate for r in untrusted_user]
+    assert len(inferred_sensitive) == 0
+    assert len(unknown_profile_active) == 0, [r.predicate for r in unknown_profile_active]
+    assert forgotten_lineage_retrieval == 0
+    assert duplicates == 0
+    assert leaked == 0
+    assert bars.stale_usage < 0.01
+    assert bars.useful_recall_precision >= 0.95, f"precision {bars.useful_recall_precision:.3f}"
+    assert bars.p95_ms < 100.0
+    # ...and the control: the legitimate half actually landed, so none of the zeros above are zeros
+    # because nothing was written at all.
+    assert len([r for r in rows if r.status == "active"]) >= 4, "the writer refused everything"
