@@ -142,8 +142,13 @@ class _Runtime:
         # an authorization ALIVE, which is the unsafe direction, so it is logged at warning rather than
         # swallowed silently. The durable recheck at execution is the second line for exactly this case.
         try:
-            from . import authorization_store, user_action_boundary as _uab
-            _boundary = _uab.evaluate(msg.text)
+            from . import authorization_store, input_envelope as _env
+            from . import user_action_boundary as _uab
+            # TRUSTED TEXT ONLY. The envelope keeps OCR, attachment, quoted, forwarded and provider
+            # content beside the student's own words rather than joined to them — a screenshot in which
+            # someone else says "yes add it" has approved a pending proposal in this codebase before.
+            _envelope = _env.from_message(msg)
+            _boundary = _uab.evaluate(_envelope.authorizing_text())
             if _boundary.blocks_execution():
                 await authorization_store.record_refusal(
                     user_id, _boundary, message_id=pmid, conversation_id=ident)
