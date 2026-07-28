@@ -43,6 +43,7 @@ import httpx
 from sqlalchemy import select
 
 from . import crypto, schema
+from . import provider_http
 from .db import user_session
 
 AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -235,7 +236,7 @@ async def handle_callback(
     claimed = await _consume_state(state)
     user_id: UUID = claimed["user_id"]
     cfg = config()
-    client = http_client or httpx.AsyncClient(timeout=30)
+    client = http_client or provider_http.shared()
 
     try:
         r = await client.post(
@@ -361,7 +362,7 @@ async def access_token_for(user_id: UUID, *, http_client: httpx.AsyncClient | No
 
     cfg = config()
     refresh = crypto.decrypt(row.refresh_token_encrypted)
-    client = http_client or httpx.AsyncClient(timeout=30)
+    client = http_client or provider_http.shared()
     try:
         r = await client.post(
             TOKEN_ENDPOINT,
@@ -412,7 +413,7 @@ async def disconnect(user_id: UUID, *, http_client: httpx.AsyncClient | None = N
     if row is None or not row.refresh_token_encrypted:
         return False
 
-    client = http_client or httpx.AsyncClient(timeout=30)
+    client = http_client or provider_http.shared()
     try:
         try:
             token = crypto.decrypt(row.refresh_token_encrypted)
