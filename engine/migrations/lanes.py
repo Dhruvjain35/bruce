@@ -27,6 +27,7 @@ MIGRATION_LANES: dict[str, str] = {
     # lanes cut a "0027" in separate worktrees and the chain forks into a multi-head on merge day.
     "0027": "authorization",       # authorization_evidence + authorization_refusals — durable consent (#121a)
     "0028": "memory",              # typed memory records (#121b)
+    "0029": "memory",              # memory reshaped to the canonical ORM model (#122)
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the

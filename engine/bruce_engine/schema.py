@@ -13,6 +13,7 @@ Alembic owns this schema (see migrations/); nothing here is created at app start
 from __future__ import annotations
 
 import datetime
+from enum import Enum
 import uuid
 
 from sqlalchemy import (
@@ -395,6 +396,110 @@ class GmailSentLedger(Base):
         UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (UniqueConstraint("user_id", "marker", name="uq_gmail_ledger_user_marker"),)
+
+
+class MemoryStatus(str, Enum):
+    """The lifecycle of one remembered fact. Exactly one of these is true at a time, and it lives in a
+    COLUMN rather than being re-derived from a combination of nullable timestamps — the old shape made
+    "is this still believed" a three-way join of `forgotten_at`, `superseded_by` and `contradicted_by`,
+    and every read path had to remember all three."""
+
+    active = "active"
+    superseded = "superseded"        # a later trusted statement replaced it
+    contradicted = "contradicted"    # a later trusted statement conflicts and neither is resolved
+    forgotten = "forgotten"          # the student asked; content is redacted, tombstone remains
+    expired = "expired"              # its own retention window elapsed
+    quarantined = "quarantined"      # withheld from ordinary retrieval pending review
+
+
+class MemoryRecordRow(Base, TSV):
+    """One typed memory. THE canonical definition — there is no second table object anywhere.
+
+    #121b queried a private SQLAlchemy Core table declared inside the memory module, which meant column
+    truth lived in two places (that file and the migration) and diverged from every other table in the
+    engine. A schema with two definitions has no definition.
+
+    `value_json` holds the structured value; `normalized_value` is the folded form the deterministic
+    shortlist matches on. Current state is NOT duplicated inside the JSON — `status`, `superseded_by_id`,
+    `contradicted_by_id` and `forgotten_at` are columns, and a reader never has to parse JSON to find out
+    whether Bruce still believes something.
+    """
+
+    __tablename__ = "memory_records"
+    memory_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    user_id = _owner()
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    predicate: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    value_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    normalized_value: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    evidence_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("1.0"))
+    observed_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_confirmed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    freshness_class: Mapped[str] = mapped_column(String(16), nullable=False, server_default="fresh")
+    retention_policy: Mapped[str] = mapped_column(String(16), nullable=False)
+    sensitivity: Mapped[str] = mapped_column(String(16), nullable=False)
+    user_editable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="active", index=True)
+    contradicted_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    forgotten_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Denormalized shortlist keys. Stage 1 of retrieval has to be an index scan, not a scan plus a
+    # Python normalize, so the folded subject and the predicate's namespace are stored rather than
+    # computed. Derived by the writer and by nothing else.
+    entity_key: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    domain: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    # The future question this memory answers, captured at write time because it cannot be recovered
+    # later. Redacted on forget along with the rest of the content: "so Bruce knows who her therapist
+    # is" is itself content.
+    reason_it_matters: Mapped[str | None] = mapped_column(String(300), nullable=True)
+
+
+class MemoryCorrectionRow(Base):
+    """One correction, kept forever. The corrected record is superseded rather than edited, and this row
+    is the link between the two — so "that's wrong" produces an auditable before and after instead of a
+    silent overwrite that nobody can explain afterwards."""
+
+    __tablename__ = "memory_corrections"
+    id = _pk()
+    user_id = _owner()
+    memory_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    replacement_memory_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    corrected_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now())
+
+
+class MemoryForgetEventRow(Base):
+    """One forget request, and the minimum needed to keep it enforced.
+
+    Content-free by construction. It records WHAT SCOPE was forgotten and how many records it reached,
+    never the values — a forget log that quoted the thing being forgotten would be the same leak with
+    extra steps. The `source_message_id` scope is what lets a re-intake of the same message be refused,
+    which is the difference between forgetting and forgetting-until-you-read-that-email-again.
+    """
+
+    __tablename__ = "memory_forget_events"
+    id = _pk()
+    user_id = _owner()
+    scope: Mapped[str] = mapped_column(String(16), nullable=False)   # fact | subject | kind | source
+    target: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    source_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    record_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    forgotten_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now())
 
 
 class AuthorizationEvidenceRow(Base):

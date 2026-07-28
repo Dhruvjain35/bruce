@@ -281,10 +281,31 @@ class _Runtime:
             except Exception:
                 cap_snapshot = None
                 log.info("capability_snapshot_error pmid=%s", pmid)
+            # THE MEMORY CUE — built from state the runtime already has, never from a model asking what
+            # might be relevant. `rd` is the router's decision for this turn, so the domain and the
+            # execution class it already derived are what scope the shortlist; entity resolution supplies
+            # the subjects. A cue that had to be inferred would put a second inference on the hot path to
+            # decide what to feed the first one.
+            memory_cue = None
+            try:
+                from . import memory_retrieval
+                _domains = tuple(d for d in ((rd.domain if rd is not None else None),) if d)
+                _cls = (rd.execution_class.value if rd is not None else "")
+                memory_cue = memory_retrieval.TurnCue(
+                    text=msg.text or "",
+                    domains=_domains,
+                    entities=tuple(capsule.referenced_entities) if hasattr(capsule, "referenced_entities") else (),
+                    active_run_domain=(rd.domain if rd is not None and rd.continuation_run_id else None),
+                    has_pending_decision=bool(rd is not None and rd.decision_id),
+                    turn_class=("action" if _cls in ("direct_action", "foreground_agent")
+                                else "complex" if _cls == "background_mission" else "conversation"))
+            except Exception:
+                memory_cue = None       # a cue fault costs context, never the turn
+
             try:
                 compiled = await context_compiler.compile(
                     user_id, recent, include_episodic=include_episodic, profile=profile,
-                    capabilities=cap_snapshot)
+                    capabilities=cap_snapshot, memory_cue=memory_cue)
                 ctx = compiled.text
                 if compiled.dropped:
                     log.info("ctx_compiled pmid=%s tokens=%s blocks=%s dropped=%s", pmid, compiled.est_tokens,

@@ -301,7 +301,7 @@ async def _source_was_forgotten(session, user_id: UUID, source_message_id: str) 
     """Has the student forgotten anything derived from this message? The tombstone keeps the message id
     (content-free lineage, exactly what `retention.py` preserves after erasing raw text) precisely so
     this question is answerable after the content is gone."""
-    found = (await session.execute(sa.select(MEMORY_RECORDS.c.id).where(
+    found = (await session.execute(sa.select(MEMORY_RECORDS.c.memory_id).where(
         MEMORY_RECORDS.c.user_id == user_id,
         MEMORY_RECORDS.c.source_message_id == source_message_id,
         MEMORY_RECORDS.c.forgotten_at.isnot(None)).limit(1))).first()

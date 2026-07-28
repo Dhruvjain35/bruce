@@ -114,3 +114,52 @@ def explain(record: MemoryRecord, *, now: datetime | None = None) -> Provenance:
         superseded_by=str(record.superseded_by) if record.superseded_by else None,
         contradicted_by=str(record.contradicted_by) if record.contradicted_by else None,
     )
+
+
+# --- provenance from a stored row -----------------------------------------------------------------------
+# `explain` above answers the full question from a hydrated MemoryRecord. Retrieval needs the short form,
+# and needs it from the ORM row it already has in hand — hydrating a record per candidate to produce six
+# words would be the most expensive part of a 100ms budget.
+
+
+def phrase(row) -> str:
+    """The one clause a reply can say out loud. Never a table name, never a column, never an id.
+
+    "you told me that" and "i got that from the calendar" are different promises about how much Bruce
+    should be trusted on it, and the student can tell which is which without being told anything about
+    how Bruce is built.
+    """
+    source = getattr(row, "source_type", None)
+    corrected = getattr(row, "superseded_by_id", None) is not None
+    if source == "trusted_user_text":
+        return "you told me that" if not corrected else "you told me, then corrected it"
+    if source == "provider":
+        return "from your connected account"
+    if source == "forwarded":
+        return "from an email you forwarded"
+    if source == "quoted":
+        return "from something you pasted"
+    if source == "attachment":
+        return "from a file you sent"
+    if source == "model":
+        return "i worked that out, so i might be wrong"
+    return "i'm not sure where i got that"
+
+
+def detail(row) -> dict:
+    """The structured answer to "why do you remember that?" — for a provenance reply, an audit view, or
+    the harness. Deliberately includes `explicitly_stated` and `expires`, because "you said so" and "I
+    inferred it, and it goes stale next week" deserve different confidence in the reply."""
+    source = getattr(row, "source_type", None)
+    return {
+        "source_type": source,
+        "source_message_id": getattr(row, "source_message_id", None),
+        "observed_at": getattr(row, "observed_at", None),
+        "confidence": getattr(row, "confidence", None),
+        "explicitly_stated": source == "trusted_user_text",
+        "from_provider_evidence": source in ("provider", "forwarded", "attachment", "quoted"),
+        "was_corrected": getattr(row, "superseded_by_id", None) is not None,
+        "expires_at": getattr(row, "expires_at", None),
+        "freshness": getattr(row, "freshness_class", None),
+        "phrase": phrase(row),
+    }
