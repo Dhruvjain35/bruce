@@ -58,7 +58,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
-from . import decision_resolver, goal_slots, temporal
+from . import decision_resolver, directive_scope, goal_slots, temporal
 from .goal_slots import GoalKind
 
 _EMPTY_PATCH: Mapping[str, str] = MappingProxyType({})
@@ -91,13 +91,18 @@ HALT = "halt_requested"
 REFERENCE_REPLY = "inline_reply_reference"
 REFERENCE_DRAFT = "recent_draft"
 REFERENCE_TOOL_RESULT = "recent_tool_result"
+AMBIGUOUS_OPERATION_SCOPE = "ambiguous_operation_scope_asks_one_question"
+# The presentation preference is a SLOT on the goal, not a global setting: "dont show me draft"
+# applies to the work in flight, and the next task starts from the default again.
+SLOT_SHOW_DRAFT = "show_draft"
+_SLOT_TONE = "tone"
 AMEND_WITHOUT_SLOT = "amend_without_matching_slot"              # understood a change, own no slot for it
 AMEND_PREFIX = "amend:"                                         # + the roles that matched, sorted
 
 EVIDENCE: frozenset[str] = frozenset({
     NO_TEXT, NOT_A_CONTINUATION, NO_ANCHOR, AFFIRMATIVE_WITHOUT_DECISION, APPROVAL_OF_DECISION,
     REJECTION_OF_DECISION, REJECTION_OF_RUN, REJECTION_UNTARGETED, HALT, REFERENCE_REPLY,
-    REFERENCE_DRAFT, REFERENCE_TOOL_RESULT, AMEND_WITHOUT_SLOT,
+    REFERENCE_DRAFT, REFERENCE_TOOL_RESULT, AMEND_WITHOUT_SLOT, AMBIGUOUS_OPERATION_SCOPE,
 })
 
 # Confidence describes the BINDING — "this text attaches to that decision" — not the plausibility of a
@@ -459,10 +464,45 @@ def resolve(user_id: Any, *, text: str | None, reply_to_message_id: str | None,
     kind = _goal_kind(open_goal)
 
     resolution = decision_resolver.resolve_approval(raw)
+    presentation_patch: dict = {}
 
     # 1. A refusal dominates everything, at any position in the message — the P0 rule `decision_resolver`
     #    already enforces. A refusal that also asks for a change is still a refusal: the caller stops and
     #    asks one question, rather than executing a half-understood edit.
+    # 0. WHAT IS THE NEGATION ABOUT. `decision_resolver` answers "is there a refusal in here", which is the
+    #    right question for its job and the wrong one for this one: "make it a professional email and send
+    #    it dont show me draft" contains a refusal of SHOWING THE DRAFT and an approval of the send, and
+    #    reading it as a refusal cancelled a real goal in production. `directive_scope` splits the clauses
+    #    and says what each one governs. This does NOT weaken refusal detection — a refusal of the
+    #    OPERATION still dominates below, unchanged. It only stops a presentation negation from wearing a
+    #    refusal's authority.
+    scope = directive_scope.interpret(raw)
+
+    if scope.presentation_show_draft is not directive_scope.ShowDraft.unchanged:
+        presentation_patch[SLOT_SHOW_DRAFT] = (
+            scope.presentation_show_draft is directive_scope.ShowDraft.true)
+
+    #    A tone edit in the SAME breath as an approval has to survive it. "make it a professional email and
+    #    send it" is one turn carrying two directives, and honouring only the approval sends the heartfelt
+    #    draft the student just asked to replace. Guarded by the kind's own declared slots, so a goal with
+    #    no tone slot silently gains nothing rather than a key its executor cannot use.
+    if scope.tone_update and kind is not None:
+        if any(s.name == _SLOT_TONE for s in goal_slots.slot_specs(kind)):
+            presentation_patch[_SLOT_TONE] = scope.tone_update
+
+    #    An ambiguous OPERATION directive authorizes nothing and cancels nothing: the Decision stays
+    #    pending, the caller asks exactly one question, and no provider is called. Guessing which half of
+    #    a contradiction to honour is guessing about a send.
+    if scope.is_ambiguous:
+        return _none(AMBIGUOUS_OPERATION_SCOPE)
+
+    if resolution is decision_resolver.Resolution.rejected and not scope.rejects_operation \
+            and scope.presentation_show_draft is not directive_scope.ShowDraft.unchanged:
+        # The only negation in the turn was about presentation. Fall through to amendment carrying the
+        # show_draft patch, so "dont show me draft" changes how Bruce behaves without closing the work.
+        resolution = decision_resolver.Resolution.approved if scope.approves_operation \
+            else decision_resolver.Resolution.unresolved
+
     if resolution is decision_resolver.Resolution.rejected:
         if decision_id:
             return Continuation(ContinuationKind.reject, run_id, decision_id, reply_ref,
@@ -475,6 +515,10 @@ def resolve(user_id: Any, *, text: str | None, reply_to_message_id: str | None,
 
     # 2. A change to what is in flight. Ahead of approval on purpose.
     patch, roles = _amend_patch(normalized, raw, kind)
+    if presentation_patch:
+        # The ROLE-based extractor wins on any key it set: it reads degree words ("a lot less formal")
+        # that the clause parser deliberately does not. This only fills what it left empty.
+        patch = {**presentation_patch, **dict(patch or {})}
     if patch:
         return Continuation(ContinuationKind.amend, run_id, decision_id, reply_ref,
                             slot_patch=MappingProxyType(dict(patch)), confidence=_CONF_AMEND,
