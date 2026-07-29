@@ -519,14 +519,15 @@ def test_changing_the_arguments_replaces_the_decision_rather_than_spending_it(cl
 def test_a_negation_that_governs_something_else_still_reads_as_refusing_the_operation(clean_db):
     """D1, isolated. The positive control is asserted first: a real refusal MUST cancel, and it does.
 
-    Then the same student says the opposite — "YES WRITE IT AND SEND IT NO MORE QUESTIONS", which is as
-    unambiguous an instruction to proceed as a person can type — and it cancels too, because "no" appears
-    in it. `decision_resolver` establishes that a negation is present and never what it governs; the
-    P0 rule that a refusal dominates then applies it to the operation.
+    FIXED at 0bf04af. `directive_scope` now reads what each negation GOVERNS, so
+    "YES WRITE IT AND SEND IT NO MORE QUESTIONS" no longer cancels because it contains "no", and
+    "dont show me draft" changes presentation instead of closing the Decision. The cancellation
+    assertions below therefore PASS.
 
-    The second half of the damage is not visible in the reply at all: `user_action_boundary.evaluate`
-    also calls that turn a withdrawal, so `authorization_store.record_refusal` closes EVERY outstanding
-    authorization this student has, in every conversation.
+    What still fails is the final `send_calls == 1`: the confirmation no longer cancels the goal, and it
+    does not execute either. That is a separate root cause in the execution seam, not in negation scope —
+    the docstring said otherwise while the assertions were already correct, which is its own small lesson
+    about trusting a test's prose over its asserts.
     """
     # POSITIVE CONTROL — an actual refusal cancels the goal and sends nothing.
     stop = "actually nah dont send it"
@@ -545,7 +546,7 @@ def test_a_negation_that_governs_something_else_still_reads_as_refusing_the_oper
 
     c.say(T5)
     assert c.goals()[0]["status"] != "cancelled", (
-        "'YES WRITE IT AND SEND IT NO MORE QUESTIONS' was read as a refusal because it contains 'no'")
+        "a turn that means proceed must never cancel — regression guard for 0bf04af")
     assert c.gmail.send_calls == 1, "the most emphatic instruction in the transcript sent nothing"
 
 
