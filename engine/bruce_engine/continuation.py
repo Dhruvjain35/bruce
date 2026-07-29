@@ -496,12 +496,26 @@ def resolve(user_id: Any, *, text: str | None, reply_to_message_id: str | None,
     if scope.is_ambiguous:
         return _none(AMBIGUOUS_OPERATION_SCOPE)
 
-    if resolution is decision_resolver.Resolution.rejected and not scope.rejects_operation \
+    if resolution is decision_resolver.Resolution.rejected and scope.approves_operation:
+        # `decision_resolver` found A negation; `directive_scope` found that the OPERATION was explicitly
+        # approved. Scope wins, because it is the only one of the two that knows what the negation attached
+        # to. This is deliberately narrow: it requires an EXPLICIT approval of the operation, so a bare
+        # "no" (scope: no operation directive) and "dont send it" (scope: reject) both still refuse,
+        # unchanged.
+        #
+        # The earlier version of this gate additionally required a presentation signal to be present,
+        # which meant "YES WRITE IT AND SEND IT NO MORE QUESTIONS" — the most emphatic instruction in the
+        # transcript — was still read as a refusal, because it says nothing about the draft. The negation
+        # there is "NO MORE QUESTIONS", governing questions. Nothing about it refuses the send.
+        resolution = decision_resolver.Resolution.approved
+    elif resolution is decision_resolver.Resolution.rejected and not scope.rejects_operation \
             and scope.presentation_show_draft is not directive_scope.ShowDraft.unchanged:
-        # The only negation in the turn was about presentation. Fall through to amendment carrying the
-        # show_draft patch, so "dont show me draft" changes how Bruce behaves without closing the work.
-        resolution = decision_resolver.Resolution.approved if scope.approves_operation \
-            else decision_resolver.Resolution.unresolved
+        # The turn's only negation was about PRESENTATION and it said nothing either way about the
+        # operation. It must not close the Decision — "dont show me the draft" is an instruction about how
+        # to behave, not a withdrawal — so it falls through to the amendment below carrying its show_draft
+        # patch. Unresolved rather than approved: changing how Bruce presents something is not permission
+        # to do it.
+        resolution = decision_resolver.Resolution.unrelated
 
     if resolution is decision_resolver.Resolution.rejected:
         if decision_id:
