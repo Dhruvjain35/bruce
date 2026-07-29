@@ -12,12 +12,14 @@ logs (message ids + statuses only — never text, handles, or file paths).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
 import shutil
 import stat
 import time
+from typing import AsyncIterator
 
 from .backend import AuthError, Backend, BackendError
 from .checkpoint import FileCheckpoint
@@ -357,20 +359,70 @@ class Relay:
         harness + tests). Live watch events already arrive as ImsgEvent via imsg.watch()."""
         return await self.process_inbound(parse_event(raw))
 
+    @staticmethod
+    def _abandon(task: "asyncio.Future") -> None:
+        """Cancel a future we no longer want, WITHOUT awaiting it.
+
+        Awaiting a just-cancelled task means sitting in `await` and swallowing whatever CancelledError
+        arrives — including one aimed at THIS task by an outer shutdown, which would quietly defeat the
+        cancellation. Dropping it instead, with a callback that retrieves any exception so asyncio does
+        not log 'exception was never retrieved', keeps cancellation semantics intact.
+        """
+        task.cancel()
+        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+
+    async def _watch_until_stopped(self, stream) -> "AsyncIterator":
+        """Yield watch events, but return PROMPTLY when stop is set — even with an idle stream.
+
+        A plain `async for` cannot do this. It parks inside `__anext__` waiting for the next iMessage, so
+        the stop flag is only ever read AFTER an event arrives. With a quiet inbox that is never, and
+        because `run()` gathers this coroutine, the whole process then fails to exit: on 2026-07-28 the
+        relay decided to stop at 12:29Z and was still resident 11.9 hours later. A supervisor can restart
+        a process that exits; it can do nothing with one that hangs. So the wait for the next event races
+        the stop signal, and shutdown no longer depends on a stranger sending a text.
+        """
+        it = stream.__aiter__()
+        stop_task = asyncio.ensure_future(self._stop.wait())
+        try:
+            while not self._stop.is_set():
+                nxt = asyncio.ensure_future(it.__anext__())
+                done, _ = await asyncio.wait({nxt, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                if nxt not in done:
+                    self._abandon(nxt)                     # abandon the in-flight readline and leave
+                    return
+                try:
+                    event = nxt.result()
+                except StopAsyncIteration:            # caught HERE: it must never escape an async gen
+                    return
+                yield event
+        finally:
+            self._abandon(stop_task)
+
     async def run_inbound(self) -> None:
         while not self._stop.is_set():
+            stream = self.imsg.watch()
             try:
-                async for event in self.imsg.watch():
+                async for event in self._watch_until_stopped(stream):
                     if self._stop.is_set():
                         return
                     await self.process_inbound(event)
             except AuthError:
                 log.error("relay credential rejected — stopping")
-                self.exit_code = REVOKED_CREDENTIAL_EXIT       # revoked -> supervisor parks
+                self.exit_code = REVOKED_CREDENTIAL_EXIT      # revoked -> supervisor PARKS, never restarts
                 self.stop()
                 return
             except Exception:
                 log.warning("watch_dropped — reconnecting")   # imsg/Messages restart
+            finally:
+                # Two DIFFERENT closes, and only the second one reaps anything. Closing the async
+                # generator ends the iteration; the long-lived `imsg rpc` child is owned by the Imsg
+                # client, whose aclose() is what actually kills it. Calling only the generator's aclose
+                # would leak one subprocess per reconnect — the loop below runs on every watch drop.
+                aclose = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    with contextlib.suppress(Exception):
+                        await aclose()
+                await self.aclose()          # reaps the watch child; next pass starts a fresh one
             if not self._stop.is_set():
                 await asyncio.sleep(self.reconnect_delay)     # reconnect
 
