@@ -148,7 +148,12 @@ async def _world_block(user_id) -> str | None:
 
 async def _operational_block(user_id) -> str | None:
     try:
-        run = await agent_run_store.latest_active(user_id)
+        # domain=None means ANY domain. `latest_active` defaults to "calendar", and its own docstring
+        # warns that the default "made every gmail background mission structurally invisible to callers
+        # that did not think to pass a domain — including the context the conversation model reads".
+        # This IS that caller. Left unfixed, a correctly-created email goal is invisible to the model on
+        # the very next turn, which is how a recipient supplied on turn 1 vanishes by turn 2.
+        run = await agent_run_store.latest_active(user_id, domain=None)
         if not run:
             return None
         goal = run.get("goal")
@@ -175,15 +180,24 @@ async def _entity_block(user_id) -> str | None:
         return None
 
 
-def _episodic_block(recent, *, include: bool) -> str | None:
-    """The bounded conversation window. When history is deliberately withheld (an explicit reply-target owns
-    the context), render the honest marker so the model knows it has none — never fabricate turns."""
+# On a turn that carries an explicit reply target, the window is NARROWED rather than deleted. Deleting it
+# was the P0.1 fix for a real leak (a newer image B got answered instead of the replied-to image A) — but
+# it also removed the only place a recipient given two turns ago still lived, on exactly the turn most
+# likely to say "send it". Narrow + the referenced content fenced as higher-priority DATA keeps the leak
+# closed (the reply target still dominates) without amnesia.
+_REF_TURNS = 4
+
+
+def _episodic_block(recent, *, include: bool, limit: int | None = None) -> str | None:
+    """The bounded conversation window. `include=False` renders the honest marker so the model knows it has
+    none — never fabricated turns. `limit` narrows the window without emptying it."""
     if not include:
         return _NO_HISTORY
     lines = [f"{t.role}: {t.text}" for t in (recent or []) if getattr(t, "text", None)]
     if not lines:
         return None
-    return "Recent conversation (oldest first):\n" + "\n".join(lines[-_MAX_TURNS:])
+    keep = _MAX_TURNS if limit is None else max(1, min(limit, _MAX_TURNS))
+    return "Recent conversation (oldest first):\n" + "\n".join(lines[-keep:])
 
 
 def _trim_episodic(text: str, budget_tokens: int) -> str | None:
@@ -204,7 +218,7 @@ def _trim_episodic(text: str, budget_tokens: int) -> str | None:
     return None                                               # no turn line fit -> drop, no dangling header
 
 
-async def compile(user_id, recent, *, include_episodic: bool = True,
+async def compile(user_id, recent, *, include_episodic: bool = True, episodic_limit: int | None = None,
                   profile: VoiceProfile | None = None,
                   capabilities=None,
                   memory_cue=None, trace=None,
@@ -246,7 +260,7 @@ async def compile(user_id, recent, *, include_episodic: bool = True,
         ("operational", _P_OPERATIONAL, await _operational_block(user_id)),
         ("memory", _P_MEMORY, memory_ctx.render() if memory_ctx is not None else ""),
         ("entity", _P_ENTITY, await _entity_block(user_id)),
-        ("episodic", _P_EPISODIC, _episodic_block(recent, include=include_episodic)),
+        ("episodic", _P_EPISODIC, _episodic_block(recent, include=include_episodic, limit=episodic_limit)),
     ):
         if text:
             candidates.append((layer, prio, text))

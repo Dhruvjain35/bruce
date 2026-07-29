@@ -344,7 +344,19 @@ class _Runtime:
             # context, so episodic is WITHHELD — that window is exactly how a newer image B leaked in and got
             # answered instead of the replied-to image A. World/entity/operational still ground the reply. The
             # referenced content (fenced as DATA below) stands on its own. Compilation never drops a turn.
-            include_episodic = not (explicit_ref and capsule.has_reference)
+            # NARROW, don't delete. Withholding the window entirely was the P0.1 fix for a real leak, but
+            # it also meant the one turn most likely to say "send it" or "this" was the one turn with no
+            # memory of what "it" referred to — the recipient given two turns earlier was simply gone. The
+            # reply target still dominates: it is fenced as DATA at a higher priority than episodic. What
+            # changes is that the window shrinks instead of vanishing.
+            # The hazard P0.1 fixed is ATTACHMENT-specific: a newer image B in the window got answered
+            # instead of the image A the user pointed at. Text has no such competitor — pointing at a
+            # draft and saying "this" needs the window, because that is where the recipient given two
+            # turns ago still lives. So withhold only when the reference carries its own images, and
+            # narrow otherwise. Blanket withholding is what made "send it" amnesiac.
+            _owns_context = bool(explicit_ref and capsule.has_reference)
+            include_episodic = not (_owns_context and bool(capsule.referenced_images))
+            episodic_limit = context_compiler._REF_TURNS if _owns_context else None
             # M1: the runtime already knows what is live. Hand that to the model instead of letting it
             # guess — a guessed "i can't add it to your calendar" on a fully-scoped Google connection is
             # what blocked a P0 verification. Fault-isolated: a snapshot error degrades to no block, never
@@ -378,7 +390,7 @@ class _Runtime:
 
             try:
                 compiled = await context_compiler.compile(
-                    user_id, recent, include_episodic=include_episodic, profile=profile,
+                    user_id, recent, include_episodic=include_episodic, episodic_limit=episodic_limit, profile=profile,
                     capabilities=cap_snapshot, memory_cue=memory_cue, trace=trace)
                 ctx = compiled.text
                 if compiled.dropped:
@@ -386,7 +398,7 @@ class _Runtime:
                              [b.layer for b in compiled.blocks], list(compiled.dropped))
             except Exception:
                 log.info("ctx_compile_error pmid=%s", pmid)         # fall back to the honest minimal context
-                ctx = _context(recent) if include_episodic else "No prior conversation."
+                ctx = _context(recent)   # the window is narrowed, never withheld — see episodic_limit above
             _ev = conversation_context.evidence_text(capsule)       # referenced content, fenced as DATA
             if _ev:
                 ctx = ctx + "\n\n" + _ev
@@ -445,8 +457,14 @@ class _Runtime:
             _wrong = capability_snapshot.contradicts(reply_out, _snap)
             if _wrong:
                 log.info("capability_contradiction pmid=%s family=%s", pmid, _wrong)
-                reply_out = capability_truth.grounded_calendar_correction(msg.text) \
-                    if _wrong == "calendar" else reply_out
+                # Both families now have a correction. Previously only calendar did, so an email denial
+                # was detected, logged, and then shipped verbatim — the detector was right and the reply
+                # lied anyway. A family with no correction still falls through unchanged rather than
+                # being silently rewritten by the wrong one.
+                _corrections = {"calendar": capability_truth.grounded_calendar_correction,
+                                "email": capability_truth.grounded_email_correction}
+                _fix = _corrections.get(_wrong)
+                reply_out = _fix(msg.text) if _fix is not None else reply_out
 
         # C1/D: when a MISSION lane ran, the runtime's own outcome decides the words, not the reasoner.
         # The reasoner writes without knowing what was executed, and that produced BOTH live failures we

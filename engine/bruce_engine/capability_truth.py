@@ -48,6 +48,30 @@ def mentions_calendar_denial(text: str | None) -> bool:
     return bool(_CAL_DENIAL_RE.search(text_norm.fold_match(text)))
 
 
+# The email counterpart. `capability_snapshot.contradicts` has returned "email" since it was written, and
+# conversation_runtime detected it, logged it, and then shipped the denial anyway because only the
+# calendar branch had a correction to swap in. That is exactly how a student was told "i can't send
+# messages for you" on a Gmail connection where tool_broker reports gmail.send_message ok=True.
+_SEND_RE = re.compile(r"\b(send|sending|sent|email|emailing|e-mail|reply|replying|respond)\b", re.IGNORECASE)
+
+
+def grounded_email_correction(user_text: str | None = None) -> str:
+    """The honest replacement for an email denial when Gmail is connected and send is live.
+
+    Mirrors the calendar version deliberately: registry-driven, specific to what was asked, and it never
+    claims anything was sent. Only a verified read-back may say that, and it does not happen here.
+    """
+    send_live = tool_registry.is_live("gmail.send_message")
+    reply_live = tool_registry.is_live("gmail.reply_to_thread")
+    wants_reply = bool(re.search(r"\b(reply|replying|respond|responding)\b", user_text or "", re.IGNORECASE))
+    if wants_reply and reply_live:
+        return "yeah i can reply to that thread for u. want me to draft it first or just send?"
+    if send_live:
+        return ("actually i can send email from ur gmail, it's connected. tell me who it's going to and "
+                "what u want it to say, and i'll draft it + confirm before it goes.")
+    return "sending email from ur gmail isn't live for u yet."
+
+
 def grounded_calendar_correction(user_text: str | None = None) -> str:
     """The honest replacement for a calendar denial when the calendar is connected — SPECIFIC to what the
     user asked and to what the registry says is live. Never claims anything is scheduled."""
