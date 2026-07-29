@@ -30,6 +30,11 @@ class RouterTiming:
     stage0_ms: float = 0.0
     stage1_ms: float = 0.0
     total_ms: float = 0.0
+    # Did the DETERMINISTIC stage answer, or did it fall through? Recorded rather than inferred from
+    # `source == "router_default"`, which is only equivalent while Stage 1 is off: the day the compact
+    # router is enabled, that inference silently starts reporting every Stage-0 miss as a hit, and
+    # anything gated on "Stage 0 returned UNKNOWN" stops firing without failing.
+    stage0_resolved: bool = True
 
 
 class RouterModel(Protocol):
@@ -200,6 +205,7 @@ async def route(user_id: UUID, text: str, *, has_attachments: bool = False, has_
     t0 = time.perf_counter()
     d = await _stage0(user_id, text, has_attachments=has_attachments, has_reply_ref=has_reply_ref)
     timing.stage0_ms = (time.perf_counter() - t0) * 1000.0
+    timing.stage0_resolved = d is not None
     if d is not None:
         timing.total_ms = timing.stage0_ms
         return d, timing

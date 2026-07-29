@@ -21,7 +21,13 @@ from .conversation_contract import RiskLevel
 
 # Handlers that ACTUALLY execute + verify a provider action, so their success copy is trustworthy (they emit
 # a completion only after a read-back). Any OTHER owner claiming a completion is fabricating.
-ACTION_HANDLERS = frozenset({"calendar_schedule", "calendar_approval", "calendar_mutation"})
+#
+# `semantic_rescue_execute` is the ONE rescue path whose words are driven by a verified ScheduleState, and
+# it is deliberately a different name from the `semantic_rescue` that proposes, clarifies and blocks — so
+# a proposal or a question that somehow claimed a completion is still downgraded. One name for both would
+# have made every rescue reply trusted on the strength of the one path that earned it.
+ACTION_HANDLERS = frozenset({"calendar_schedule", "calendar_approval", "calendar_mutation",
+                             "semantic_rescue_execute"})
 
 # A sentence that FRAMES an offer / intent / question is never a "it landed" claim, even if it contains
 # completion-shaped words ("i'll put it on ur calendar", "want me to move it"). Checked per-sentence so a

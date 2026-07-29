@@ -217,6 +217,111 @@ async def latest_pending_calendar_mission(user_id: UUID) -> dict | None:
         return {"mission_id": str(m.id), "goal": m.goal}
 
 
+# --- the founder-alpha semantic-rescue proposal -------------------------------------------------------
+# A rescued proposal is a pending Decision, and this file already knows how to represent one. Giving it a
+# second home — a `rescue_proposals` table, a cache, an in-memory map — would mean two answers to "is
+# something awaiting this student's ok", and the two would disagree on the day one of them is written and
+# the other is not. So a rescue proposal IS a mission row in `awaiting_approval`, read back by the same
+# owner-scoped query shape as `latest_pending_calendar_mission`, and closed by the same `record_phase`.
+#
+# The `decision` discriminator is what keeps the two kinds apart. `latest_pending_calendar_mission` filters
+# on `goal.capability == "calendar.create_event"` and a rescue proposal stores the gate's own capability
+# key ("google_calendar.create_event"), so neither query can return the other's row — which matters,
+# because the calendar approval handler resolves a decision WITHOUT the arguments-fingerprint check the
+# rescue path is built around, and answering a rescue proposal through it would skip that check.
+
+RESCUE_DECISION_TYPE = "rescue_proposal"
+
+
+def rescue_idempotency_key(source_message_id: str, capability: str) -> str:
+    """Owner + source message + intended capability, like every other mission key. A relay redelivery of
+    the turn that produced the offer references the SAME pending Decision instead of stacking a second."""
+    return f"rescue:{capability}:{source_message_id}"[:_MAX_KEY]
+
+
+async def create_pending_rescue_proposal(
+    user_id: UUID, *, pending, presentation: str, proposed_goal: str, goal_spec: dict | None = None,
+) -> MissionCreation:
+    """Persist ONE canonical pending Decision for a semantic-rescue proposal. Takes no external action.
+
+    `pending` is a `semantic_rescue.PendingProposal` — a pure value object. The whole point of the split is
+    that the thing being written here was derived deterministically from the model's reading, so what lands
+    on disk is a concrete operation with exact arguments and an exact fingerprint, not a paraphrase.
+
+    Note which id survives. `build_pending` mints a `decision_id` before there is a row to point at; the
+    row's own id is what every later turn resolves against, so the loader below reports the MISSION id as
+    the decision id. Carrying both would give one Decision two names, and the authorization record binds to
+    exactly one of them.
+    """
+    capability = f"{pending.provider}.{pending.operation}"
+    key = rescue_idempotency_key(pending.source_message_id or "", capability)
+    goal = {
+        "capability": capability,
+        "proposed_goal": proposed_goal[:200],
+        "source_message_ids": [pending.source_message_id] if pending.source_message_id else [],
+        "decision": {"type": RESCUE_DECISION_TYPE},
+        # The proposal verbatim. `arguments_fingerprint` is the load-bearing field: the approval turn is
+        # judged against it, and execution re-derives it from what is actually about to reach the provider.
+        "rescue": {
+            "goal_id": pending.goal_id,
+            "provider": pending.provider,
+            "operation": pending.operation,
+            "normalized_arguments": pending.normalized_arguments,
+            "arguments_fingerprint": pending.arguments_fingerprint,
+            "trusted_authorization_required": pending.trusted_authorization_required,
+            "conversation_id": pending.conversation_id,
+            "source_message_id": pending.source_message_id,
+            "created_at": pending.created_at.isoformat(),
+            "expires_at": pending.expires_at.isoformat(),
+            "presentation": presentation,
+            "goal_spec": goal_spec or {},
+        },
+    }
+    phase = MissionPhase.awaiting_approval.value
+    async with user_session(user_id) as s:
+        existing = (await s.execute(select(schema.Mission).where(
+            schema.Mission.user_id == user_id,
+            schema.Mission.idempotency_key == key))).scalar_one_or_none()
+        if existing is not None:
+            return MissionCreation(mission_id=existing.id, created=False, phase=existing.phase)
+        mission = schema.Mission(
+            user_id=user_id, kind=HANDOFF_KIND, status="running", phase=phase,
+            short_status=f"awaiting ok: {proposed_goal}"[:200], goal=goal, idempotency_key=key)
+        s.add(mission)
+        try:
+            await s.flush()
+        except IntegrityError:
+            async with user_session(user_id) as s2:
+                ex = (await s2.execute(select(schema.Mission).where(
+                    schema.Mission.user_id == user_id,
+                    schema.Mission.idempotency_key == key))).scalar_one_or_none()
+                if ex is not None:
+                    return MissionCreation(mission_id=ex.id, created=False, phase=ex.phase)
+            raise
+        s.add(schema.MissionPhaseEvent(
+            user_id=user_id, mission_id=mission.id, phase=phase, short_status="rescue_awaiting_approval"))
+        await s.flush()
+        log.info("rescue_proposal_pending mission_id=%s cap=%s", mission.id, capability)
+        return MissionCreation(mission_id=mission.id, created=True, phase=phase)
+
+
+async def latest_pending_rescue_proposal(user_id: UUID) -> dict | None:
+    """The most recent OPEN rescue proposal awaiting the founder's ok. Owner-scoped; None if nothing is
+    pending. Deliberately keyed on the `decision.type` discriminator rather than on the capability, so
+    adding a second rescued operation does not need a second query."""
+    async with user_session(user_id) as s:
+        m = (await s.execute(select(schema.Mission).where(
+            schema.Mission.user_id == user_id,
+            schema.Mission.kind == HANDOFF_KIND,
+            schema.Mission.status == "running",
+            schema.Mission.phase == MissionPhase.awaiting_approval.value,
+            schema.Mission.goal["decision"]["type"].astext == RESCUE_DECISION_TYPE).order_by(
+            schema.Mission.created_at.desc()).limit(1))).scalar_one_or_none()
+        if m is None:
+            return None
+        return {"mission_id": str(m.id), "goal": m.goal}
+
+
 async def record_phase(
     user_id: UUID, mission_id: UUID, phase: str, short_status: str, *, status: str | None = None,
 ) -> bool:
