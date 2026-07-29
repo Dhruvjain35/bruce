@@ -66,6 +66,47 @@ def _context(recent: list) -> str:
     return "Recent conversation (oldest first):\n" + "\n".join(lines[-8:])
 
 
+async def _open_goal_row(user_id: UUID, conversation_id: str) -> dict | None:
+    """The newest open AgentRun that declares a TYPED goal kind — the run a continuation can land on.
+
+    Selected by KIND rather than by "newest run" for the reason `goal_runtime` spells out: a background
+    audit run, a mission row and a real goal all share this table, and only the last of them has slots a
+    turn can answer into. A run with no declared kind is skipped rather than returned, because handing
+    `continuation` a run whose `_goal_kind` is None makes every amendment resolve to "I own no slot for
+    that" — a change the student asked for, silently understood and silently dropped.
+    """
+    from . import goal_runtime, goal_slots
+    for run in await goal_runtime.open_runs(user_id, conversation_id=conversation_id):
+        goal = run.get("goal")
+        kind, _slots = goal_slots.from_goal_jsonb(goal if isinstance(goal, dict) else None)
+        if kind is not None:
+            return run
+    return None
+
+
+def _continuation_state(run: dict | None) -> tuple[dict | None, dict | None, dict | None]:
+    """(pending decision, recent draft, recent tool result) — all three read off the ONE run.
+
+    `continuation.resolve` is pure and takes each of these separately so the caller cannot skip one by
+    accident. They come from the same row on purpose: a decision belonging to one goal and a draft
+    belonging to another is how "send it" sends the wrong thing.
+
+    The DRAFT is the goal itself once any slot is filled. That is not a stand-in — the collected slots ARE
+    what Bruce would send, so "this" pointing at them resolves to the run rather than to nothing, which is
+    precisely what the transcript's inline reply of "this" failed to do.
+    """
+    if not isinstance(run, dict):
+        return None, None, None
+    from . import goal_slots
+    block = run.get("active_decision")
+    last = run.get("last_tool_result")
+    goal = run.get("goal")
+    _kind, slots = goal_slots.from_goal_jsonb(goal if isinstance(goal, dict) else None)
+    return (block if isinstance(block, dict) else None,
+            {"id": str(run.get("id"))} if slots else None,
+            last if isinstance(last, dict) else None)
+
+
 class _Runtime:
     def __init__(self, reasoner: ConversationReasoner | None = None,
                  style: ConversationStyleEngine | None = None,
@@ -78,14 +119,22 @@ class _Runtime:
         self.handlers = handlers if handlers is not None else conversation_outcomes.default_handlers()
         self.fallback = fallback if fallback is not None else conversation_outcomes.default_fallback()
 
-    async def _resolve_outcome(self, *, decision, capsule, msg, profile, channel, user_id, pmid):
+    async def _resolve_outcome(self, *, decision, capsule, msg, profile, channel, user_id, pmid,
+                               turn_context=None, continuation=None, open_goal=None,
+                               conversation_id: str = "", turn_index: int = 0,
+                               mission_lane_ran: bool = False):
         """Two-phase dispatch (invariant 1): PURE evaluate() over every handler, deterministic priority
         selection (claims outrank blocked; single top-priority owner; a tie fails loudly; zero owners ->
         explicit fallback), then execute() ONLY the selected handler (mutation happens here, post-
-        selection). Presentation (render/style/safety) is applied AFTER, by the runtime, not the handler."""
+        selection). Presentation (render/style/safety) is applied AFTER, by the runtime, not the handler.
+
+        The snapshot arguments are passed THROUGH rather than looked up: they were assembled once for this
+        turn, and a handler that fetched its own copy would put back the exact defect the spine removes."""
         octx = conversation_outcomes.OutcomeContext(
             user_id=user_id, decision=decision, capsule=capsule, msg=msg, profile=profile,
-            channel=channel, pmid=pmid, style=self.style, store=conversation_store)
+            channel=channel, pmid=pmid, style=self.style, store=conversation_store,
+            turn_context=turn_context, continuation=continuation, open_goal=open_goal,
+            conversation_id=conversation_id, turn_index=turn_index, mission_lane_ran=mission_lane_ran)
         verdicts = []
         for h in self.handlers:                               # PURE evaluation — no mutation, no enqueue
             v = await h.evaluate(octx)
@@ -156,6 +205,42 @@ class _Runtime:
         except Exception:
             log.warning("authz_refusal_record_failed pmid=%s", pmid)
 
+        # CONTINUATION BEFORE ROUTING — the ordering the transcript proved was backwards.
+        #
+        # Routing asks "what kind of request is this text". Three turns of that conversation were answers
+        # to work Bruce was already supposed to be doing, and text alone cannot answer them: "send it" does
+        # not match the send pattern (it is looking for the word "email"), "make it professional" re-entered
+        # the pipeline as a brand-new subjectless request, and an inline reply of "this" resolved to
+        # nothing at all. The answerable question is "what does this turn DO to what is already open", and
+        # only STATE can answer it. So state is read first, `continuation` resolves against it, and a turn
+        # that lands on work in flight never reaches the classifier.
+        #
+        # Every piece of state here is fetched ONCE and handed onward: `continuation.resolve` is pure by
+        # design, and a resolver that fetched its own would grow a second, drifting copy of the truth.
+        from . import continuation as continuation_mod, goal_handler
+        open_goal_row = None
+        turn_continuation = None
+        if goal_handler.enabled():
+            try:
+                open_goal_row = await _open_goal_row(user_id, ident)
+                pending_decision, recent_draft, recent_tool_result = _continuation_state(open_goal_row)
+                if open_goal_row is not None or pending_decision is not None:
+                    # NOTHING IN FLIGHT MEANS NOTHING TO CONTINUE. Resolving against an empty world would
+                    # turn an ordinary "nah" into an untargeted rejection and pull it out of routing for
+                    # no reason; `continuation` reports that honestly, and this is the caller acting on it.
+                    turn_continuation = continuation_mod.resolve(
+                        user_id, text=msg.text,
+                        reply_to_message_id=(msg.reply_to_message_id or msg.thread_root_message_id),
+                        open_goal=open_goal_row, pending_decision=pending_decision,
+                        recent_draft=recent_draft, recent_tool_result=recent_tool_result)
+                    log.info("continuation pmid=%s kind=%s evidence=%s conf=%.2f", pmid,
+                             turn_continuation.kind.value, turn_continuation.evidence,
+                             turn_continuation.confidence)
+            except Exception:
+                log.info("continuation_error pmid=%s", pmid)   # never costs the turn; the router still runs
+                turn_continuation = None
+        resolved_continuation = turn_continuation is not None and turn_continuation.resolved
+
         # G0.1 FastRouter: classify the cheapest-correct execution path (fast chat / single verified action /
         # foreground agent / durable mission) BEFORE the heavy reasoner, and instrument its latency. This turn
         # the decision is SHADOWED — recorded for the router-quality harness, latency telemetry, and the later
@@ -181,62 +266,74 @@ class _Runtime:
             # here would attribute a read to the wrong place; leaving it silently null would make the gap
             # invisible.
             trace.absent("decisions_ready", turn_trace.NOT_APPLICABLE)
-            turn_trace.guard(trace, "router_started")
-            rd, rt = await fast_router.route(
-                user_id, msg.text or "", has_attachments=bool(msg.attachments),
-                has_reply_ref=bool(msg.reply_to_message_id or msg.thread_root_message_id))
-            turn_trace.guard(trace, "router_finished")
-            router_ec, router_ms = rd.execution_class.value, rt.total_ms
-            turn_trace.note(trace, execution_path=router_ec)
-            log.info("router pmid=%s ec=%s action=%s domain=%s conf=%.2f src=%s stage0_ms=%.1f "
-                     "stage1_ms=%.1f total_ms=%.1f", pmid, router_ec,
-                     rd.action.value if rd.action else None, rd.domain, rd.confidence, rd.source,
-                     rt.stage0_ms, rt.stage1_ms, rt.total_ms)
-            # G0.3 ToolBroker (SHADOW): for a tool-bearing path, shortlist the FEW relevant, live, connected
-            # tools the router→broker seam would hand a planner — never the whole registry. Recorded for
-            # telemetry + the G0.4 planner that will consume it; execution is unchanged this turn. Skipped for
-            # chat/plan paths (no provider tool), so pure conversation pays nothing.
-            if rd.domain and rd.action and rd.execution_class in (
-                    ExecutionClass.direct_action, ExecutionClass.foreground_agent):
-                sl = await tool_broker.shortlist(user_id, domain=rd.domain, action=rd.action,
-                                                 candidate_capabilities=rd.candidate_capabilities)
-                shortlisted = tuple(c.capability for c in sl.candidates)
-                log.info("broker pmid=%s caps=%s actionable=%s dead=%s unavailable=%s", pmid,
-                         list(shortlisted), sl.has_actionable, list(sl.excluded_dead), list(sl.unavailable))
-            # Phase A: AUTHORITATIVE router. On a deterministic text-action lane whose DB precondition the
-            # router already verified, the winning handler ignores the reasoner's decision — so for a canary
-            # user, skip the expensive vision pass and dispatch on a synthetic decision (identical outcome).
-            skip = router_authority.is_authoritative(user_id) and router_authority.reasoner_skippable(
-                rd, has_attachments=bool(msg.attachments),
-                has_reply_ref=bool(msg.reply_to_message_id or msg.thread_root_message_id))
-            if skip and rd.domain == "calendar":
-                # the calendar handlers CLAIM only when connected; if not, defer to the reasoner so the honest
-                # "not connected" reply is still generated instead of an empty synthetic one (keeps parity).
-                # Phase B: the ToolBroker is the single capability-truth authority (live+connected+scoped);
-                # a known-live cap is the shared-connection proxy. Kill switch falls back to the registry.
-                if tool_broker.authority_enabled():
-                    skip = (await tool_broker.availability(user_id, "calendar.update_event")).ok
-                else:
-                    skip = await tool_registry.is_available("calendar.update_event", user_id)
-            if skip:
-                authoritative_decision = router_authority.synthetic_decision(rd)
-            # C1: a routed BACKGROUND mission becomes a DURABLE run right here. This is the seam that was
-            # missing — until now `enqueue_background` had no live caller, so a mission only existed if a
-            # job inserted one by hand. The key is derived from the inbound message, so a webhook
-            # redelivery resolves to the SAME run instead of sending a second email. Best-effort like the
-            # rest of this block: a planner fault must never cost the student their reply.
-            if mission_planner.is_enqueueable(rd):
-                plan = await mission_planner.plan_mission(
-                    user_id, rd, text=msg.text or "", source_message_id=pmid,
-                    idempotency_key=mission_planner.mission_idempotency_key(ch, pmid))
-                mission_plan = plan
-                # surface the broker's shortlist for the MISSION lane too: the block above only computes
-                # one for direct/foreground, so without this a mission's capability truth is invisible.
-                if plan.shortlisted:
-                    shortlisted = plan.shortlisted
-                log.info("mission_plan pmid=%s enqueued=%s status=%s run=%s existed=%s caps=%s",
-                         pmid, plan.enqueued, plan.status, plan.run_id, plan.already_existed,
-                         list(plan.shortlisted))
+            if resolved_continuation:
+                # Skipped, not merely ignored. Classifying a continuation would ALSO re-enqueue whatever
+                # lane the original request landed in — a background send mission included — so a student
+                # saying "yeah send it" could get the same email twice.
+                trace.absent("router_started", turn_trace.NOT_APPLICABLE)
+                trace.absent("router_finished", turn_trace.NOT_APPLICABLE)
+                log.info("router_skipped pmid=%s reason=continuation kind=%s evidence=%s", pmid,
+                         turn_continuation.kind.value, turn_continuation.evidence)
+            else:
+                turn_trace.guard(trace, "router_started")
+                rd, rt = await fast_router.route(
+                    user_id, msg.text or "", has_attachments=bool(msg.attachments),
+                    has_reply_ref=bool(msg.reply_to_message_id or msg.thread_root_message_id))
+                turn_trace.guard(trace, "router_finished")
+                router_ec, router_ms = rd.execution_class.value, rt.total_ms
+                turn_trace.note(trace, execution_path=router_ec)
+                log.info("router pmid=%s ec=%s action=%s domain=%s conf=%.2f src=%s stage0_ms=%.1f "
+                         "stage1_ms=%.1f total_ms=%.1f", pmid, router_ec,
+                         rd.action.value if rd.action else None, rd.domain, rd.confidence, rd.source,
+                         rt.stage0_ms, rt.stage1_ms, rt.total_ms)
+                # G0.3 ToolBroker (SHADOW): for a tool-bearing path, shortlist the FEW relevant, live,
+                # connected tools the router→broker seam would hand a planner — never the whole registry.
+                # Recorded for telemetry + the G0.4 planner that will consume it; execution is unchanged this
+                # turn. Skipped for chat/plan paths (no provider tool), so pure conversation pays nothing.
+                if rd.domain and rd.action and rd.execution_class in (
+                        ExecutionClass.direct_action, ExecutionClass.foreground_agent):
+                    sl = await tool_broker.shortlist(user_id, domain=rd.domain, action=rd.action,
+                                                     candidate_capabilities=rd.candidate_capabilities)
+                    shortlisted = tuple(c.capability for c in sl.candidates)
+                    log.info("broker pmid=%s caps=%s actionable=%s dead=%s unavailable=%s", pmid,
+                             list(shortlisted), sl.has_actionable, list(sl.excluded_dead),
+                             list(sl.unavailable))
+                # Phase A: AUTHORITATIVE router. On a deterministic text-action lane whose DB precondition the
+                # router already verified, the winning handler ignores the reasoner's decision — so for a
+                # canary user, skip the expensive vision pass and dispatch on a synthetic decision (identical
+                # outcome).
+                skip = router_authority.is_authoritative(user_id) and router_authority.reasoner_skippable(
+                    rd, has_attachments=bool(msg.attachments),
+                    has_reply_ref=bool(msg.reply_to_message_id or msg.thread_root_message_id))
+                if skip and rd.domain == "calendar":
+                    # the calendar handlers CLAIM only when connected; if not, defer to the reasoner so the
+                    # honest "not connected" reply is still generated instead of an empty synthetic one
+                    # (keeps parity). Phase B: the ToolBroker is the single capability-truth authority
+                    # (live+connected+scoped); a known-live cap is the shared-connection proxy. Kill switch
+                    # falls back to the registry.
+                    if tool_broker.authority_enabled():
+                        skip = (await tool_broker.availability(user_id, "calendar.update_event")).ok
+                    else:
+                        skip = await tool_registry.is_available("calendar.update_event", user_id)
+                if skip:
+                    authoritative_decision = router_authority.synthetic_decision(rd)
+                # C1: a routed BACKGROUND mission becomes a DURABLE run right here. This is the seam that was
+                # missing — until now `enqueue_background` had no live caller, so a mission only existed if a
+                # job inserted one by hand. The key is derived from the inbound message, so a webhook
+                # redelivery resolves to the SAME run instead of sending a second email. Best-effort like the
+                # rest of this block: a planner fault must never cost the student their reply.
+                if mission_planner.is_enqueueable(rd):
+                    plan = await mission_planner.plan_mission(
+                        user_id, rd, text=msg.text or "", source_message_id=pmid,
+                        idempotency_key=mission_planner.mission_idempotency_key(ch, pmid))
+                    mission_plan = plan
+                    # surface the broker's shortlist for the MISSION lane too: the block above only computes
+                    # one for direct/foreground, so without this a mission's capability truth is invisible.
+                    if plan.shortlisted:
+                        shortlisted = plan.shortlisted
+                    log.info("mission_plan pmid=%s enqueued=%s status=%s run=%s existed=%s caps=%s",
+                             pmid, plan.enqueued, plan.status, plan.run_id, plan.already_existed,
+                             list(plan.shortlisted))
         except Exception:
             log.info("router_error pmid=%s", pmid)     # classification never blocks a reply
             authoritative_decision = None
@@ -284,6 +381,32 @@ class _Runtime:
         # GENERIC reasoner consumes as evidence (no reply-specific branch). Hoisted so both the authoritative
         # and the legacy path share it (a skippable turn has no reference -> a cheap, empty capsule).
         capsule = await conversation_context.resolve(user_id, msg)
+
+        # THE ONE SNAPSHOT. Assembled once, here, before anything reasons, and handed onward rather than
+        # rebuilt. The transcript's four symptoms were one cause: the reply path read one window of chat,
+        # the routing path asked the MODEL whether a mission was needed, and capability truth stayed in
+        # the broker where the replying model never saw it — three views of one turn, and the student got
+        # the least informed one. `assemble` never raises (a store that is down costs its own field and
+        # says so in `report_for(ctx)`), so the guard here is for a defect in this call, not in that one.
+        #
+        # `trace=None` on purpose. The assembler marks `decisions_ready` / `capabilities_ready` /
+        # `agent_runs_ready` / `conversation_state_ready`, and `turn_trace.STAGES` orders those AROUND the
+        # ContextCompiler's own `memory_ready` / `entities_ready`, which are marked further down. Taking
+        # both sets would make every trace read as out of order and the latency baseline unusable; the
+        # assembly's own cost is logged by `turn_context_assembled` instead.
+        turn_ctx = None
+        try:
+            from . import turn_context_assembler
+            turn_ctx = await turn_context_assembler.assemble(
+                user_id,
+                # The ENVELOPE, not the raw message: `turn_context._message_text` takes
+                # `authorizing_text()` off it, so OCR'd and forwarded content stays out of the one field
+                # every path treats as the student's instruction.
+                latest_message=(envelope if envelope is not None else msg.text),
+                reply_reference=(msg.reply_to_message_id or msg.thread_root_message_id or ""),
+                recent_turns=recent, trace=None)
+        except Exception:
+            log.info("turn_context_error pmid=%s", pmid)
 
         if authoritative_decision is not None:
             # Phase A: the FastRouter OWNS this deterministic text-action lane and already verified its DB
@@ -432,8 +555,17 @@ class _Runtime:
         # loudly (error telemetry inside select_owner) but degrades the USER to a safe honest reply.
         try:
             turn_trace.guard(trace, "response_generation_started")
-            outcome = await self._resolve_outcome(decision=decision, capsule=capsule, msg=msg,
-                                                  profile=profile, channel=ch, user_id=user_id, pmid=pmid)
+            outcome = await self._resolve_outcome(
+                decision=decision, capsule=capsule, msg=msg, profile=profile, channel=ch,
+                user_id=user_id, pmid=pmid, turn_context=turn_ctx, continuation=turn_continuation,
+                # Position in the conversation, used to order slot values deterministically so a merge
+                # cannot depend on which turn happened to be replayed last. `recent` is a BOUNDED window,
+                # so this number saturates on a long thread — `goal_handler.turn_index_for` floors it
+                # against the goal's own highest index, which is what keeps a late correction winning.
+                open_goal=open_goal_row, conversation_id=ident, turn_index=len(recent) + 1,
+                # A background mission may ALREADY have sent something on this turn. Nothing else may
+                # act on it, or the student gets the same email twice.
+                mission_lane_ran=bool(mission_plan is not None and mission_plan.enqueued))
         except conversation_outcomes.OutcomeCollision:
             log.error("conv_outcome_collision pmid=%s", pmid)      # loud; details already logged, no content
             await self._finalize(user_id, ch, ident, pmid,

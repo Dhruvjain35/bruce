@@ -274,9 +274,41 @@ def unchecked_status_writes_for_test():
             os.environ[_UNCHECKED_ENV] = previous
 
 
+def _conversation_uuid(value: str | UUID | None) -> UUID | None:
+    """Coerce a caller's conversation id to what the COLUMN can hold, or refuse loudly.
+
+    `agent_runs.conversation_id` is a uuid column (migration 0023), while several conversation ids in
+    this codebase are channel identities — a handle, not a uuid. Those two facts have to meet somewhere,
+    and the only safe place is here, at the write:
+
+      * empty / None means UNATTRIBUTED, which is a real answer (a background mission belongs to no
+        conversation) and becomes NULL. `goal_runtime._conversation_of` already reads "" the same way.
+      * a non-uuid conversation key RAISES rather than being quietly dropped. Silently NULLing it is the
+        exact shape of this whole mission's bug — a caller believes a goal is scoped to one conversation,
+        the column says nothing, and the next turn continues somebody else's goal. A caller whose
+        conversation key is a handle must keep it in the goal blob, where it is a string.
+
+    The value is never interpolated into the message: it can be a handle, and handles are not logged.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("conversation_id must be a UUID — agent_runs.conversation_id is a uuid column; "
+                         "a non-uuid conversation key belongs in the goal blob") from exc
+
+
 def _to_dict(r: "schema.AgentRun") -> dict:
     return {
         "id": str(r.id), "user_id": str(r.user_id), "domain": r.domain, "status": r.status,
+        # The conversation this run belongs to. It used to be dropped here, so a caller holding a run
+        # dict could not tell whose thread the goal was — and `goal_runtime` had to keep a second
+        # row-to-dict of its own just to see the column. Shaped identically to that one (str or None) so
+        # the two agree by construction; "" is never emitted, because unattributed is None.
+        "conversation_id": str(r.conversation_id) if r.conversation_id else None,
         "goal": r.goal, "temporal": r.temporal, "selected_entity_id": str(r.selected_entity_id) if r.selected_entity_id else None,
         "selected_provider_account": r.selected_provider_account, "current_action": r.current_action,
         "last_tool_result": r.last_tool_result, "verification_result": r.verification_result,
@@ -285,7 +317,8 @@ def _to_dict(r: "schema.AgentRun") -> dict:
     }
 
 
-async def create_run(user_id: UUID, *, domain: str = "calendar", goal: dict | None = None,
+async def create_run(user_id: UUID, *, domain: str = "calendar", conversation_id: str | UUID | None = None,
+                     goal: dict | None = None,
                      mission_id: UUID | None = None, idempotency_key: str | None = None,
                      status: str = "understanding", next_run_at: datetime | None = None) -> dict:
     """Create (or reference, if idempotency_key already exists) the run + its first event, atomically.
@@ -294,9 +327,21 @@ async def create_run(user_id: UUID, *, domain: str = "calendar", goal: dict | No
 
     A creation is not a transition — there is no `current` to move from — but the WORD still has to be one
     the machine knows, or the run starts life in a state nothing can legally move it out of and the CHECK
-    constraint refuses it a layer later with a much worse error."""
+    constraint refuses it a layer later with a much worse error.
+
+    `conversation_id` records WHICH THREAD this run belongs to. The column has existed since migration
+    0023 and this parameter did not, so every run ever created through the store had NULL there — which
+    is why `goal_runtime` had to write the same attribution into the goal blob as a fallback. A run with
+    no conversation is not the same claim as a run whose conversation is unknown, and only the caller
+    knows which one it has, so this stays optional and None keeps meaning UNATTRIBUTED.
+
+    On the idempotent path the existing run is REFERENCED, not re-attributed: a second create with the
+    same key returns the row as it stands. Reassigning a live goal to whichever conversation asked for it
+    last is precisely the cross-thread confusion the column exists to prevent.
+    """
     if status not in STATUS_VOCABULARY:
         raise IllegalStatusWrite("", status, UNKNOWN_STATUS)
+    conversation_uuid = _conversation_uuid(conversation_id)
     async with user_session(user_id) as s:
         if idempotency_key:
             ex = (await s.execute(select(schema.AgentRun).where(
@@ -304,7 +349,8 @@ async def create_run(user_id: UUID, *, domain: str = "calendar", goal: dict | No
                 schema.AgentRun.idempotency_key == idempotency_key))).scalar_one_or_none()
             if ex is not None:
                 return _to_dict(ex)
-        run = schema.AgentRun(user_id=user_id, domain=domain, status=status, goal=goal or {},
+        run = schema.AgentRun(user_id=user_id, domain=domain, conversation_id=conversation_uuid,
+                              status=status, goal=goal or {},
                               mission_id=mission_id, idempotency_key=idempotency_key, next_run_at=next_run_at)
         s.add(run)
         try:

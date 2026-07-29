@@ -123,7 +123,14 @@ class ResolvedReply:
 @dataclass
 class OutcomeContext:
     """Inputs a handler may read + the collaborators execute() needs. APPEND-ONLY. Handlers must not
-    mutate durable state during evaluate()."""
+    mutate durable state during evaluate().
+
+    THE SNAPSHOT FIELDS BELOW ARE THE POINT OF THE BRAIN SPINE. Every one of them is state the RUNTIME
+    fetched exactly once, before anything reasoned, and handed over. A handler that went back to the
+    database for its own copy would be rebuilding the defect the transcript exposed: three paths each
+    deriving their own view of one turn, and the student getting the least informed one. They default to
+    None/empty so every existing handler and every existing test is untouched by their arrival.
+    """
     user_id: UUID
     decision: "ConversationDecision"
     capsule: "ContextCapsule"
@@ -133,6 +140,13 @@ class OutcomeContext:
     pmid: str
     style: "ConversationStyleEngine"
     store: object                      # conversation_store module
+    # --- the one snapshot, assembled once per turn (turn_context_assembler.assemble) ---------------------
+    turn_context: object = None        # turn_context.TurnContext — live capability truth + open work
+    continuation: object = None        # continuation.Continuation — what this turn does to work in flight
+    open_goal: dict | None = None      # the newest open AgentRun that declares a typed goal kind
+    conversation_id: str = ""          # which thread this turn (and any goal it opens) belongs to
+    turn_index: int = 0                # position in the conversation; orders slot values deterministically
+    mission_lane_ran: bool = False     # the background-mission lane already acted, so nothing else may
 
 
 @runtime_checkable
@@ -610,9 +624,17 @@ class DefaultReplyHandler:
 
 def default_handlers() -> list[OutcomeHandler]:
     """Claim-candidate handlers, evaluated every turn (pure). Ordering is by explicit priority, not list
-    position. A workstream inserts its handler here with a stable priority."""
-    return [CalendarApprovalHandler(), WorldStateHandler(), CalendarMutationHandler(), CalendarScheduleHandler(),
-            StatusQueryHandler(), MissionHandoffHandler(), EventCandidateHandler()]
+    position. A workstream inserts its handler here with a stable priority.
+
+    `GoalHandler` sits at the top (90) because an answer that advances work already in flight outranks
+    starting anything new — the transcript's second turn was an answer to Bruce's own question and was
+    routed as a brand-new, subjectless request. It claims narrowly (a capability with a declared slot set
+    AND an executor behind it), so every handler below keeps the turns it owns today.
+    """
+    from .goal_handler import GoalHandler
+    return [GoalHandler(), CalendarApprovalHandler(), WorldStateHandler(), CalendarMutationHandler(),
+            CalendarScheduleHandler(), StatusQueryHandler(), MissionHandoffHandler(),
+            EventCandidateHandler()]
 
 
 def default_fallback() -> OutcomeHandler:
