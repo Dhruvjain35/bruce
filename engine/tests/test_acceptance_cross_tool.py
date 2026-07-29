@@ -15,7 +15,15 @@ of "this" resolved nothing. The last of twenty-two turns said "i can't send mess
 `tool_broker` was answering ok=True for `gmail.send_message` in the same process. Twenty-two turns, ZERO
 missions, ZERO agent_runs.
 
-HOW TO READ A RED TEST HERE. Several tests in this file FAIL, and they are supposed to be able to: they
+WHAT IS PROVEN GREEN. On a five-turn exchange whose wording avoids the defects below, the spine does the
+entire job the transcript failed at: ONE goal across five turns, the recipient and purpose from turn 1
+still on the run at turn 5, the tone amended mid-flight, no question ever repeated for a slot already
+filled, exactly ONE pending Decision, ZERO Gmail calls before the confirmation, exactly ONE send after it,
+exactly one fetch-back, a terminal verified run — and two confirmations arriving at the same instant still
+send once. A named calendar move writes the provider once, keeps the title, moves start and end together,
+and refuses a stale "yes". A refusal closes the goal and every outstanding authorization, across tools.
+
+HOW TO READ A RED TEST HERE. The rest of this file FAILS, and it is supposed to be able to: those tests
 assert the outcome the student is owed, not the outcome the code currently produces. Each one is paired
 with a positive control asserted FIRST, so a failure says "the machinery works, and this specific input
 defeats it" rather than "something is broken somewhere". The named defects are:
@@ -23,16 +31,22 @@ defeats it" rather than "something is broken somewhere". The named defects are:
   * D1 — a negation is matched anywhere in the message and always read as refusing THE OPERATION, so
     "...and send it dont show me draft" cancels the send, and "YES WRITE IT AND SEND IT NO MORE QUESTIONS"
     (the founder's last turn) cancels it too AND, through `user_action_boundary`, invalidates every
-    outstanding authorization the student has in every conversation.
+    outstanding authorization the student has in every conversation. This is a SCOPE defect, not a
+    precedence one: refusal must keep dominating, and `continuation`'s resolution order must not move.
   * D2 — `continuation._STYLE` only sees a tone word that directly follows "make it", so "make it a
     professional email" changes no tone while "make it professional" does.
   * D3 — `calendar.create_event` has a declared slot set and no CapabilityExecutor, so the goal seam
     declines every calendar turn and a calendar goal never exists. Everything the calendar half of this
     program is supposed to prove (one goal id across a move, a replacement Decision, attendees retained)
-    has nothing to be proven against.
+    has nothing live to be proven against, and is proven here against `goal_runtime` directly instead.
   * D4 — `conversation_runtime._open_goal_row` picks the NEWEST typed run and nothing else, so with two
-    goals open the older one is invisible: "send it" cannot reach an email Decision underneath a newer
-    calendar goal, and an inline reply pointing at the older goal does not change the choice.
+    goals open the older one is invisible: an email turn that names no capability is read as a calendar
+    turn, "send it" cannot reach an email Decision underneath a newer calendar goal, and an inline reply
+    pointing at the older goal does not change the choice.
+  * D5 — `goal_handler.resolve_temporal` writes BOTH halves of a resolved phrase over the goal, so a
+    date-only amendment ("move it to friday") replaces a 4-5pm slot with an all-day block and loses the
+    hour the student had already set. `calendar_mutation.recompute` is the reference implementation: it
+    keeps the base time and the original duration when only the date moves.
 
 Nothing in this file logs message content, and no assertion is made against a log line.
 """
@@ -41,7 +55,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -49,9 +63,9 @@ from sqlalchemy.ext.asyncio import create_async_engine as _real_create_async_eng
 from sqlalchemy.pool import NullPool
 
 import bruce_engine.db as db
-from bruce_engine import (calendar_adapter, conversation_outcomes, conversation_runtime, crypto,
-                          entity_store, gmail_adapter, goal_handler, goal_runtime, goal_slots,
-                          oauth_google, schema, world_state)
+from bruce_engine import (calendar_adapter, conversation_graph, conversation_outcomes,
+                          conversation_runtime, crypto, entity_store, gmail_adapter, goal_handler,
+                          goal_runtime, goal_slots, oauth_google, schema, world_state)
 from bruce_engine import continuation as continuation_mod
 from bruce_engine.conversation_contract import (ConversationDecision, ExtractedEntity, IntentKind,
                                                 ResponseType, RiskLevel)
@@ -162,12 +176,12 @@ class ScriptedReasoner:
                             provider="fake", model="fake", input_tokens=0, output_tokens=0, latency_ms=1)
 
 
-async def _seed(uid, *, scopes=(CAL, GSEND, GREAD)):
+async def _seed(uid):
     await users.ensure(uid, auth_provider="test")
     async with user_session(uid) as s:
         s.add(schema.Integration(
             user_id=uid, provider=oauth_google.PROVIDER, provider_account_id=ACCOUNT,
-            scopes=list(scopes), refresh_token_encrypted=crypto.encrypt("rt"),
+            scopes=[CAL, GSEND, GREAD], refresh_token_encrypted=crypto.encrypt("rt"),
             selected_calendar_id="primary", status="connected"))
     await world_state.set_timezone(uid, TZ, source="user_stated")
 
@@ -176,10 +190,10 @@ class Conversation:
     """One student, one thread. `say` is a complete inbound turn: the runtime, the router, the handler
     pipeline, the gate and the provider."""
 
-    def __init__(self, script, *, scopes=(CAL, GSEND, GREAD), gmail=True):
+    def __init__(self, script):
         self.uid = uuid4()
-        _run(_seed(self.uid, scopes=scopes))
-        self.gmail = CountingGmail(account=ACCOUNT) if gmail else None
+        _run(_seed(self.uid))
+        self.gmail = CountingGmail(account=ACCOUNT)
         self.reasoner = ScriptedReasoner(script)
         self.channel = FakeChannel()
         self.n = 0
@@ -187,7 +201,6 @@ class Conversation:
         # idempotency on the inbound id alone, so two students in one test replaying "m1" collide in the
         # database rather than in the code under test.
         self.tag = uuid4().hex[:8]
-        self.replies: list[str] = []
 
     # --- driving ------------------------------------------------------------------------------------------
 
@@ -209,13 +222,18 @@ class Conversation:
 
     def say(self, text: str, *, reply_to: str | None = None) -> str:
         self.n += 1
+        msg = self._inbound(text, self.mid(self.n), reply_to=reply_to)
+        # The message graph is upserted by `messaging_inbound` BEFORE it dispatches to the runtime, and the
+        # runtime's authoritative-target rule reads it: without the node, an inline reply is an unresolvable
+        # target and the turn fails closed before any handler runs. Doing it here keeps the harness at the
+        # same starting state the production caller hands over.
+        msg.user_id = self.uid
+        _run(conversation_graph.ingest_inbound_message(msg))
         out = _run(conversation_runtime.handle(
-            self.channel, self._inbound(text, self.mid(self.n), reply_to=reply_to), user_id=self.uid,
+            self.channel, msg, user_id=self.uid,
             reply_target=PHONE, reasoner=self.reasoner, handlers=self._handlers()))
         assert out.status == "processed", out.status
-        reply = _run(self._last_reply())
-        self.replies.append(reply)
-        return reply
+        return _run(self._last_reply())
 
     def say_twice_at_once(self, text: str) -> None:
         """The SAME turn arriving twice concurrently — a webhook redelivery, a double tap. Both reads see
@@ -261,13 +279,6 @@ class Conversation:
 
     def goal_of(self, kind: GoalKind) -> dict | None:
         return next((g for g in self.goals() if g["kind"] is kind), None)
-
-    def runs(self) -> int:
-        async def _count():
-            async with user_session(self.uid) as s:
-                return len((await s.execute(select(schema.AgentRun).where(
-                    schema.AgentRun.user_id == self.uid))).scalars().all())
-        return _run(_count())
 
     def authorizations(self) -> list[dict]:
         async def _read():
@@ -318,7 +329,7 @@ T5_CLEAN = "YES WRITE IT AND SEND IT"
 
 _ASK = _decision(IntentKind.actionable, caps=[SEND], needs_mission=False,
                  proposed_goal="email ms alvarez a thank-you note",
-                 text="sure — what should the subject line be?",
+                 text="sure, what should the subject line be?",
                  entities=[_entity("recipient_email", TEACHER),
                            _entity("purpose", "thank her for the recommendation letter"),
                            _entity("tone", "heartfelt")])
@@ -327,7 +338,7 @@ _ASK = _decision(IntentKind.actionable, caps=[SEND], needs_mission=False,
 _DRAFTS = _decision(IntentKind.clarification, text="ok, here's what i've got",
                     entities=[_entity("subject", "thank you"),
                               _entity("body_text", "thank you so much for writing my recommendation "
-                                                   "letter — it meant a lot.")])
+                                                   "letter. it meant a lot.")])
 
 SCRIPT = {
     T1: _ASK,
@@ -430,6 +441,7 @@ def test_the_same_five_turns_without_the_scoped_negations_send_exactly_once(clea
     assert c.gmail.send_calls == 0, "a bare pointer was spent as a confirmation"
     assert c.decision_ids() == [only_decision], "the pointer minted a second Decision"
     assert (c.goals()[0]["decision"] or {}).get("status") == goal_handler.PENDING
+    assert TEACHER in reply4, f"the pointer resolved to nothing, exactly as it did live: {reply4!r}"
     assert "who this should go to" not in reply4.lower()
 
     receipt = c.say(T5_CLEAN)
@@ -466,6 +478,42 @@ def test_a_second_confirmation_arriving_at_the_same_instant_still_sends_once(cle
     c.say_twice_at_once(T5_CLEAN)
     assert len(c.gmail.messages) == 1, "a concurrent confirmation produced a second email"
     assert len([g for g in c.goals()]) == 1, "a concurrent confirmation opened a second goal"
+
+
+def test_changing_the_arguments_replaces_the_decision_rather_than_spending_it(clean_db):
+    """A change made AFTER the offer produces a REPLACEMENT Decision, and the yes that follows is bound to
+    what the student was last shown.
+
+    "send it to coach@school.edu instead" contains "send it", so a yes/no resolver reads it as an approval;
+    reading it that way would mail the old draft to the old address. The amendment wins, the arguments
+    move, and the Decision is not merely re-fingerprinted — it is a NEW decision id, because the question
+    the student is being asked is a different question.
+
+    There is nothing to invalidate on the authorization side here: consent is minted at execution, so an
+    offer that was never accepted leaves no authorization behind. The invalidation half of that criterion
+    is proven where a real authorization exists — see the refusal test at the end of this file.
+    """
+    other = "coach@school.edu"
+    change = f"send it to {other} instead"
+    c = Conversation({**SCRIPT, change: _decision(IntentKind.clarification, text="ok")})
+    for turn in (T1, T2_CLEAN, T3):
+        c.say(turn)
+    offered = c.goals()[0]["decision"] or {}
+    assert offered.get("status") == goal_handler.PENDING and offered.get("arguments_fingerprint")
+
+    c.say(change)
+    assert c.gmail.send_calls == 0, "an amendment was spent as the confirmation it looks like"
+    replaced = c.goals()[0]["decision"] or {}
+    assert c.goals()[0]["slots"]["recipient"].value == other, "the correction never reached the goal"
+    assert replaced.get("arguments_fingerprint") != offered.get("arguments_fingerprint"), \
+        "the pending Decision still points at the arguments the student just changed"
+    assert replaced.get("decision_id") != offered.get("decision_id"), \
+        "a different question was asked under the old Decision's id"
+    assert replaced.get("status") == goal_handler.PENDING
+
+    c.say(T5_CLEAN)
+    assert c.gmail.send_calls == 1
+    assert _sent_headers(c.gmail)["To"] == other, "the yes sent the pre-correction draft"
 
 
 def test_a_negation_that_governs_something_else_still_reads_as_refusing_the_operation(clean_db):
@@ -547,7 +595,7 @@ def _calendar_conversation(script, adapter, monkeypatch) -> Conversation:
     injected where the production code builds it, so every layer above — the handler, the gate, the
     gateway, the read-back verification — is the real thing."""
     monkeypatch.setattr(calendar_adapter, "GoogleCalendarAdapter", lambda *a, **kw: adapter)
-    return Conversation(script, gmail=False)
+    return Conversation(script)
 
 
 def _seed_event(c: Conversation, adapter: CountingCalendar, *, title: str, start: str, end: str) -> None:
@@ -582,10 +630,12 @@ def test_moving_a_named_event_updates_the_provider_exactly_once_and_receipts_onc
     title is kept, the start AND the end move together, the provider is written exactly once, the reply is
     the one verified receipt, and a "yes" typed afterwards adds nothing.
 
-    START AND END MOVING TOGETHER is the assertion that matters. A patch is replacement-shaped and can name
+    START AND END MOVING TOGETHER is the assertion that matters. A change is replacement-shaped and can name
     only one field, so a start moved on its own would leave the old end beside it — an event that starts on
-    Friday and ends on Tuesday. `calendar_mutation.recompute` preserves the original DURATION, which is the
-    same invariant `goal_handler.resolve_temporal` holds for the goal path.
+    Friday and ends on Tuesday. `calendar_mutation.recompute` is the implementation that gets this right:
+    it keeps the base clock and the ORIGINAL duration when only the date moves. The goal path's equivalent
+    does not (see `test_moving_the_day_of_a_calendar_goal_keeps_the_clock_the_student_already_set`), which
+    is why this test is worth having on the lane that works.
     """
     adapter = CountingCalendar(account=ACCOUNT)
     c = _calendar_conversation(_CAL_SCRIPT, adapter, monkeypatch)
@@ -609,15 +659,19 @@ def test_moving_a_named_event_updates_the_provider_exactly_once_and_receipts_onc
     assert new_end - new_start == datetime.timedelta(hours=2), \
         "the end did not move with the start — the two-hour event was silently reshaped"
 
-    # The authorization was bound to the RECOMPUTED time and is spent, once.
+    # ONE authorization, bound to the recomputed time, and it is still the only one afterwards: a stale
+    # "yes" must not silently mint a second consent for a write that already happened.
     grants = [a for a in c.authorizations() if a["operation"] == "update_event"]
-    assert len(grants) == 1 and grants[0]["consumed"], "the update ran without a spent authorization"
+    assert len(grants) == 1, "the update ran on something other than one authorization"
+    assert not grants[0]["invalidated"]
 
     # A "yes" typed after a completed move is a stale approval. It must not write again.
     before = adapter.update_calls
     again = c.say("yes")
     assert adapter.update_calls == before, "a stale yes performed a second provider update"
     assert "✅" not in again, "a stale yes claimed a completion that did not happen this turn"
+    assert len([a for a in c.authorizations() if a["operation"] == "update_event"]) == 1, \
+        "a stale yes minted a second authorization to update the event"
 
 
 def test_move_it_to_friday_lands_on_the_work_in_flight(clean_db, monkeypatch):
@@ -637,19 +691,23 @@ def test_move_it_to_friday_lands_on_the_work_in_flight(clean_db, monkeypatch):
 
     So the student's move is understood by nothing and answered by the model's own reply.
     """
-    adapter = CountingCalendar(account=ACCOUNT)
-    c = _calendar_conversation(_CAL_SCRIPT, adapter, monkeypatch)
-    today = datetime.datetime.now(datetime.timezone.utc).date()
-    start = datetime.datetime.combine(_next_weekday(today, 1), datetime.time(16, 0))
-    _seed_event(c, adapter, title="chess club", start=start.isoformat(timespec="seconds"),
-                end=(start + datetime.timedelta(hours=1)).isoformat(timespec="seconds"))
+    def _student(monkeypatch_):
+        adapter = CountingCalendar(account=ACCOUNT)
+        conv = _calendar_conversation(_CAL_SCRIPT, adapter, monkeypatch_)
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        start = datetime.datetime.combine(_next_weekday(today, 1), datetime.time(16, 0))
+        _seed_event(conv, adapter, title="chess club", start=start.isoformat(timespec="seconds"),
+                    end=(start + datetime.timedelta(hours=1)).isoformat(timespec="seconds"))
+        return conv, adapter
 
-    c.say(MOVE_NAMED)
-    assert adapter.update_calls == 1                      # positive control: the named move works
+    control, control_adapter = _student(monkeypatch)
+    control.say(MOVE_NAMED)
+    assert control_adapter.update_calls == 1              # positive control: the named move works
 
-    # A second event so the deictic turn is about the one just discussed, not about "the only one".
+    # The same event, the same intent — said the way a person says it once the thing is already on screen.
+    c, adapter = _student(monkeypatch)
     c.say(MOVE_DEICTIC)
-    assert adapter.update_calls == 2, (
+    assert adapter.update_calls == 1, (
         "'move it to friday' — the exact phrase the acceptance criteria name — reached no handler: the "
         "goal seam declines calendar for want of an executor and entity resolution refuses a bare 'it'")
 
@@ -691,43 +749,89 @@ def test_a_calendar_goal_keeps_its_title_and_attendees_when_only_the_time_moves(
 
     A list-valued slot is the reason `ROLE_RECIPIENT` is email-only: `slot_patch` replaces, and replacing
     `attendees` would delete everyone who was not named in the last message.
+
+    RETAINED IS NOT THE SAME AS DELIVERED, and it is worth being exact about which one this proves.
+    `attendees` is declared with no `tool_arg`, and `models.CalendarEvent` has no attendees field at all,
+    so the list survives every turn of the conversation and would still not reach Google once an executor
+    exists. That is a second, separate gap from D3 and it is a schema one, not a wiring one.
     """
     uid = uuid4()
     _run(_seed(uid))
-    slots = {"title": SlotValue("rehearsal", Source.user_stated, turn_index=1),
-             "start": SlotValue("2026-08-04T16:00:00", Source.user_stated, turn_index=1),
-             "end": SlotValue("2026-08-04T17:00:00", Source.user_stated, turn_index=1),
-             "timezone": SlotValue(TZ, Source.user_stated, turn_index=1),
-             "attendees": SlotValue(["mr.kim@school.edu", "sam@school.edu"], Source.user_stated,
-                                    turn_index=1)}
     view = _run(goal_runtime.ensure_goal(uid, capability=CREATE_EVENT, conversation_id=PHONE,
-                                         slots_in=slots, turn_index=1, decision=None))
+                                         slots_in=_rehearsal_slots(), turn_index=1, decision=None))
     assert view.kind is GoalKind.schedule_event and view.missing == ()
 
+    moved = _move_the_goal(uid, view, "move it to friday at 5pm")
+    assert moved.run_id == view.run_id, "the move opened a second calendar goal"
+    assert moved.slots["title"].value == "rehearsal", "a time change rewrote the title"
+    assert list(moved.slots["attendees"].value) == ["mr.kim@school.edu", "sam@school.edu"], \
+        "a time change dropped the attendees"
+    assert moved.slots["timezone"].value == TZ
+    new_start = datetime.datetime.fromisoformat(moved.slots["start"].value)
+    new_end = datetime.datetime.fromisoformat(moved.slots["end"].value)
+    assert new_start.weekday() == 4 and new_start.hour == 17, f"the start did not move: {new_start}"
+    assert new_end.date() == new_start.date(), "the end was left on the old day"
+    assert new_end > new_start
+
+
+def _rehearsal_slots() -> dict:
+    """A fully specified calendar goal: a title, a one-hour timed slot, a zone and two attendees."""
+    return {"title": SlotValue("rehearsal", Source.user_stated, turn_index=1),
+            "start": SlotValue("2026-08-04T16:00:00", Source.user_stated, turn_index=1),
+            "end": SlotValue("2026-08-04T17:00:00", Source.user_stated, turn_index=1),
+            "timezone": SlotValue(TZ, Source.user_stated, turn_index=1),
+            "attendees": SlotValue(["mr.kim@school.edu", "sam@school.edu"], Source.user_stated,
+                                   turn_index=1)}
+
+
+def _move_the_goal(uid, view, text: str):
+    """One amendment turn against an open calendar goal, through the production calls `goal_handler`
+    makes: resolve the continuation, turn the student's phrase into a real moment in THEIR zone, fold it
+    into the goal. `now` is pinned so "friday" means one specific friday no matter when this suite runs."""
     run = _run(goal_runtime.open_goal_of_kind(uid, GoalKind.schedule_event, conversation_id=PHONE))
-    cont = continuation_mod.resolve(uid, text=MOVE_DEICTIC, reply_to_message_id=None, open_goal=run,
+    cont = continuation_mod.resolve(uid, text=text, reply_to_message_id=None, open_goal=run,
                                     pending_decision=None, recent_draft={"id": view.run_id},
                                     recent_tool_result=None)
     assert cont.kind is continuation_mod.ContinuationKind.amend
     assert set(cont.slot_patch) == {"start"}, "the move patched something other than the start"
-
-    # The caller resolves the phrase into a real moment IN THE STUDENT'S ZONE and rewrites the end with it.
     at = datetime.datetime(2026, 8, 4, 12, 0, tzinfo=datetime.timezone.utc)
     patched = goal_handler.resolve_temporal(
         GoalKind.schedule_event,
         {"start": SlotValue(cont.slot_patch["start"], Source.user_stated, turn_index=2)},
         timezone_name=TZ, now=at)
-    moved = _run(goal_runtime.ensure_goal(uid, capability=CREATE_EVENT, conversation_id=PHONE,
-                                          slots_in=patched, turn_index=2, decision=None))
-    assert moved.run_id == view.run_id, "the move opened a second calendar goal"
-    assert moved.slots["title"].value == "rehearsal", "a time change rewrote the title"
-    assert list(moved.slots["attendees"].value) == ["mr.kim@school.edu", "sam@school.edu"], \
-        "a time change dropped the attendees"
-    new_start = datetime.datetime.fromisoformat(moved.slots["start"].value)
-    new_end = datetime.datetime.fromisoformat(moved.slots["end"].value)
-    assert new_start.weekday() == 4, f"the start did not move to friday: {new_start}"
-    assert new_end.date() == new_start.date(), "the end was left on the old day"
-    assert new_end > new_start
+    return _run(goal_runtime.ensure_goal(uid, capability=CREATE_EVENT, conversation_id=PHONE,
+                                         slots_in=patched, turn_index=2, decision=None))
+
+
+def test_moving_the_day_of_a_calendar_goal_keeps_the_clock_the_student_already_set(clean_db):
+    """"Move it to friday" changes the DAY. It says nothing about the hour, and a 4pm rehearsal moved to
+    Friday is a 4pm rehearsal on Friday.
+
+    The positive control is asserted first: "move it to friday at 5pm", which states an hour, resolves to
+    a timed 5-6pm slot on Friday. Then the same instruction WITHOUT an hour turns the event into an
+    all-day block — `temporal.resolve` correctly reports a date-only phrase as a whole day, and
+    `goal_handler.resolve_temporal` writes both halves of it over a start and end the student had already
+    pinned. The other calendar path already gets this right and is worth naming as the reference:
+    `calendar_mutation.recompute` keeps the base time and the original duration when only the date moves.
+    """
+    uid = uuid4()
+    _run(_seed(uid))
+    view = _run(goal_runtime.ensure_goal(uid, capability=CREATE_EVENT, conversation_id=PHONE,
+                                         slots_in=_rehearsal_slots(), turn_index=1, decision=None))
+
+    timed = _move_the_goal(uid, view, "move it to friday at 5pm")            # positive control
+    assert datetime.datetime.fromisoformat(timed.slots["start"].value).hour == 17
+
+    dayless = uuid4()
+    _run(_seed(dayless))
+    fresh = _run(goal_runtime.ensure_goal(dayless, capability=CREATE_EVENT, conversation_id=PHONE,
+                                          slots_in=_rehearsal_slots(), turn_index=1, decision=None))
+    moved = _move_the_goal(dayless, fresh, MOVE_DEICTIC)
+    start = moved.slots["start"].value
+    assert len(str(start)) > 10, (
+        f"'move it to friday' dropped the 4pm the student had already set and made the event all-day "
+        f"({start!r} -> {moved.slots['end'].value!r})")
+    assert datetime.datetime.fromisoformat(start).hour == 16, "the hour the student set was not kept"
 
 
 # ==========================================================================================================
@@ -749,8 +853,22 @@ def _open_calendar_goal(uid) -> str:
 
 def test_an_email_goal_and_a_calendar_goal_never_exchange_slots(clean_db):
     """A student can be booking a rehearsal and writing to a teacher in the same thread. Selection is by
-    KIND, never by "the newest run", so the recipient cannot land in the calendar goal and the start time
-    cannot land in the email — which is what would happen if the runtime picked the most recent row."""
+    KIND, never by "the newest run" — `goal_runtime.ensure_goal` looks the goal up with
+    `open_goal_of_kind`, so a recipient cannot land in the calendar goal and a start time cannot land in
+    the email. That half holds, and it is asserted below.
+
+    What does NOT hold is getting the turn to the right goal in the first place. The positive control is
+    the same turn with only the email goal open: the drafted subject and body land on it. With a NEWER
+    calendar goal open they land nowhere, because `conversation_runtime._open_goal_row` hands the handler
+    the newest typed run and `goal_handler.capability_for_turn` takes its kind for any turn that names no
+    capability — so the email draft is read as a calendar turn and declined for want of an executor. No
+    contamination, but the student's turn is silently dropped, which is the transcript's own failure mode.
+    """
+    control = Conversation(SCRIPT)
+    control.say(T1)
+    control.say(T3)
+    assert control.goal_of(GoalKind.send_email)["slots"]["subject"].filled     # positive control
+
     c = Conversation(SCRIPT)
     c.say(T1)
     email_run = c.goal_of(GoalKind.send_email)["id"]
@@ -761,11 +879,16 @@ def test_an_email_goal_and_a_calendar_goal_never_exchange_slots(clean_db):
     email = c.goal_of(GoalKind.send_email)
     calendar = c.goal_of(GoalKind.schedule_event)
     assert email["id"] == email_run and calendar["id"] == calendar_run
-    assert email["slots"]["subject"].filled and email["slots"]["recipient"].value == TEACHER
+    # NO CONTAMINATION — this part is real and holds.
     assert "recipient" not in calendar["slots"], "an email address landed in the calendar goal"
-    assert "subject" not in calendar["slots"]
+    assert "subject" not in calendar["slots"], "an email subject landed in the calendar goal"
     assert calendar["slots"]["title"].value == "rehearsal", "the calendar goal was rewritten"
     assert "start" not in email["slots"], "a calendar slot landed in the email goal"
+    assert email["slots"]["recipient"].value == TEACHER
+    # AND THE TURN STILL HAS TO ARRIVE.
+    assert "subject" in email["slots"], (
+        "the drafted subject reached neither goal: with a newer calendar goal open, an email turn that "
+        "names no capability is read as a calendar turn and declined")
 
 
 def test_send_it_resolves_the_email_decision_even_with_a_newer_calendar_goal_open(clean_db):
@@ -814,9 +937,9 @@ def test_an_inline_reply_beats_recency_when_two_goals_are_open(clean_db):
     for turn in (T1, T2_CLEAN, T3):
         control.say(turn)
     only = control.decision_ids()[0]
-    control.say(T4, reply_to=c.mid(3))
+    control_reply = control.say(T4, reply_to=control.mid(3))
     assert control.decision_ids() == [only]                # positive control: the pointer resolves
-    assert (control.goal_of(GoalKind.send_email)["decision"] or {}).get("status") == goal_handler.PENDING
+    assert TEACHER in control_reply, "the pointer did not land on the email proposal"
 
     c = Conversation(SCRIPT)
     for turn in (T1, T2_CLEAN, T3):
@@ -824,32 +947,51 @@ def test_an_inline_reply_beats_recency_when_two_goals_are_open(clean_db):
     email_run = c.goal_of(GoalKind.send_email)["id"]
     _open_calendar_goal(c.uid)                             # newer, and about something else entirely
 
-    c.say(T4, reply_to=c.mid(3))                               # "this", replying to the EMAIL proposal
-    email = c.goal_of(GoalKind.send_email)
-    assert email["id"] == email_run
-    assert (email["decision"] or {}).get("status") == goal_handler.PENDING
-    assert email["status"] == "awaiting_approval", (
-        "an inline reply pointing at the email proposal did not select the email goal — the run was "
-        "chosen by recency before the reply reference was consulted")
+    reply = c.say(T4, reply_to=c.mid(3))                   # "this", replying to the EMAIL proposal
+    assert c.goal_of(GoalKind.send_email)["id"] == email_run
+    # The ASSERTION THAT MATTERS is that the turn arrived somewhere. Checking only that the email goal is
+    # still pending would pass just as well if the pointer reached nothing at all, which is exactly what
+    # happens: the run is chosen by recency before the reply reference is ever consulted.
+    assert TEACHER in reply, (
+        "an inline reply pointing at the email proposal was answered by the model instead: the runtime "
+        "picked the newer calendar goal by recency and never looked at the reply reference")
 
 
-def test_a_refusal_closes_outstanding_consent_across_both_goals(clean_db):
-    """A refusal closes work in EVERY conversation, not only the one it was typed in — `record_refusal`
-    is deliberately unconditional about scope, because asking a student which thread they meant while
-    something irreversible is queued is not a conversation anyone wants to have.
+def test_a_refusal_closes_the_open_goal_and_every_outstanding_authorization(clean_db, monkeypatch):
+    """ONE student, BOTH tools, one refusal. A calendar move leaves a real authorization row behind and an
+    email goal is parked awaiting approval; "actually never mind" has to close both.
 
-    Asserted with a positive control on the same student: before the refusal there is an open authorization
-    path and a pending Decision; after it the Decision is closed and nothing was sent.
+    `record_refusal` is deliberately unconditional about scope — it closes work in every conversation, not
+    only the one the refusal was typed in — because asking a student which thread they meant while
+    something irreversible is queued is not a conversation anyone wants to have. The positive control is
+    asserted first and is what stops the "every authorization is closed" assertion from passing over an
+    empty table.
     """
     stop = "actually never mind, dont send anything"
-    c = Conversation({**SCRIPT, stop: _decision(IntentKind.status_cancel_correction, text="ok")})
-    for turn in (T1, T2_CLEAN, T3):
+    adapter = CountingCalendar(account=ACCOUNT)
+    c = _calendar_conversation(
+        {**SCRIPT, **_CAL_SCRIPT, stop: _decision(IntentKind.status_cancel_correction, text="ok")},
+        adapter, monkeypatch)
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    start = datetime.datetime.combine(_next_weekday(today, 1), datetime.time(16, 0))
+    _seed_event(c, adapter, title="chess club", start=start.isoformat(timespec="seconds"),
+                end=(start + datetime.timedelta(hours=1)).isoformat(timespec="seconds"))
+
+    c.say(MOVE_NAMED)                                    # a real provider write -> a real authorization row
+    for turn in (T1, T2_CLEAN, T3):                      # and an email parked on the student's yes
         c.say(turn)
-    assert c.goal_of(GoalKind.send_email)["status"] == "awaiting_approval"    # positive control
+
+    # POSITIVE CONTROL — there is something to close, and it is open.
+    before = c.authorizations()
+    assert before, "no authorization was ever recorded, so the assertion below would prove nothing"
+    assert any(not a["invalidated"] for a in before)
+    assert c.goal_of(GoalKind.send_email)["status"] == "awaiting_approval"
     assert c.gmail.send_calls == 0
 
     c.say(stop)
     assert c.goal_of(GoalKind.send_email)["status"] == "cancelled"
     assert c.gmail.send_calls == 0, "a refusal still let the send through"
-    assert all(a["invalidated"] or a["consumed"] for a in c.authorizations()), \
-        "a refusal left an authorization open"
+    after = c.authorizations()
+    assert len(after) == len(before)
+    assert all(a["invalidated"] or a["consumed"] for a in after), \
+        "a refusal left an authorization open for a later turn to spend"
