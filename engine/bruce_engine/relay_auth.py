@@ -32,6 +32,20 @@ class RelayAuthError(Exception):
     """Authentication failed — bad/revoked credential, or a replayed (stale-timestamp) request."""
 
 
+class RelayAuthTransientError(RelayAuthError):
+    """The CREDENTIAL is fine; this one REQUEST was not acceptable (stale or malformed timestamp).
+
+    Split out because the relay cannot tell these apart from the outside, and guessing wrong is
+    expensive in both directions: treating a revocation as transient leaves a revoked device polling
+    forever, and treating a clock blip as a revocation parks a healthy relay until a human notices.
+    On 2026-07-28 the second one happened — one stale-timestamp 401 during a 6.5-minute network
+    transition parked the relay for 11.9 hours with a perfectly valid credential.
+
+    Subclasses RelayAuthError so every existing `except RelayAuthError` still refuses the request:
+    this changes what the caller is TOLD, never whether the request is allowed.
+    """
+
+
 class BootstrapError(RelayAuthError):
     """Bootstrap device registration was refused (bad/expired/used token, env/device mismatch, rate limit)."""
 
@@ -156,9 +170,9 @@ async def authenticate(secret: str, *, timestamp: str | None = None,
         try:
             sent_at = datetime.datetime.fromisoformat(timestamp)
         except ValueError as exc:
-            raise RelayAuthError("bad timestamp") from exc
+            raise RelayAuthTransientError("bad timestamp") from exc
         if abs((now - sent_at).total_seconds()) > REPLAY_WINDOW.total_seconds():
-            raise RelayAuthError("stale request (replay)")
+            raise RelayAuthTransientError("stale request (replay)")
 
     h = _hash(secret)
     async with worker_session() as s:

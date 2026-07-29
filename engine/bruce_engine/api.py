@@ -547,7 +547,12 @@ async def current_relay_device(
     try:
         return await relay_auth.authenticate(authorization[7:], timestamp=x_bruce_timestamp)
     except relay_auth.RelayAuthError as exc:
-        raise HTTPException(status_code=401, detail={"error": "relay_auth_failed", "reason": str(exc)})
+        # `retryable` tells the relay whether its CREDENTIAL is dead or just this request. Without it the
+        # client can only guess, and guessing "revoked" on a clock blip parks a healthy relay silently.
+        # The request is refused identically either way — this only changes what the caller is told.
+        raise HTTPException(status_code=401, detail={
+            "error": "relay_auth_failed", "reason": str(exc),
+            "retryable": isinstance(exc, relay_auth.RelayAuthTransientError)})
 
 
 class RelayRegisterRequest(BaseModel):
