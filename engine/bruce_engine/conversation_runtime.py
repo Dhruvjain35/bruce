@@ -274,7 +274,7 @@ class _Runtime:
                     reply_out = response_composer.no_false_completion(
                         enforce_no_dashes(rescued.reply), handler=rescued.handler)
                     await self._finalize(user_id, ch, ident, pmid, reply_out, reply_target, trace=trace,
-                                         decision=None, intent="semantic_rescue")
+                                         decision=None, intent="semantic_rescue", trusted_text=msg.text)
                     turn_trace.record(trace.finish())
                     return InboundOutcome(status="processed", user_id=user_id, execution_class=router_ec,
                                           router_ms=router_ms, shortlisted_capabilities=shortlisted,
@@ -308,7 +308,7 @@ class _Runtime:
                 if capsule.attachment_pending:                      # replied to an image/file, not downloaded
                     reply = self.style.template("reply_attachment_pending")
                     await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
-                                         decision=None, intent="image_understanding")
+                                         decision=None, intent="image_understanding", trusted_text=msg.text)
                     turn_trace.record(trace.finish())
                     return InboundOutcome(status="processed", user_id=user_id)
                 if capsule.attachment_load_failed:                  # the exact file EXISTS but we couldn't load
@@ -317,13 +317,13 @@ class _Runtime:
                     # from the newest/nearest image.
                     reply = self.style.template("reply_image_unavailable")
                     await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
-                                         decision=None, intent="image_understanding")
+                                         decision=None, intent="image_understanding", trusted_text=msg.text)
                     turn_trace.record(trace.finish())
                     return InboundOutcome(status="processed", user_id=user_id)
                 if explicit_ref and not (capsule.referenced_text or capsule.prior_answer):
                     reply = self.style.template("reply_target_unavailable")        # target lost / nothing to show
                     await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
-                                         decision=None, intent="image_understanding")
+                                         decision=None, intent="image_understanding", trusted_text=msg.text)
                     turn_trace.record(trace.finish())
                     return InboundOutcome(status="processed", user_id=user_id)
 
@@ -334,7 +334,7 @@ class _Runtime:
             if (msg.attachment_unavailable or unreadable) and not (msg.text and msg.text.strip()) and not images:
                 reply = self.style.template("could_not_read_attachment")
                 await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
-                                     decision=None, intent="image_understanding")
+                                     decision=None, intent="image_understanding", trusted_text=msg.text)
                 turn_trace.record(trace.finish())
                 return InboundOutcome(status="processed", user_id=user_id)
 
@@ -415,7 +415,7 @@ class _Runtime:
                 # real email is already in their inbox and monitoring is running.
                 reply = mission_planner.reply_for(mission_plan) or _FALLBACK
                 await self._finalize(user_id, ch, ident, pmid, reply, reply_target, trace=trace,
-                                     decision=None, intent="unsupported")
+                                     decision=None, intent="unsupported", trusted_text=msg.text)
                 log.info("conv_model_error pmid=%s mission=%s", pmid,
                          mission_plan.status if mission_plan else None)
                 turn_trace.record(trace.finish())
@@ -438,7 +438,7 @@ class _Runtime:
             log.error("conv_outcome_collision pmid=%s", pmid)      # loud; details already logged, no content
             await self._finalize(user_id, ch, ident, pmid,
                                  mission_planner.reply_for(mission_plan) or _FALLBACK, reply_target,
-                                 decision=None, intent="unsupported", trace=trace)
+                                 decision=None, intent="unsupported", trace=trace, trusted_text=msg.text)
             turn_trace.record(trace.finish())
             return InboundOutcome(
                 status="outcome_collision", user_id=user_id,
@@ -498,7 +498,7 @@ class _Runtime:
             log.info("false_completion_downgraded pmid=%s handler=%s", pmid, outcome.handler)
 
         await self._finalize(user_id, ch, ident, pmid, reply_out, reply_target,
-                             decision=decision, event_candidate_id=outcome.event_candidate_id)
+                             decision=decision, event_candidate_id=outcome.event_candidate_id, trusted_text=msg.text)
         log.info("conv_ok pmid=%s intent=%s rt=%s ec=%s mission=%s handler=%s route=%s route_ms=%s",
                  pmid, decision.intent.value, decision.response_type.value,
                  outcome.event_candidate_id is not None, outcome.mission_id is not None, outcome.handler,
@@ -554,7 +554,7 @@ class _Runtime:
 
     async def _finalize(self, user_id, ch, ident, pmid, reply, reply_target, *,
                         decision: ConversationDecision | None, event_candidate_id=None, intent=None,
-                        trace=None):
+                        trace=None, trusted_text: str | None = None):
         # persist the assistant turn, then enqueue EXACTLY ONE outbound (idempotent on conv:{pmid}).
         if decision is not None:
             await conversation_store.persist_assistant_turn(
@@ -582,6 +582,17 @@ class _Runtime:
         await messaging_outbound.enqueue(
             user_id=user_id, to_handle=reply_target, channel=ChannelKind.self_hosted_imessage,
             kind=kind, text=reply, idempotency_key=f"conv:{pmid}")
+
+        # The memory stack finally has a caller. This runs AFTER the reply is enqueued, deliberately: the
+        # student's answer is already safe, so a memory failure costs a remembered preference rather than
+        # a turn. `memory_finalize` writes aggregate style only — never task slots, which stay in the
+        # goal, and never guesses.
+        try:
+            from . import memory_finalize
+            await memory_finalize.after_turn(user_id, trusted_text=trusted_text,
+                                             source_message_id=pmid)
+        except Exception:
+            log.info("memory_finalize_failed pmid=%s", pmid)
 
 
 async def handle(channel: MessagingChannel, msg: InboundMessage, *, user_id: UUID, reply_target: str,
