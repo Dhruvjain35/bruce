@@ -93,6 +93,61 @@ _TOOLS: tuple[ToolSpec, ...] = (
 _BY_CAP: dict[str, ToolSpec] = {t.capability: t for t in _TOOLS}
 
 
+# --- what the MODEL calls things, mapped onto what the registry calls them --------------------------------
+#
+# THE DEFECT THIS CLOSES, measured live on 2026-07-30. A founder asked Bruce to send one email. The model
+# emitted `required_capabilities=['email.send_message']` with `intent=actionable` and every entity correct.
+# The registry id is `gmail.send_message`. `email.send_message` has the right SHAPE, so
+# `transitions.is_operation_id` accepted it, and the wrong NAMESPACE, so `get()` returned None —
+# `goal_runtime.creation_verdict` answered `capability_not_in_registry`, NO goal and NO Decision were
+# created, and the turn fell through to the model's own words, which promised a send that had not been
+# arranged. Zero provider calls happened; the safety envelope held. The honesty envelope did not.
+#
+# This is the transcript's original defect one layer up. That one was `"sending messages"` — free text
+# joining to nothing. This one joins to nothing while LOOKING like an id, which is worse, because every
+# shape check passes.
+#
+# DERIVED, NEVER HAND-LISTED. The aliases are generated from `_TOOLS`, so a new tool gets its aliases for
+# free and a renamed capability cannot leave a stale mapping pointing at an id that no longer exists —
+# the same discipline `authorization_store._capability_for` already uses. A REAL capability id can never
+# be shadowed by an alias: the real ids are removed from the map after it is built.
+_FAMILY: dict[str, str] = {"google_calendar": "calendar", "gmail": "email"}
+"""provider -> the capability FAMILY a model reasons in. `capability_snapshot.is_usable` and
+`semantic_rescue_runtime._FAMILY` speak the same two words; a model told to think in families will say
+"email" where the registry says "gmail", and that gap is what the alias map spans."""
+
+
+def _build_aliases() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for spec in _TOOLS:
+        # the PROVIDER-prefixed form: `authorization_evidence` keys on "google_calendar.create_event"
+        # while the registry keys on "calendar.create_event", so a model echoing either is understood.
+        out.setdefault(f"{spec.provider}.{spec.operation}", spec.capability)
+        family = _FAMILY.get(spec.provider)
+        if family:
+            out.setdefault(f"{family}.{spec.operation}", spec.capability)
+    for spec in _TOOLS:
+        out.pop(spec.capability, None)          # a real id is never an alias for something else
+    return out
+
+
+_ALIASES: dict[str, str] = _build_aliases()
+
+
+def canonical(capability: str | None) -> str:
+    """The registry id for whatever the model called this operation. Total, and never invents one.
+
+    An id the registry already knows is returned unchanged. A known alias resolves to its real id.
+    Anything else — free text, a typo, an operation that genuinely does not exist — comes back UNTOUCHED,
+    so `get()` still answers None and the caller still refuses. Canonicalizing is a translation, not a
+    permission: it can rescue a turn the model named badly, and it can never conjure a capability.
+    """
+    cap = (capability or "").strip()
+    if not cap or _BY_CAP.get(cap) is not None:
+        return cap
+    return _ALIASES.get(cap, cap)
+
+
 def get(capability: str) -> ToolSpec | None:
     return _BY_CAP.get(capability)
 

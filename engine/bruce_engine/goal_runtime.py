@@ -266,7 +266,10 @@ async def resolve_capability(user_id: UUID, *, proposed: str | None = None,
         an email and a calendar goal is how a recipient ends up as an event title — the one thing
         selection-by-kind exists to prevent. The caller must disambiguate instead.
     """
-    cap = (proposed or "").strip()
+    # Canonicalized first: the model reasons in FAMILIES ("email.send_message") and the registry keys on
+    # ids ("gmail.send_message"). A live founder turn died here with `capability_not_in_registry` for
+    # exactly that reason. `canonical` never invents an id, so an unknown one still falls through.
+    cap = tool_registry.canonical(proposed)
     if cap and (goal_slots.kind_for_capability(cap) is not None or tool_registry.get(cap) is not None):
         return cap
     kinds = {k for k in (_kind_of(r) for r in await open_runs(user_id, conversation_id=conversation_id))

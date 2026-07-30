@@ -246,7 +246,10 @@ def _named_capability(decision) -> str:
     nothing in the transcript and must join to nothing here."""
     from . import tool_registry
     for raw in (getattr(decision, "required_capabilities", None) or ()):
-        cap = str(raw or "").strip()
+        # Canonicalized through the ONE alias map, so selection and goal creation agree about what the
+        # model named. Two answers to "which operation is this" is how a turn gets selected onto a goal
+        # it is then refused by.
+        cap = tool_registry.canonical(str(raw or "").strip())
         if cap and (goal_slots.kind_for_capability(cap) is not None or tool_registry.get(cap) is not None):
             return cap
     return ""

@@ -88,6 +88,50 @@ async def _open_goal_candidates(user_id: UUID, conversation_id: str) -> list[dic
     return out
 
 
+async def _has_live_decision(user_id: UUID, conversation_id: str) -> bool:
+    """Is there durable state that will MAKE a promise true — right now, in the database?
+
+    The fact `response_composer.no_false_promise` needs, read from the row rather than taken from a
+    handler's word for it. A handler asserting "I parked a Decision" is the same class of claim the whole
+    spine exists to stop trusting.
+
+    TWO lanes park a real decision and both count. The goal spine puts a pending Decision on the run; the
+    flyer lane saves an EventCandidate as `proposed` and offers it ("want me to add it to ur google
+    calendar? just say the word and i'll put it on there"). That second sentence is a conditional promise
+    and it is TRUE — the candidate is sitting there waiting for the word. Missing that lane is not a
+    theoretical gap: it downgraded the flyer offer to a limitation and broke the offer→"ya"→execute flow,
+    which `test_offer_then_ya_executes_same_run_no_loop` catches.
+
+    Reachability matters as much as existence: a Decision for a capability the registry does not declare
+    live is not something Bruce will actually do, so a promise resting on it would still be false.
+    """
+    from sqlalchemy import select as _select
+
+    from . import goal_handler, schema, tool_registry
+    from .db import user_session as _user_session
+    try:
+        for run in await _open_goal_candidates(user_id, conversation_id):
+            block = run.get("active_decision")
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("status") or "") != goal_handler.PENDING:
+                continue
+            capability = str(block.get("capability") or "")
+            if capability and tool_registry.is_live(tool_registry.canonical(capability)):
+                return True
+        async with _user_session(user_id) as s:
+            proposed = (await s.execute(
+                _select(schema.EventCandidate.id).where(
+                    schema.EventCandidate.user_id == user_id,
+                    schema.EventCandidate.status == "proposed").limit(1))).first()
+        return proposed is not None
+    except Exception:
+        # Unreadable state must not licence a promise. Failing to False costs one honest sentence;
+        # failing to True is the lie this gate exists to prevent.
+        log.info("live_decision_read_failed user=%s", user_id)
+    return False
+
+
 def _pending_operation(run: dict | None):
     """The EXACT operation this student is being asked to answer for, or None.
 
@@ -728,6 +772,17 @@ class _Runtime:
         reply_out = response_composer.no_false_completion(reply_out, handler=outcome.handler)
         if reply_out is not pre_guard:
             log.info("false_completion_downgraded pmid=%s handler=%s", pmid, outcome.handler)
+
+        # The FUTURE-tense dual. "i'll send it" is only true if something will actually send it, so the
+        # database is asked whether a Goal with a pending Decision exists for a reachable operation.
+        # Checked ONLY when the reply actually promises something, so an ordinary turn pays nothing.
+        if response_composer.promises_action(reply_out):
+            live_decision = await _has_live_decision(user_id, ident)
+            pre_promise = reply_out
+            reply_out = response_composer.no_false_promise(
+                reply_out, handler=outcome.handler, has_live_decision=live_decision)
+            if reply_out is not pre_promise:
+                log.warning("false_promise_downgraded pmid=%s handler=%s", pmid, outcome.handler)
 
         await self._finalize(user_id, ch, ident, pmid, reply_out, reply_target,
                              decision=decision, event_candidate_id=outcome.event_candidate_id, trusted_text=msg.text)
