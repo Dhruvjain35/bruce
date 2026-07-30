@@ -57,6 +57,43 @@ def classify_span(text: str | None) -> str | None:
     return None
 
 
+# A bare pointer standing in for the event. `entity_resolution._GENERIC_REF` refuses these on their own —
+# correctly — so this is only ever consulted once a mutation verb has been classified in the student's own
+# words, which is what gives the pointer something to point AT.
+_POINTER_RE = re.compile(r"\b(?:it|that|this|these|those|them)\b", re.IGNORECASE)
+
+
+async def resolve_target(user_id: UUID, kind: str | None, text: str | None):
+    """WHICH event this mutation is about — the ONE answer the claim and the execution both use.
+
+    It used to be two: `CalendarMutationHandler.evaluate` resolved to decide whether to claim, and
+    `handle` resolved again to decide what to write. Two answers to "which event" is the shape of defect
+    this tree keeps finding, so there is one now.
+
+    `entity_resolution.resolve` refuses a lone "it", and it is right to: a bare "it" appears in almost any
+    sentence, and letting it select the student's only event would turn "i'll deal with it later" into a
+    provider write. What that function cannot see is that a MUTATION VERB was classified in the student's
+    own trusted words — and a verb plus a pointer plus exactly one active event is a referent rather than
+    a guess. That missing layer is this function.
+
+    Narrower than the repair fallback in three deliberate ways:
+
+      * a pointer word must actually be in the message — a verb alone is not a reference;
+      * exactly ONE event may be active, so two open events resolve to a question instead of to the
+        newest, because a pointer that could mean either IS a question;
+      * a DELETE never gets it. Deletion cannot be taken back, so it keeps having to name its target.
+    """
+    res = await entity_resolution.resolve(user_id, text)
+    if res.status != "not_found":
+        return res
+    if kind == "repair":
+        # A title-less correction points at the operation just performed ("not today, i said friday").
+        return await entity_resolution.resolve_most_recent(user_id)
+    if kind == "update" and _POINTER_RE.search(text or ""):
+        return await entity_resolution.resolve_only_active(user_id)
+    return res
+
+
 def _parse(iso: str) -> tuple[_dt.date, _dt.time | None]:
     """(date, time|None) from an ISO start — time is None for an all-day date."""
     if len(iso) == 10:
@@ -121,11 +158,9 @@ async def handle(user_id: UUID, kind: str, text: str, *, adapter=None,
     tz = await world_state.resolve_timezone(user_id, default=DEFAULT_TZ)
     now = _dt.datetime.now(ZoneInfo(tz))
 
-    # A correction may NAME the event ("actually move chess club to friday"); resolve by title first, and
-    # fall back to the most-recent event only for a genuinely title-less correction ("not today, ...").
-    res = await entity_resolution.resolve(user_id, text)
-    if kind == "repair" and res.status == "not_found":
-        res = await entity_resolution.resolve_most_recent(user_id)
+    # THE SAME resolution the handler claimed on. Title first, then the narrow pointer fallbacks — see
+    # `resolve_target`, which is deliberately the only place that decides this.
+    res = await resolve_target(user_id, kind, text)
     if res.status == "not_found":
         return "i don't see that one on ur calendar. which event do u mean?"
     if res.status == "ambiguous":

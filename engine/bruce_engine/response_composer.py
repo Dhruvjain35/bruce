@@ -26,8 +26,15 @@ from .conversation_contract import RiskLevel
 # it is deliberately a different name from the `semantic_rescue` that proposes, clarifies and blocks — so
 # a proposal or a question that somehow claimed a completion is still downgraded. One name for both would
 # have made every rescue reply trusted on the strength of the one path that earned it.
+#
+# `goal` earns its place the same way and by one line: `goal_handler._run` emits `_COPY.receipt` ONLY
+# under `if result.verified`, and `verified` is copied from the adapter's own independent read-back and
+# never re-judged. Every other branch of that method says plainly that nothing happened. It is here now
+# because registering `calendar.create_event` made the goal lane emit CALENDAR completion copy for the
+# first time — an email receipt ("sent it to X ✅") never tripped this gate, and a true calendar receipt
+# was being rewritten into "i didn't actually put that on ur calendar yet" after a verified create.
 ACTION_HANDLERS = frozenset({"calendar_schedule", "calendar_approval", "calendar_mutation",
-                             "semantic_rescue_execute"})
+                             "semantic_rescue_execute", "goal"})
 
 # A sentence that FRAMES an offer / intent / question is never a "it landed" claim, even if it contains
 # completion-shaped words ("i'll put it on ur calendar", "want me to move it"). Checked per-sentence so a

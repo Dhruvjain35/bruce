@@ -123,7 +123,14 @@ class ResolvedReply:
 @dataclass
 class OutcomeContext:
     """Inputs a handler may read + the collaborators execute() needs. APPEND-ONLY. Handlers must not
-    mutate durable state during evaluate()."""
+    mutate durable state during evaluate().
+
+    THE SNAPSHOT FIELDS BELOW ARE THE POINT OF THE BRAIN SPINE. Every one of them is state the RUNTIME
+    fetched exactly once, before anything reasoned, and handed over. A handler that went back to the
+    database for its own copy would be rebuilding the defect the transcript exposed: three paths each
+    deriving their own view of one turn, and the student getting the least informed one. They default to
+    None/empty so every existing handler and every existing test is untouched by their arrival.
+    """
     user_id: UUID
     decision: "ConversationDecision"
     capsule: "ContextCapsule"
@@ -133,6 +140,15 @@ class OutcomeContext:
     pmid: str
     style: "ConversationStyleEngine"
     store: object                      # conversation_store module
+    # --- the one snapshot, assembled once per turn (turn_context_assembler.assemble) ---------------------
+    turn_context: object = None        # turn_context.TurnContext — live capability truth + open work
+    continuation: object = None        # continuation.Continuation — what this turn does to work in flight
+    open_goal: dict | None = None      # the newest open AgentRun that declares a typed goal kind
+    conversation_id: str = ""          # which thread this turn (and any goal it opens) belongs to
+    turn_index: int = 0                # position in the conversation; orders slot values deterministically
+    mission_lane_ran: bool = False     # the background-mission lane already acted, so nothing else may
+    scope: object = None               # directive_scope.ScopeProposal — what a negation in this turn is ABOUT
+    goal_selection: object = None      # goal_selection.Selection — WHICH open goal this turn is about
 
 
 @runtime_checkable
@@ -324,7 +340,7 @@ class CalendarMutationHandler:
     priority = 72
 
     async def evaluate(self, octx: OutcomeContext) -> HandlerVerdict:
-        from . import calendar_mutation, entity_resolution, oauth_google
+        from . import calendar_mutation, oauth_google
         kind = calendar_mutation.classify(octx.msg.text)
         if kind is None:
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
@@ -336,20 +352,15 @@ class CalendarMutationHandler:
         if not (integ is not None and integ.status == "connected" and integ.revoked_at is None):
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="calendar_not_connected")
-        # A mutation verb alone is NOT enough — require a CONCRETE referent (a title/generic-noun resolved
-        # entity, or, for a title-less correction, a most-recent event). This stops "cancel that plan with
-        # mike" from deleting the only event, and stops "add chess class, make it 5pm" from hijacking create.
+        # A mutation verb alone is NOT enough — require a CONCRETE referent. This stops "cancel that plan
+        # with mike" from deleting the only event, and stops "add chess class, make it 5pm" from hijacking
+        # create. `calendar_mutation.resolve_target` is the SAME resolution `handle` will perform, so a
+        # turn can never be claimed on one referent and executed against another.
         try:
-            res = await entity_resolution.resolve(octx.user_id, octx.msg.text)
+            res = await calendar_mutation.resolve_target(octx.user_id, kind, octx.msg.text)
         except Exception:
             res = None
         has_referent = res is not None and res.status in ("resolved", "ambiguous")
-        if not has_referent and kind == "repair":
-            try:
-                recent = await entity_resolution.resolve_most_recent(octx.user_id)
-                has_referent = recent is not None and recent.status == "resolved"
-            except Exception:
-                pass
         if not has_referent:
             return HandlerVerdict(disposition=Disposition.decline, priority=self.priority,
                                   reason="no_referent")
@@ -610,9 +621,17 @@ class DefaultReplyHandler:
 
 def default_handlers() -> list[OutcomeHandler]:
     """Claim-candidate handlers, evaluated every turn (pure). Ordering is by explicit priority, not list
-    position. A workstream inserts its handler here with a stable priority."""
-    return [CalendarApprovalHandler(), WorldStateHandler(), CalendarMutationHandler(), CalendarScheduleHandler(),
-            StatusQueryHandler(), MissionHandoffHandler(), EventCandidateHandler()]
+    position. A workstream inserts its handler here with a stable priority.
+
+    `GoalHandler` sits at the top (90) because an answer that advances work already in flight outranks
+    starting anything new — the transcript's second turn was an answer to Bruce's own question and was
+    routed as a brand-new, subjectless request. It claims narrowly (a capability with a declared slot set
+    AND an executor behind it), so every handler below keeps the turns it owns today.
+    """
+    from .goal_handler import GoalHandler
+    return [GoalHandler(), CalendarApprovalHandler(), WorldStateHandler(), CalendarMutationHandler(),
+            CalendarScheduleHandler(), StatusQueryHandler(), MissionHandoffHandler(),
+            EventCandidateHandler()]
 
 
 def default_fallback() -> OutcomeHandler:

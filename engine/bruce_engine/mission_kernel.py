@@ -25,7 +25,8 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from . import schema
+from . import agent_run_store, execution_gate, schema, transitions
+from .contract import MachineState
 from .db import user_session
 from .models import MissionPhase
 
@@ -33,6 +34,51 @@ log = logging.getLogger("bruce.mission")   # content-free: ids/phases only, neve
 
 HANDOFF_KIND = "handoff"
 _MAX_KEY = 128
+
+
+# --- the phase log is a state machine too --------------------------------------------------------------
+# `record_phase` used to be `m.phase = phase`, which meant the phase log — the thing the Live Activity
+# renders and the thing a student reads to decide whether Bruce actually did something — could be moved
+# anywhere by anyone. A mission could go from "awaiting your ok" straight to "Added and verified" with no
+# provider call in between, and nothing in the code would object. So phases are proposed now, through the
+# SAME gate `agent_run_store` uses, and refused moves raise `IllegalStatusWrite`.
+#
+# `MissionPhase` is the render vocabulary and `MachineState` is the machine's; they overlap on eight of
+# ten words. The two that differ are projections, not new states: `created` is the instant before
+# `understanding`, and `extracting` is what `preparing` looks like on screen.
+
+_PHASE_TO_MACHINE: dict[str, MachineState] = {
+    MissionPhase.created.value: MachineState.understanding,
+    MissionPhase.understanding.value: MachineState.understanding,
+    MissionPhase.extracting.value: MachineState.preparing,
+    MissionPhase.awaiting_approval.value: MachineState.awaiting_approval,
+    MissionPhase.executing.value: MachineState.executing,
+    MissionPhase.waiting_external.value: MachineState.waiting_external,
+    MissionPhase.verifying.value: MachineState.verifying,
+    MissionPhase.succeeded.value: MachineState.succeeded,
+    MissionPhase.blocked.value: MachineState.blocked,
+    MissionPhase.failed.value: MachineState.failed,
+    # not a MissionPhase — the row never renders it — but a mission whose decision was declined is
+    # cancelled, and the projection has to be total or the gate cannot judge that mission at all.
+    MachineState.cancelled.value: MachineState.cancelled,
+}
+
+# The one edge the phase LOG walks that the machine table does not have. `transitions.py` requires a
+# capability, a live connection and an open authorization before `executing`, and it is right to: that is
+# the check that must happen before a provider is called. But it happens at `mutation_gateway` — the ONE
+# DOOR, one statement later in `calendar_schedule` — and re-asking it here would mean either duplicating
+# the broker + authorization lookups or, worse, answering them from stale columns. The phase log RECORDS
+# what the door already permitted; it is not a second door. It still cannot record an unverified success:
+# `check_operational_lane` forbids any supplement from naming `succeeded`.
+_PHASE_LANE: dict[str, frozenset[str]] = {
+    MachineState.preparing.value: frozenset({MachineState.executing.value}),
+}
+agent_run_store.check_operational_lane(_PHASE_LANE, "the mission phase-log lane")
+
+# Mission ROW statuses. A coarse rollup of the phase for list views — not a third state machine, and it
+# must never disagree with the phase, which is what `_authorize_phase` enforces for the only value that
+# makes a claim about the world.
+MISSION_STATUSES: frozenset[str] = frozenset({"running", "succeeded", "failed", "cancelled", "done"})
 
 
 def handoff_idempotency_key(source_message_id: str, capability: str) -> str:
@@ -322,21 +368,95 @@ async def latest_pending_rescue_proposal(user_id: UUID) -> dict | None:
         return {"mission_id": str(m.id), "goal": m.goal}
 
 
+_SUSPENDED_RECEIPT = "provider-semantics-test-suspension"   # never persisted; guard evidence only
+
+
+async def _operation_receipt(s, user_id: UUID, mission_id: UUID) -> str | None:
+    """The provider entity id this mission's OWN consumed authorization recorded, or None.
+
+    This is the read-back evidence, taken from the database rather than from an argument. When a mutation
+    goes through `mutation_gateway`, the authorization is marked consumed with `operation_receipt_id` set
+    to what the provider actually returned (`receipt_of`) — and that happens BEFORE the caller records
+    `succeeded`. So the question "is there proof this write produced a real object" already has a durable
+    answer, and a mission cannot be argued into `succeeded` by a caller that merely believes it worked.
+    """
+    return (await s.execute(select(schema.AuthorizationEvidenceRow.operation_receipt_id).where(
+        schema.AuthorizationEvidenceRow.user_id == user_id,
+        schema.AuthorizationEvidenceRow.mission_id == mission_id,
+        schema.AuthorizationEvidenceRow.consumed_at.isnot(None),
+        schema.AuthorizationEvidenceRow.operation_receipt_id.isnot(None)).order_by(
+        schema.AuthorizationEvidenceRow.consumed_at.desc()).limit(1))).scalar_one_or_none()
+
+
 async def record_phase(
     user_id: UUID, mission_id: UUID, phase: str, short_status: str, *, status: str | None = None,
+    verified_read_back: bool | None = None, read_back_entity_id: str | None = None,
 ) -> bool:
-    """Append ONE durable phase event to an existing mission and move its live phase/short_status
+    """Append ONE durable phase event to an existing mission and PROPOSE its live phase/short_status
     (optionally its status). Owner-scoped; a no-op returning False if the mission isn't the caller's.
+    Raises ``agent_run_store.IllegalStatusWrite`` if the move is not one the machine allows.
 
     This is how an EXECUTING capability (e.g. the real calendar write) records the honest states the
     product must never skip — creation_attempted -> created -> fetched_back -> verified / failed /
-    verification_inconclusive — each as a persisted event, never merely a log line. The mission is
-    only marked ``succeeded`` by the caller AFTER an independent read-back verified the result."""
+    verification_inconclusive — each as a persisted event, never merely a log line.
+
+    ``succeeded`` is the state this function exists to protect. It is reachable only from ``verifying``,
+    and only with an independent read-back: pass ``verified_read_back`` / ``read_back_entity_id`` if you
+    are holding the provider's answer, otherwise the mission's own consumed-authorization receipt is
+    looked up and used. If neither exists, the move is REFUSED and the mission stays in ``verifying`` —
+    which is the honest state for a write nobody has proven, and the one the student should be shown.
+    """
     async with user_session(user_id) as s:
         m = (await s.execute(select(schema.Mission).where(
             schema.Mission.id == mission_id, schema.Mission.user_id == user_id))).scalar_one_or_none()
         if m is None:
             return False
+
+        current, target = _PHASE_TO_MACHINE.get(m.phase or ""), _PHASE_TO_MACHINE.get(phase)
+        if current is None or target is None:
+            # An unrecognised phase word cannot be judged, and a phase nothing can judge is exactly the
+            # free-text `required_capabilities=["sending messages"]` failure in another column.
+            raise agent_run_store.IllegalStatusWrite(
+                m.phase or "", phase, agent_run_store.UNKNOWN_STATUS)
+        if current in (MachineState.succeeded, MachineState.cancelled):
+            # A finished mission does not move, and a redelivery is not an error. At-least-once transports
+            # re-hand the same flyer, and `calendar_schedule` answers a repeat by re-walking its graph —
+            # the provider's 409 keeps that safe, but the PHASE log must not be dragged back to
+            # "preparing" and then forward to a second "verified". Recording nothing is what "terminal"
+            # means; raising would make a normal redelivery look like a defect.
+            log.info("mission_phase_ignored_terminal mission_id=%s phase=%s", mission_id, m.phase)
+            return False
+        if status is not None and status not in MISSION_STATUSES:
+            raise agent_run_store.IllegalStatusWrite(m.status or "", status, agent_run_store.UNKNOWN_STATUS)
+        if status == MachineState.succeeded.value and target is not MachineState.succeeded:
+            # Marking the ROW succeeded while the phase says otherwise would route around the read-back
+            # guard through the one field the guard does not look at.
+            raise agent_run_store.IllegalStatusWrite(
+                m.status or "", status, transitions.NOT_FROM_VERIFYING, (transitions.VERIFIED_READ_BACK,))
+
+        entity_id, verified = read_back_entity_id, verified_read_back
+        if target is MachineState.succeeded and not (entity_id or "").strip():
+            entity_id = await _operation_receipt(s, user_id, mission_id)
+            if entity_id is None and execution_gate.unchecked():
+                # The ONE declared suspension (`unchecked_provider_writes_for_test`, which raises outside
+                # pytest). Those tests call the verified I/O directly, so the gateway that writes the
+                # receipt never ran and there is nothing to find. Refusing here would fail them for the
+                # single thing they declared out of scope — and would prove nothing about the guard, which
+                # is exercised head-on in test_status_enforcement.py.
+                entity_id = _SUSPENDED_RECEIPT
+        if verified is None:
+            # The provider id IS the read-back. A caller that has one has verified by definition; a caller
+            # that explicitly says False is believed, because it knows something this row does not.
+            verified = bool((entity_id or "").strip())
+
+        agent_run_store.enforce_status_write(
+            current.value, target.value, extra_edges=_PHASE_LANE,
+            guard_ctx=transitions.GuardContext(
+                capability=(m.goal or {}).get("capability"),
+                decision_id=str(mission_id),        # the mission row IS the decision — see the rescue note
+                verified_read_back=bool(verified),
+                read_back_entity_id=entity_id))
+
         m.phase = phase
         m.short_status = short_status[:200]
         if status is not None:

@@ -138,15 +138,20 @@ def test_select_tie_at_top_priority_fails_loudly():
 
 def test_default_pipeline_shape():
     hs = co.default_handlers()
-    assert [h.name for h in hs] == ["calendar_approval", "world_state", "calendar_mutation",
+    # GoalHandler leads: an answer that advances work already in flight outranks starting anything new.
+    # The transcript's second turn was an answer to Bruce's OWN question and was routed as a brand-new,
+    # subjectless request — which is how the recipient was asked for twice.
+    assert [h.name for h in hs] == ["goal", "calendar_approval", "world_state", "calendar_mutation",
                                     "calendar_schedule", "mission_status", "mission_handoff", "event_candidate"]
     assert co.default_fallback().name == "default_reply"
-    # explicit, DISTINCT priorities: decision resolve > calendar execute > status read > handoff > event > fallback
-    prios = [co.CalendarApprovalHandler().priority, co.WorldStateHandler().priority,
+    # explicit, DISTINCT priorities: goal continue > decision resolve > calendar execute > status read >
+    # handoff > event > fallback
+    from bruce_engine.goal_handler import GoalHandler   # imported lazily in default_handlers
+    prios = [GoalHandler().priority, co.CalendarApprovalHandler().priority, co.WorldStateHandler().priority,
              co.CalendarMutationHandler().priority, co.CalendarScheduleHandler().priority,
              co.StatusQueryHandler().priority, co.MissionHandoffHandler().priority,
              co.EventCandidateHandler().priority, co.DefaultReplyHandler().priority]
-    assert prios == sorted(prios, reverse=True) and len(set(prios)) == 8
+    assert prios == sorted(prios, reverse=True) and len(set(prios)) == 9
 
 
 def test_status_query_handler_declines_without_status_language():

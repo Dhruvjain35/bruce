@@ -30,6 +30,7 @@ enforces that by stripping quoted/forwarded regions before resolution.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from enum import Enum
@@ -80,6 +81,35 @@ def trusted_reply_text(text: str | None) -> str:
     if m:
         raw = raw[:m.start()]
     return raw
+
+
+# An inline quotation of someone ELSE's words. `trusted_reply_text` strips quoted REGIONS (reply blocks,
+# forwarded headers); this catches the other shape — a student pasting a sentence mid-message. Measured:
+# 'coach replied "yes add it" — what does he mean' authorized a write, because the quoted affirmative was
+# read as the student's own.
+_INLINE_QUOTE = re.compile(r"[\"“”][^\"“”]{1,200}[\"“”]")
+
+
+def strip_inline_quotes(text: str | None) -> str:
+    """Someone else's sentence, pasted mid-message, removed.
+
+    Lives here rather than in each caller because the AFFIRMATIVE path and only the affirmative path may
+    use it: removing a quote can turn a yes into a non-yes, never a no into a yes. Two copies of that
+    asymmetry would eventually disagree, and the direction of the disagreement is the unsafe one.
+    """
+    return _INLINE_QUOTE.sub(" ", text or "")
+
+
+def trusted_digest(text: str | None) -> str:
+    """A stable identity for the student's own words in ONE turn.
+
+    Exists so a reading DERIVED from a turn's trusted text cannot later be applied to different text. A
+    caller computes a semantic proposal over the words it separated; the boundary recomputes this over the
+    words IT was handed and refuses the proposal when they disagree. Without it, a proposal built from a
+    correctly separated message could be spent against a message that still has an attacker's forwarded
+    email joined onto it, and the separation would have bought nothing.
+    """
+    return hashlib.sha256(normalize(trusted_reply_text(text)).encode("utf-8")).hexdigest()
 
 
 # --- lexicon -----------------------------------------------------------------------------------------

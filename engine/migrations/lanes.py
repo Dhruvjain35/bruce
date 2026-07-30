@@ -29,6 +29,9 @@ MIGRATION_LANES: dict[str, str] = {
     "0028": "memory",              # typed memory records (#121b)
     "0029": "memory",              # memory reshaped to the canonical ORM model (#122)
     "0030": "memory",              # claim lineage + active-claim uniqueness (#123)
+    # The brain spine. agent_runs.status becomes a CHECK-constrained MachineState vocabulary, so an
+    # illegal state cannot reach the row even if a caller bypasses transitions.propose_transition.
+    "0031": "runtime",             # agent_runs.status CHECK over MachineState (brain spine)
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the
