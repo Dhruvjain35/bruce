@@ -60,6 +60,22 @@ async def resolve(user_id: UUID, text: str | None) -> ResolutionResult:
     return ResolutionResult("not_found")
 
 
+async def resolve_only_active(user_id: UUID) -> ResolutionResult:
+    """The student's ONE active event, or ambiguous when there is more than one.
+
+    The referent of a bare pointer whose VERB the caller has already established — see
+    `calendar_mutation.resolve_target`, which is the only thing that may ask. Deliberately not "the newest
+    of several": a pointer that could mean either event is a question, and answering it by recency is how
+    the wrong event gets moved with nothing ever saying so.
+    """
+    events = await entity_store.active_events(user_id, limit=4)
+    if not events:
+        return ResolutionResult("not_found")
+    if len(events) > 1:
+        return ResolutionResult("ambiguous", candidates=events)
+    return ResolutionResult("resolved", entity=events[0])
+
+
 async def resolve_most_recent(user_id: UUID) -> ResolutionResult:
     """The most-recently-created active event — the referent of a bare correction ("not today, i said
     4 days from now") that points at the operation just performed."""

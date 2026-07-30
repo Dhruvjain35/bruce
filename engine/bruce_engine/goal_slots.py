@@ -34,8 +34,10 @@ is message content.
 
 from __future__ import annotations
 
+import datetime
 import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -165,6 +167,123 @@ def _rank(sv: SlotValue) -> tuple[int, int, str]:
     a max over this order, folding turns is associative and commutative, i.e. order-independent.
     """
     return (_TRUST.get(sv.source, 0), sv.turn_index, _canonical(sv.value))
+
+
+def temporal_pair(kind: GoalKind | str) -> tuple[str | None, str | None]:
+    """(the slot that holds a moment, the slot that holds its end) for this kind, or (None, None).
+
+    Read off the SLOT SCHEMA rather than named: the datetime-typed slots, in declaration order, are the
+    moment and its end — the convention `_DECLARED` already writes down (`start` before `end`). Naming
+    them in a handler would be product knowledge, and product knowledge inside a generic handler is how
+    the calendar path and the email path came to disagree about what a turn was.
+    """
+    dts = [s.name for s in slot_specs(kind) if s.value_kind.rstrip("?") == "datetime"]
+    return (dts[0] if dts else None, dts[1] if len(dts) > 1 else None)
+
+
+_DEFAULT_DURATION = datetime.timedelta(hours=1)
+
+
+def _is_date_only(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 10
+
+
+def _is_moment(value: Any) -> bool:
+    """Is this a resolved moment, or is it still the words the student typed? A slot holding "whenever
+    works" is a question Bruce owes them, never a time anything may be executed against."""
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _known_duration(known: Mapping[str, SlotValue] | None, start_name: str,
+                    end_name: str) -> datetime.timedelta:
+    """How long the event ALREADY is. Defaulted to an hour rather than to zero, and never negative: a
+    change to the day must not silently reshape a two-hour event into a moment."""
+    start = (known or {}).get(start_name)
+    end = (known or {}).get(end_name)
+    if start is None or end is None or not start.filled or not end.filled:
+        return _DEFAULT_DURATION
+    if _is_date_only(start.value) or _is_date_only(end.value):
+        return _DEFAULT_DURATION
+    try:
+        span = (datetime.datetime.fromisoformat(str(end.value))
+                - datetime.datetime.fromisoformat(str(start.value)))
+    except ValueError:
+        return _DEFAULT_DURATION
+    return span if span > datetime.timedelta(0) else _DEFAULT_DURATION
+
+
+def reconcile_temporal(kind: GoalKind | str, known: Mapping[str, SlotValue] | None,
+                       incoming: Mapping[str, SlotValue] | None) -> dict[str, SlotValue]:
+    """A DATE-ONLY change keeps the clock the student already set, and moves the end with the start.
+
+    "MOVE IT TO FRIDAY" CHANGES THE DAY. It says nothing about the hour, and a 4pm rehearsal moved to
+    friday is a 4pm rehearsal on friday. `temporal.resolve` correctly reports a date-only phrase as a
+    whole day; writing both halves of that over a start and an end the student had already pinned turns
+    their event into an all-day block, against something they never said and with no way to notice.
+
+    THIS IS THE ONLY PLACE THAT CAN DECIDE IT, which is why it lives at the merge rather than in the
+    resolver. Turning a phrase into a moment happens before the goal is loaded and cannot see the clock it
+    is about to overwrite; the merge is where the old value and the new one are both in hand.
+
+    Three rules, and the date-only one is `calendar_mutation.recompute`'s — the reference implementation
+    on the other calendar path, pinned against it in `test_temporal_patching`:
+
+      * an explicit new time REPLACES the clock          "move it to friday at 5pm" -> 5pm
+      * a date-only change KEEPS it                      "move it to friday"        -> still 4pm
+      * the end always moves with the start, by the duration the event already had
+
+    The two lanes still differ on ONE thing, and it is recorded rather than smoothed over: when the
+    student states a new TIME, `recompute` keeps the event's old duration while this lane takes
+    `temporal.resolve`'s (an hour, when no range was stated). They could only agree if the merge could
+    tell a defaulted end from a stated one, and `Resolved` does not carry that distinction — guessing it
+    from the span would stretch a genuine one-hour range to two. See the test that asserts the gap.
+
+    An event that was all-day to begin with stays all-day: there is no clock to keep, and inventing one
+    would put a whole-day block at midnight. A phrase that resolved to no moment at all is dropped rather
+    than merged, because prose in a start slot is a call nothing can build.
+    """
+    out = dict(incoming or {})
+    start_name, end_name = temporal_pair(kind)
+    if start_name is None or end_name is None:
+        return out
+    new = out.get(start_name)
+    old = (known or {}).get(start_name)
+    if new is None or not new.filled or old is None or not old.filled:
+        return out
+
+    if not _is_moment(new.value) and _is_moment(old.value):
+        # AN UNREADABLE PHRASE IS NOT A NEW TIME. `resolve_temporal` leaves a when-phrase it cannot read
+        # exactly as the student typed it, so Bruce asks rather than inventing a moment — but on a goal
+        # that already HAS one, merging that prose in replaces a real start with "whenever works" and the
+        # executor can no longer build the call at all. The pinned moment stands and the offer is made
+        # again against it, which is visible to the student in a way a corrupted slot is not.
+        out.pop(start_name, None)
+        out.pop(end_name, None)
+        return out
+
+    if not _is_date_only(new.value) or _is_date_only(old.value):
+        return out
+    try:
+        day = datetime.date.fromisoformat(str(new.value))
+        base = datetime.datetime.fromisoformat(str(old.value))
+    except ValueError:
+        return out
+    start = datetime.datetime.combine(day, base.time())
+    end = start + _known_duration(known, start_name, end_name)
+    out[start_name] = replace(new, value=start.isoformat(timespec="seconds"))
+    # The end is REWRITTEN, not merged. `slot_patch` is replacement-shaped and can only name one slot, so
+    # a start moved on its own would leave the previous end beside it — an event that starts on friday and
+    # ends on tuesday. Same provenance and same turn index as the start, which is what lets `merge_slots`
+    # prefer it over the stale one.
+    out[end_name] = SlotValue(end.isoformat(timespec="seconds"), new.source, turn_id=new.turn_id,
+                              turn_index=new.turn_index)
+    return out
 
 
 def merge_slots(existing: dict[str, SlotValue] | None,

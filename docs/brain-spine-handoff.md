@@ -153,18 +153,32 @@ The suite was green through every one of these:
 
 ---
 
-## 4. Remaining acceptance failures: 13 passed / 3 failed (was 8/8; **B and C are closed**)
+## 4. Remaining acceptance failures: NONE — **16 passed / 0 failed** (was 8/8; A, B and C are all closed)
 
 Run: `cd engine && .venv/bin/python -m pytest tests/test_acceptance_cross_tool.py -q`
 
-**A — `calendar.create_event` not reachable from the goal seam (3), and the only group left.**
-`CalendarCreateExecutor` exists (committed at `565024b`) but is not in `goal_handler._EXECUTORS`, so the
-seam declines with `capability_has_no_executor`. Two of the three failures are exactly that
-(`test_a_calendar_request_never_becomes_a_typed_goal`, `test_move_it_to_friday_lands_on_the_work_in_flight`).
-The third, `test_moving_the_day_of_a_calendar_goal_keeps_the_clock_the_student_already_set`, is grouped
-here because it is a calendar-goal symptom, but its cause is D5 below — `goal_handler.resolve_temporal`,
-not the missing executor row. It runs entirely against `goal_runtime` and `continuation` with no runtime
-and no selection, so nothing in the B fix could reach it.
+~~**A — `calendar.create_event` not reachable from the goal seam (3).**~~ **CLOSED**, and it was three
+separate causes wearing one symptom:
+
+1. **The registry row.** `CalendarCreateExecutor` was written and tested at `565024b`;
+   `goal_handler._EXECUTORS` had no entry joining it to the declared slot set, so the seam declined every
+   calendar turn with `capability_has_no_executor`. One row. `tests/test_calendar_goal_lane.py` drives the
+   whole chain — Decision → AuthorizationEvidence → ExecutionAttempt → MutationGateway → provider create →
+   fetch-back → Receipt — and asserts each link where it is actually recorded.
+2. **The date-only clock (D5).** `goal_slots.reconcile_temporal` now keeps the hour and the duration when
+   only the date changes, at the MERGE rather than in the resolver: turning "friday" into a date happens
+   before the goal is loaded and cannot see the clock it is about to overwrite. Pinned against
+   `calendar_mutation.recompute`, with the one place the two lanes still differ asserted rather than hidden.
+3. **The bare pointer.** "move it to friday" reached no handler at all — the goal seam had no calendar goal
+   to patch and `entity_resolution` refuses a lone "it". `calendar_mutation.resolve_target` is the layer
+   above it: a mutation VERB plus a pointer plus exactly ONE active event is a referent. Two events ask; a
+   delete never gets it; and it is now the single resolution both the handler's claim and its execution use.
+
+Three defects found on the way, all by reading rather than by a red test: the goal lane never passed
+`parent_run_id`, so every attempt row recorded a provider write that named no goal; `response_composer`
+rewrote a VERIFIED calendar receipt into "i didn't actually put that on ur calendar yet" because `goal`
+was not in `ACTION_HANDLERS`; and an unreadable when-phrase merged into an existing goal replaced a real
+start with prose the executor could not build a call from.
 
 ~~**B — deterministic multi-goal disambiguation (3).**~~ **CLOSED** by `goal_selection`, a pure ordered
 selector the runtime calls with every open typed run instead of taking the newest one.
@@ -228,10 +242,11 @@ cd /Users/dhruvjain/bruce/engine
 # the five gates, in order
 .venv/bin/python -m pytest tests/test_semantic_scope.py tests/test_directive_scope.py -q
 .venv/bin/python -m pytest tests/test_goal_selection.py -q                                         # 42
+.venv/bin/python -m pytest tests/test_calendar_goal_lane.py tests/test_temporal_patching.py -q      # 23
 .venv/bin/python -m pytest tests/test_action_boundary.py tests/test_authorization_zero_call.py -q  # 281/36
 .venv/bin/python -m pytest tests/ -q -k "authorization"                                            # 314/36
 .venv/bin/python -m pytest tests/test_acceptance_cross_tool.py::test_the_exact_founder_sequence_ends_in_one_verified_send -q
-.venv/bin/python -m pytest tests/test_acceptance_cross_tool.py -q                                   # 13/3
+.venv/bin/python -m pytest tests/test_acceptance_cross_tool.py -q                                   # 16/0
 
 # one corpus case alone
 .venv/bin/python -m pytest "tests/test_authorization_zero_call.py::test_no_corpus_case_that_forbids_writes_ever_reaches_an_adapter[cancel-pending-10]" -q

@@ -49,6 +49,7 @@ CAL = "https://www.googleapis.com/auth/calendar.events"
 GSEND = "https://www.googleapis.com/auth/gmail.send"
 GREAD = "https://www.googleapis.com/auth/gmail.readonly"
 SEND = "gmail.send_message"
+CREATE_EVENT = "calendar.create_event"
 
 users = PostgresUserRepository()
 
@@ -151,16 +152,27 @@ def test_the_exactly_once_key_is_derived_from_durable_state():
     assert run_id in goal_handler.idempotency_key(run_id, SEND)
 
 
-def test_a_capability_with_no_executor_is_declined_rather_than_half_collected():
-    """`calendar.create_event` has a declared slot set and no CapabilityExecutor. Collecting a title, a
-    start and a timezone and only then admitting nothing can perform the call is the exchange this whole
-    workstream exists to delete, so the goal seam refuses the turn and the calendar handlers keep it."""
+def test_a_capability_with_no_executor_is_declined_rather_than_half_collected(monkeypatch):
+    """Collecting a title, a start and a timezone and only then admitting nothing can perform the call is
+    the exchange this whole workstream exists to delete, so a slot-bearing capability with no
+    CapabilityExecutor is refused up front.
+
+    `calendar.create_event` used to be that capability — the row was missing and every calendar turn was
+    declined (D3). Both declared kinds have an executor now, so the refusal is exercised by REMOVING the
+    row: the mechanism is proven to still work, and the only reason it no longer fires in production is
+    that the executor is genuinely there.
+    """
     handler = goal_handler.GoalHandler()
-    octx = _octx(_decision(IntentKind.actionable, caps=["calendar.create_event"]))
+    octx = _octx(_decision(IntentKind.actionable, caps=[CREATE_EVENT]))
+
+    # THE FIX, asserted first: the capability that used to be refused is claimed.
+    assert _run(handler.evaluate(octx)).disposition is conversation_outcomes.Disposition.claim
+
+    monkeypatch.delitem(goal_handler._EXECUTORS, CREATE_EVENT)
     verdict = _run(handler.evaluate(octx))
     assert verdict.disposition is conversation_outcomes.Disposition.decline
     assert verdict.reason == goal_handler.NO_EXECUTOR
-    # positive control: the same shape of turn on a capability that DOES have one is claimed.
+    # positive control: the same shape of turn on a capability that still HAS one is claimed.
     claimed = _run(handler.evaluate(_octx(_decision(IntentKind.actionable, caps=[SEND]))))
     assert claimed.disposition is conversation_outcomes.Disposition.claim
 

@@ -35,13 +35,17 @@ WHAT THE MODEL IS NOT ALLOWED TO DO
 WHY EXECUTION IS BOUND TO A CAPABILITY, NOT TO A HANDLER
 
 `_EXECUTORS` maps a capability id onto the `CapabilityExecutor` that already knows how to perform and
-VERIFY it. Today it has one row, because `gmail.send_message` is the only slot-bearing capability in this
-tree with a CapabilityExecutor behind it. `calendar.create_event` has a declared slot set and no such
-executor (`calendar_executor` implements update and delete only), so this handler DECLINES it and the
-existing calendar handlers own that turn exactly as they did before. That is a deliberate refusal rather
-than an omission: collecting a title, a start and a timezone and only then admitting nothing can perform
-the call is the precise exchange this workstream exists to delete. When a calendar-create executor lands,
-wiring it is one row here and no code.
+VERIFY it. It has two rows — `gmail.send_message` and `calendar.create_event` — and the second one is
+worth remembering, because it was MISSING for the whole of D3 while its executor sat written and tested
+in `calendar_executor`. The declared slot set existed, the executor existed, and the row joining them did
+not, so this handler declined every calendar turn with `NO_EXECUTOR` and a `schedule_event` goal could
+never come into being. Nothing was broken; a table had a hole in it, and the hole was invisible from
+either side.
+
+The refusal itself stays, and it is deliberate rather than an omission: a slot-bearing capability with no
+executor is declined UP FRONT, because collecting a title, a start and a timezone and only then admitting
+nothing can perform the call is the precise exchange this workstream exists to delete. A third product is
+a row in `goal_slots._DECLARED`, a row here and a row in `_COPY` — no code.
 
 Nothing in this module logs a slot value, a recipient, a subject or a body. Every one of those is message
 content. Ids, capability names, dispositions, statuses and counts only.
@@ -102,8 +106,27 @@ def _gmail_send(arguments: dict, *, idempotency_key: str, adapter=None):
     return GmailSendExecutor(idempotency_key=idempotency_key, adapter=adapter, **arguments)
 
 
+def _calendar_create(arguments: dict, *, idempotency_key: str, adapter=None):
+    """`calendar.create_event`. The row that was missing, and the whole of defect D3.
+
+    `goal_slots` declared a full slot set for this capability and this map had no entry for it, so the
+    handler DECLINED every calendar turn with `NO_EXECUTOR` and a `schedule_event` goal could never exist
+    — which meant every calendar acceptance criterion (one goal id across a move, a replacement Decision,
+    attendees retained) had nothing live to hold. `CalendarCreateExecutor` was written and tested at
+    `565024b` and never wired.
+
+    `attendees` is deliberately absent from `arguments`: it is a slot with no `tool_arg`, so
+    `GoalView.tool_arguments()` never emits it and the executor's `undeliverable()` refusal never fires
+    from this lane. That is the honest shape — the list is collected and remembered, and it does not reach
+    Google until `execution_gate.calendar_create_args` and `models.CalendarEvent` gain somewhere to put it.
+    """
+    from .calendar_executor import CalendarCreateExecutor
+    return CalendarCreateExecutor(idempotency_key=idempotency_key, adapter=adapter, **arguments)
+
+
 _EXECUTORS: dict[str, Any] = {
     "gmail.send_message": _gmail_send,
+    "calendar.create_event": _calendar_create,
 }
 
 
@@ -136,6 +159,13 @@ _COPY: dict[str, _Copy] = {
                   "subject: {subject}\n\n{body}\n\nwant me to send it?"),
         receipt="sent it to {recipient} ✅",
         memory="emailed {recipient} about {subject}"),
+    # `{when}` is rendered by `_values` from whichever slots this kind declares as its moment, so the
+    # sentence says "friday at 4pm" rather than an ISO timestamp. Data, like every other row here.
+    "calendar.create_event": _Copy(
+        noun="event", verb="add", past="added",
+        proposal="ok, {title} {when}. want me to put it on ur calendar?",
+        receipt="{title} is on ur calendar {when} ✅",
+        memory="put {title} on the calendar {when}"),
 }
 
 _FALLBACK_COPY = _Copy(noun="that", verb="do", past="done",
@@ -191,16 +221,34 @@ def entity_slots(kind: GoalKind, entities) -> dict[str, str]:
     return out
 
 
-def _temporal_pair(kind: GoalKind) -> tuple[str | None, str | None]:
-    """(the slot that holds a moment, the slot that holds its end) for this kind, or (None, None).
+def _when_phrase(kind: GoalKind | None, values: dict, *, timezone_name: str = "") -> str:
+    """"friday at 4pm" for whatever moment this kind declares, or "" for a kind that has none.
 
-    Read off the SLOT SCHEMA rather than named here: the datetime-typed slots, in declaration order, are
-    the moment and its end — the convention `goal_slots._DECLARED` already writes down (`start` before
-    `end`). Naming them in this file would be product knowledge, and product knowledge inside a generic
-    handler is how the calendar path and the email path came to disagree about what a turn was.
+    Generic by the same rule as everything else here: the moment is found through
+    `goal_slots.temporal_pair`, off the schema, so an email goal renders an empty `{when}` rather than
+    needing a branch. A student confirming an irreversible-ish write should be reading the time in their
+    own words — an ISO timestamp in a confirmation is a thing nobody checks.
+
+    `timezone_name` is the STUDENT'S, and it is here for one reason: `human_when` says "today" and
+    "tomorrow" relative to now, and now is a different day in Chicago than it is in Auckland. A
+    confirmation that called tonight "tomorrow" would be wrong in the one sentence the student is being
+    asked to check.
     """
-    dts = [s.name for s in goal_slots.slot_specs(kind) if s.value_kind.rstrip("?") == "datetime"]
-    return (dts[0] if dts else None, dts[1] if len(dts) > 1 else None)
+    if kind is None:
+        return ""
+    start_name, end_name = goal_slots.temporal_pair(kind)
+    start = values.get(start_name) if start_name else None
+    if not start:
+        return ""
+    from .calendar_schedule import human_when
+    from .models import CalendarEvent
+    end = values.get(end_name) if end_name else None
+    try:
+        event = CalendarEvent(title="x", start=str(start), end=str(end) if end else None)
+        return human_when(event, now=_now_in(timezone_name) if timezone_name else None)
+    except Exception:
+        # A sentence with a gap in it is recoverable; an exception in the reply path is not.
+        return ""
 
 
 def _now_in(timezone_name: str, now: datetime | None = None) -> datetime:
@@ -229,7 +277,7 @@ def resolve_temporal(kind: GoalKind, incoming: dict[str, SlotValue], *, timezone
     A phrase `temporal.resolve` cannot read is left EXACTLY as the student typed it, so Bruce asks one
     question instead of sending an invented moment to a provider.
     """
-    start_name, end_name = _temporal_pair(kind)
+    start_name, end_name = goal_slots.temporal_pair(kind)
     if start_name is None:
         return dict(incoming)
     sv = incoming.get(start_name)
@@ -529,8 +577,8 @@ class GoalHandler:
         if step.disposition == goal_runtime.ASK_MISSING:
             return co.HandlerOutput(text=_lower_first(step.question), styled=False)
         if step.disposition == goal_runtime.PROPOSE_CONFIRMATION:
-            return await self._propose(octx, view, capability, block)
-        return await self._run(octx, view, capability, block, availability_status=status)
+            return await self._propose(octx, view, capability, block, tz=tz)
+        return await self._run(octx, view, capability, block, availability_status=status, tz=tz)
 
     # --- dispositions ---------------------------------------------------------------------------------------
 
@@ -566,7 +614,7 @@ class GoalHandler:
         await self._move(octx, view, "blocked", blocked_reason=f"{capability}:{status}"[:200])
         return co.HandlerOutput(text=text, styled=False)
 
-    async def _propose(self, octx, view, capability, block):
+    async def _propose(self, octx, view, capability, block, *, tz: str = ""):
         """Put the EXACT operation on screen and park a canonical Decision beside it.
 
         The decision carries the fingerprint of the arguments that would reach the provider, so the
@@ -580,7 +628,7 @@ class GoalHandler:
                 text=_lower_first(goal_runtime.clarifying_question(view.missing))
                 or "i still need a bit more before i can do that.", styled=False)
         copy = _COPY.get(capability, _FALLBACK_COPY)
-        question = _render(copy.proposal, self._values(view, capability))
+        question = _render(copy.proposal, self._values(view, capability, tz=tz))
         fingerprint = _fingerprint(executor.gate_provider, executor.gate_operation,
                                    executor.gate_arguments())
         if not (isinstance(block, dict) and block.get("arguments_fingerprint") == fingerprint
@@ -594,7 +642,7 @@ class GoalHandler:
                  block["decision_id"])
         return co.HandlerOutput(text=question, styled=False)
 
-    async def _run(self, octx, view, capability, block, *, availability_status: str):
+    async def _run(self, octx, view, capability, block, *, availability_status: str, tz: str = ""):
         """Goal -> arguments -> authorization -> MutationGateway -> provider -> read-back -> receipt.
 
         The ONE execution path. Everything irreversible happens inside `agent_loop.run_direct_action`,
@@ -618,7 +666,7 @@ class GoalHandler:
             # The goal changed after the student said yes. Their consent was for the old words, so it is
             # not spent here — the offer is made again against what the goal says now.
             log.info("goal_arguments_changed run=%s cap=%s", view.run_id, capability)
-            return await self._propose(octx, view, capability, None)
+            return await self._propose(octx, view, capability, None, tz=tz)
 
         authorization = ae.try_grant(
             user_id=octx.user_id, provider=executor.gate_provider, operation=executor.gate_operation,
@@ -666,15 +714,20 @@ class GoalHandler:
 
         result = await agent_loop.run_direct_action(
             octx.user_id, executor=executor, idempotency_key=idempotency_key(view.run_id, capability),
-            authorization=authorization, conversation_id=getattr(octx, "conversation_id", "") or None)
+            authorization=authorization, conversation_id=getattr(octx, "conversation_id", "") or None,
+            # The goal this call is executing ON BEHALF OF. `agent_loop` says a caller that has one must
+            # pass it, and this one always has: without it the attempt row records a provider write that
+            # names no goal, so "what did this goal actually do" cannot be answered from the database —
+            # which is the question the whole spine exists to make answerable.
+            parent_run_id=view.run_id)
         await self._settle(octx, view, result)
         log.info("goal_executed run=%s cap=%s status=%s verified=%s", view.run_id, capability,
                  result.status, result.verified)
 
         copy = _COPY.get(capability, _FALLBACK_COPY)
         if result.verified:
-            await self._remember(octx, view, capability, result.tool_result)
-            return co.HandlerOutput(text=_render(copy.receipt, self._values(view, capability)),
+            await self._remember(octx, view, capability, result.tool_result, tz=tz)
+            return co.HandlerOutput(text=_render(copy.receipt, self._values(view, capability, tz=tz)),
                                     styled=False)
         if result.status == "blocked":
             spec = tool_registry.get(capability)
@@ -688,9 +741,10 @@ class GoalHandler:
 
     # --- the small mechanics ----------------------------------------------------------------------------------
 
-    def _values(self, view, capability) -> dict:
+    def _values(self, view, capability, *, tz: str = "") -> dict:
         values = {name: sv.value for name, sv in view.slots.items() if sv is not None and sv.filled}
         values["capability"] = capability
+        values["when"] = _when_phrase(view.kind, values, timezone_name=tz)
         return values
 
     def _bind(self, view, capability):
@@ -811,7 +865,7 @@ class GoalHandler:
             # losing it AND telling the student nothing happened would be worse.
             log.warning("goal_settle_failed run=%s status=%s", view.run_id, result.status)
 
-    async def _remember(self, octx, view, capability, tr):
+    async def _remember(self, octx, view, capability, tr, *, tz: str = ""):
         """The durable fact, written only after the read-back proved it — `memory_finalize`'s own rule.
         "I emailed my coach on the 29th" is true forever; "i am about to" is a slot, and slots stay in the
         goal where they can be corrected."""
@@ -820,7 +874,7 @@ class GoalHandler:
         try:
             await memory_finalize.after_verified_outcome(
                 octx.user_id, capability=capability,
-                summary=_render(copy.memory, self._values(view, capability)),
+                summary=_render(copy.memory, self._values(view, capability, tz=tz)),
                 trusted_text=getattr(octx.msg, "text", None), stated_span=None,
                 source_message_id=octx.pmid, provider_entity_id=tr.provider_entity_id)
         except Exception:

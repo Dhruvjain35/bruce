@@ -408,6 +408,11 @@ async def ensure_goal(user_id: UUID, *, capability: str, conversation_id: str | 
 
     existing_goal = run.get("goal") if isinstance(run.get("goal"), Mapping) else {}
     _, known = goal_slots.from_goal_jsonb(dict(existing_goal))
+    # A DATE-ONLY change keeps the clock the goal already has, and moves the end with the start. Applied
+    # HERE because this is the only point where the old moment and the new one are both in hand: turning
+    # "friday" into a date happens before the goal is loaded, and by the time it is merged the value that
+    # would be overwritten is no longer visible to the thing doing the overwriting.
+    incoming = goal_slots.reconcile_temporal(kind, known, incoming)
     merged = goal_slots.merge_slots(known, incoming)
     goal = goal_slots.to_goal_jsonb(_carry_forward(dict(existing_goal), cap, conversation_id, decision),
                                     kind, merged)
