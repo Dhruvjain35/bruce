@@ -377,10 +377,18 @@ def turn_index_for(octx) -> int:
 
 
 def _proposed_capability(decision) -> str:
+    """The capability the model named, CANONICALIZED onto a registry id.
+
+    `tool_registry.canonical` is the one place that knows the model says "email" where the registry says
+    "gmail". Without it a perfectly good turn — right intent, right entities, right operation — dies at
+    `creation_verdict` with `capability_not_in_registry`, and the student gets a promise instead of a
+    Decision. Canonicalization cannot invent a capability: an id the registry does not know comes back
+    unchanged and is refused exactly as before.
+    """
     for c in (getattr(decision, "required_capabilities", None) or ()):
         text = str(c or "").strip()
         if text:
-            return text
+            return tool_registry.canonical(text)
     return ""
 
 
