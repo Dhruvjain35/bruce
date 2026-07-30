@@ -147,6 +147,7 @@ class OutcomeContext:
     conversation_id: str = ""          # which thread this turn (and any goal it opens) belongs to
     turn_index: int = 0                # position in the conversation; orders slot values deterministically
     mission_lane_ran: bool = False     # the background-mission lane already acted, so nothing else may
+    scope: object = None               # directive_scope.ScopeProposal — what a negation in this turn is ABOUT
 
 
 @runtime_checkable

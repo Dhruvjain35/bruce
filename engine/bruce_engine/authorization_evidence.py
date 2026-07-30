@@ -37,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import UUID, uuid4
 
-from . import decision_resolver
+from . import decision_resolver, directive_scope
 from . import user_action_boundary as uab
 
 log = logging.getLogger("bruce.authz")   # CONTENT-FREE: ids, operations, verdicts — never message text
@@ -389,6 +389,7 @@ def try_grant(*, user_id: UUID, provider: str, operation: str, arguments: dict |
               has_pending_decision: bool = False, has_active_run: bool = False,
               request_span: str | None = None, untrusted_content: str | None = None,
               explicit_operation_request: bool = True,
+              scope: directive_scope.ScopeProposal | None = None,
               now: datetime | None = None) -> AuthorizationEvidence | None:
     """Mint from a raw turn, or return None when the turn does not authorize anything.
 
@@ -411,10 +412,19 @@ def try_grant(*, user_id: UUID, provider: str, operation: str, arguments: dict |
 
     `untrusted_content` is never evaluated. It is passed so the grounding check can prove a span did not
     come from it, and so a caller has somewhere to put the pasted material other than the trusted text.
+
+    `scope` is an optional `directive_scope.ScopeProposal` — a checked reading of which thing a negation in
+    this turn governed. It is forwarded to the boundary and NEVER consulted here, so this function has no
+    way to be talked into a grant the boundary did not reach. It is dropped unless it was built for the
+    exact operation being authorized: a reading about a send may not speak for a deletion.
     """
     now = now or datetime.now(timezone.utc)
+    if scope is not None and scope.operation_id != f"{provider}.{operation}":
+        log.info("authz_scope_wrong_operation op=%s.%s", provider, operation)
+        scope = None
     boundary = uab.evaluate(text, has_pending_decision=has_pending_decision,
-                            has_active_run=has_active_run, source_message_id=trusted_message_id)
+                            has_active_run=has_active_run, source_message_id=trusted_message_id,
+                            scope=scope)
     if boundary.blocks_execution():
         log.info("authz_refused_at_boundary op=%s.%s polarity=%s", provider, operation,
                  boundary.polarity.value)

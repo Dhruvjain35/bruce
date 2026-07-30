@@ -72,9 +72,28 @@ Google integration but no messaging identity and no access. The live founder acc
 
 ---
 
-## 3. THE ONE BLOCKER
+## 3. THE ONE BLOCKER — **CLOSED**. Kept below because the reasoning is the fix's specification.
 
-`user_action_boundary.evaluate` classifies this as `withdrawal`:
+Closed by the semantic attachment seam (`directive_scope`) plus one optional argument on
+`user_action_boundary.evaluate`. What actually shipped, and how it differs from what section 5 predicted:
+
+| | |
+|---|---|
+| the gate | `directive_scope.turn_is_ambiguous` — BOTH an approving and a refusing clause, judged with `decision_resolver.resolve_approval`. 25 of the 238 corpus turns (10.5%) open it; every plain yes and no, and `cancel-pending-10`, never do. |
+| the reader | injectable `ScopeReader`. **The wired default is `DeterministicScopeReader`** (`interpret` restated as a reading), so the seam costs ZERO provider calls. `ModelScopeReader` exists and is reached only by `BRUCE_SCOPE_READER=model`. |
+| the checks | `directive_scope.validate` — 11 typed refusals. An approval needs a clause that is really a clause of this turn, NAMES the operation, is the LAST clause that does, itself reads as approved, has verbatim spans, and clears a 0.75 confidence floor. A rejection needs far less, because it ends in "nothing runs". |
+| the binding | `decision_resolver.trusted_digest`. A proposal cannot be spent against different words — not a joined message, not a later turn. |
+| the authority | `user_action_boundary._scoped`, consulted ONLY on the `rejected` branch and only after the cancellation branch has had its say. `scope=None` leaves `evaluate` byte-for-byte what it was, which is why the corpus cannot move. |
+| `unclear` | withdrawal when the pending operation is destructive, ambiguous otherwise. Both satisfy `blocks_execution()`. |
+
+Measured after: boundary **281/36**, corpus **314/36** (24 categories unmoved, `_OVER_BLOCKED` identical
+at 14/36), acceptance **10 passed / 6 failed**, founder **1 authorization, 1 send, 1 fetch-back, 1 receipt**.
+`tests/test_semantic_scope.py` runs the whole corpus through the seam with the gate forced open in both
+text shapes: 0 forbidden cases gain an affirmative, 0 lose a block.
+
+The rest of this section is the original diagnosis, unedited.
+
+`user_action_boundary.evaluate` classified this as `withdrawal`:
 
 ```
 "YES WRITE IT AND SEND IT NO MORE QUESTIONS"
@@ -134,7 +153,7 @@ The suite was green through every one of these:
 
 ---
 
-## 4. Remaining acceptance failures: 8 passed / 8 failed
+## 4. Remaining acceptance failures: 10 passed / 6 failed (was 8/8; **C is closed**)
 
 Run: `cd engine && .venv/bin/python -m pytest tests/test_acceptance_cross_tool.py -q`
 
@@ -148,8 +167,8 @@ two kinds are open rather than guessing — correct, but nothing then disambigua
 goal open: a drafted subject reaches neither goal, an email confirmation reaches nothing, an inline reply
 is answered by the model. Needs inline-reply and Decision-id targeting to beat recency.
 
-**C — semantic negation attachment (2).** This handoff. `test_the_exact_founder_sequence…` and
-`test_a_negation_that_governs_something_else…`, both at `send_calls == 0`.
+~~**C — semantic negation attachment (2).**~~ **CLOSED** — see section 3.
+`test_the_exact_founder_sequence…` and `test_a_negation_that_governs_something_else…` both pass.
 
 Also open, lower priority:
 - `continuation._amend_patch` reduces "a lot less formal" to "less formal" — degree modifier lost.
@@ -161,7 +180,7 @@ Also open, lower priority:
 
 ---
 
-## 5. The fix to build
+## 5. The fix to build — **BUILT**. Read section 3 for what shipped; this is what was specified.
 
 **Pattern**: the model resolves what the words refer to; the backend decides whether that resolution is
 safe enough to authorize. This is the fourth instance of an asymmetry the codebase already runs on —
@@ -197,7 +216,7 @@ teeth.
 cd /Users/dhruvjain/bruce/engine
 
 # the five gates, in order
-.venv/bin/python -m pytest tests/test_directive_scope.py -q
+.venv/bin/python -m pytest tests/test_semantic_scope.py tests/test_directive_scope.py -q
 .venv/bin/python -m pytest tests/test_action_boundary.py tests/test_authorization_zero_call.py -q  # 281/36
 .venv/bin/python -m pytest tests/ -q -k "authorization"                                            # 314/36
 .venv/bin/python -m pytest tests/test_acceptance_cross_tool.py::test_the_exact_founder_sequence_ends_in_one_verified_send -q

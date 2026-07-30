@@ -593,7 +593,13 @@ class GoalHandler:
             arguments=gate_args, authorization_type=ae.AuthorizationType.decision_approval,
             text=getattr(octx.msg, "text", None), trusted_message_id=octx.pmid,
             decision_id=view.decision_id, conversation_id=getattr(octx, "conversation_id", "") or None,
-            has_pending_decision=True, explicit_operation_request=False)
+            has_pending_decision=True, explicit_operation_request=False,
+            # The runtime's reading of what a negation in this turn governed, computed ONCE for the whole
+            # turn. It is forwarded, never interpreted: this handler cannot tell an approval from a
+            # refusal and has no business trying — `user_action_boundary` is still the only thing that
+            # turns a reading into a verdict, and it discards this outright unless it was derived from
+            # these exact words and built for this exact operation.
+            scope=getattr(octx, "scope", None))
         verdict = execution_gate.evaluate(
             authorization, user_id=octx.user_id, provider=executor.gate_provider,
             operation=executor.gate_operation, arguments=gate_args,

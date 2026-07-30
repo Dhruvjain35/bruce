@@ -84,6 +84,29 @@ async def _open_goal_row(user_id: UUID, conversation_id: str) -> dict | None:
     return None
 
 
+def _pending_operation(run: dict | None):
+    """The EXACT operation this student is being asked to answer for, or None.
+
+    Read off the canonical Decision parked on the run (`agent_runs.active_decision`) rather than inferred
+    from the goal kind: only a decision that is still PENDING is a question the student can be answering,
+    and only the capability recorded on it names the operation they were shown. A goal with no pending
+    decision produces None, and None means the attachment reader is never consulted at all — which is the
+    common case and the cheap one.
+    """
+    if not isinstance(run, dict):
+        return None
+    from . import directive_scope, goal_handler, tool_registry
+    block = run.get("active_decision")
+    if not isinstance(block, dict) or str(block.get("status") or "") != goal_handler.PENDING:
+        return None
+    capability = str(block.get("capability") or "")
+    spec = tool_registry.get(capability) if capability else None
+    if spec is None:
+        return None
+    return directive_scope.pending_operation(provider=spec.provider, operation=spec.operation,
+                                             summary=str(block.get("question") or ""))
+
+
 def _continuation_state(run: dict | None) -> tuple[dict | None, dict | None, dict | None]:
     """(pending decision, recent draft, recent tool result) — all three read off the ONE run.
 
@@ -122,7 +145,7 @@ class _Runtime:
     async def _resolve_outcome(self, *, decision, capsule, msg, profile, channel, user_id, pmid,
                                turn_context=None, continuation=None, open_goal=None,
                                conversation_id: str = "", turn_index: int = 0,
-                               mission_lane_ran: bool = False):
+                               mission_lane_ran: bool = False, scope=None):
         """Two-phase dispatch (invariant 1): PURE evaluate() over every handler, deterministic priority
         selection (claims outrank blocked; single top-priority owner; a tie fails loudly; zero owners ->
         explicit fallback), then execute() ONLY the selected handler (mutation happens here, post-
@@ -134,7 +157,8 @@ class _Runtime:
             user_id=user_id, decision=decision, capsule=capsule, msg=msg, profile=profile,
             channel=channel, pmid=pmid, style=self.style, store=conversation_store,
             turn_context=turn_context, continuation=continuation, open_goal=open_goal,
-            conversation_id=conversation_id, turn_index=turn_index, mission_lane_ran=mission_lane_ran)
+            conversation_id=conversation_id, turn_index=turn_index, mission_lane_ran=mission_lane_ran,
+            scope=scope)
         verdicts = []
         for h in self.handlers:                               # PURE evaluation — no mutation, no enqueue
             v = await h.evaluate(octx)
@@ -181,6 +205,23 @@ class _Runtime:
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
         turn_trace.guard(trace, "trusted_input_ready")
 
+        # THE OPEN GOAL IS READ FIRST, once, and everything below is handed it.
+        #
+        # It moved above the refusal block deliberately. The boundary that decides whether this turn
+        # closes outstanding consent has to be able to know WHAT IS PENDING: "YES WRITE IT AND SEND IT NO
+        # MORE QUESTIONS" contains a negation, and whether that negation is about the pending send or
+        # about being asked things is not answerable from the sentence alone. Reading the row afterwards
+        # would mean two boundaries per turn with two different answers, which is the defect this spine
+        # exists to remove.
+        from . import continuation as continuation_mod, goal_handler
+        open_goal_row = None
+        turn_continuation = None
+        if goal_handler.enabled():
+            try:
+                open_goal_row = await _open_goal_row(user_id, ident)
+            except Exception:
+                log.info("open_goal_read_failed pmid=%s", pmid)   # never costs the turn
+
         # INVALIDATE CONFLICTING AUTHORIZATION — step 3 of the authoritative execution order, and it runs
         # here rather than inside the router because it must hold whether or not semantic routing is on.
         # A refusal has to close outstanding consent even when this turn goes nowhere near a tool: the
@@ -191,14 +232,31 @@ class _Runtime:
         # an authorization ALIVE, which is the unsafe direction, so it is logged at warning rather than
         # swallowed silently. The durable recheck at execution is the second line for exactly this case.
         envelope = None            # hoisted: semantic rescue below needs the SAME separation, not a copy
+        scope_proposal = None      # hoisted: the goal handler spends the SAME reading, not a second one
+
+        # WHAT DOES THE NEGATION IN THIS TURN GOVERN. Resolved once, from the student's own words and the
+        # exact operation on screen, and only for a turn whose clauses genuinely disagree — every plain
+        # yes and every plain no returns from here without a reader being consulted at all.
+        #
+        # IN ITS OWN TRY, deliberately. A fault while reading scope must not also skip the refusal record
+        # below: that would fail in the unsafe direction (an authorization left alive) for a reason that
+        # has nothing to do with authorization. No proposal is the safe degradation and the common case.
         try:
-            from . import authorization_store, input_envelope as _env
-            from . import user_action_boundary as _uab
+            from . import directive_scope, input_envelope as _env
             # TRUSTED TEXT ONLY. The envelope keeps OCR, attachment, quoted, forwarded and provider
             # content beside the student's own words rather than joined to them — a screenshot in which
             # someone else says "yes add it" has approved a pending proposal in this codebase before.
             envelope = _env.from_message(msg)
-            _boundary = _uab.evaluate(envelope.authorizing_text())
+            scope_proposal = await directive_scope.resolve_attachment(
+                envelope.authorizing_text(), pending=_pending_operation(open_goal_row))
+        except Exception:
+            log.info("scope_attachment_failed pmid=%s", pmid)   # degrade to the deterministic reading
+
+        try:
+            from . import authorization_store, input_envelope as _env2
+            from . import user_action_boundary as _uab
+            envelope = envelope or _env2.from_message(msg)
+            _boundary = _uab.evaluate(envelope.authorizing_text(), scope=scope_proposal)
             if _boundary.blocks_execution():
                 await authorization_store.record_refusal(
                     user_id, _boundary, message_id=pmid, conversation_id=ident)
@@ -217,12 +275,8 @@ class _Runtime:
         #
         # Every piece of state here is fetched ONCE and handed onward: `continuation.resolve` is pure by
         # design, and a resolver that fetched its own would grow a second, drifting copy of the truth.
-        from . import continuation as continuation_mod, goal_handler
-        open_goal_row = None
-        turn_continuation = None
         if goal_handler.enabled():
             try:
-                open_goal_row = await _open_goal_row(user_id, ident)
                 pending_decision, recent_draft, recent_tool_result = _continuation_state(open_goal_row)
                 if open_goal_row is not None or pending_decision is not None:
                     # NOTHING IN FLIGHT MEANS NOTHING TO CONTINUE. Resolving against an empty world would
@@ -563,6 +617,11 @@ class _Runtime:
                 # so this number saturates on a long thread — `goal_handler.turn_index_for` floors it
                 # against the goal's own highest index, which is what keeps a late correction winning.
                 open_goal=open_goal_row, conversation_id=ident, turn_index=len(recent) + 1,
+                # The SAME attachment reading the refusal boundary above was judged with. Handing it down
+                # rather than letting the handler resolve its own is the difference between one reading of
+                # this turn and two that can disagree about consent — and, if the model reader is ever
+                # turned on, between one provider call and two.
+                scope=scope_proposal,
                 # A background mission may ALREADY have sent something on this turn. Nothing else may
                 # act on it, or the student gets the same email twice.
                 mission_lane_ran=bool(mission_plan is not None and mission_plan.enqueued))

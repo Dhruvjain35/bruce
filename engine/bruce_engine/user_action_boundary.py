@@ -17,6 +17,19 @@ than reimplemented, so there is exactly one definition of what counts as the stu
 MONOTONIC. Negative, withdrawal, cancellation and ambiguous are terminal for the turn. Nothing later in
 the pipeline can upgrade them. Only a LATER trusted turn carrying clear affirmative authorization creates
 a new authorization state.
+
+ONE TURN DEFEATS THE DETERMINISTIC READING, and it is not a rare one. "YES WRITE IT AND SEND IT NO MORE
+QUESTIONS" contains an approval of the send and a refusal of being asked things, and read as a flat
+sequence of tokens it is a same-breath retraction. Its twin, "skip it for now, just show me what u wrote",
+IS a retraction. Clause by clause the two are the same shape, and four attempts to separate them by rules
+over clause verdicts each fixed one and broke the other, because the difference is what the words REFER
+to and nothing deterministic here knows that.
+
+So `evaluate` accepts an optional `scope`: a `directive_scope.ScopeProposal` that has already been checked
+against the student's own words. It is an INPUT, not an override — every rule below still runs, a
+cancellation still wins outright, and a proposal whose digest does not match the text being judged is
+discarded. Passing nothing leaves this module byte-for-byte the function it was, which is why the 238-case
+authorization corpus cannot move: it never passes one.
 """
 
 from __future__ import annotations
@@ -26,7 +39,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-from . import decision_resolver
+from . import decision_resolver, directive_scope
 
 log = logging.getLogger("bruce.action_boundary")   # CONTENT-FREE: labels only, never message text
 
@@ -68,7 +81,10 @@ _ACTION_VERB = re.compile(r"\b(?:add|put|schedule|book|save|create|send|email|ma
 # forwarded headers); this catches the other shape — a student pasting a sentence mid-message. Measured:
 # 'coach replied "yes add it" — what does he mean' authorized a write, because the quoted affirmative was
 # read as the student's own. Stripped before authorization is considered, never before a refusal is.
-_INLINE_QUOTE = re.compile(r"[\"\u201c\u201d][^\"\u201c\u201d]{1,200}[\"\u201c\u201d]")
+#
+# The pattern itself lives in `decision_resolver`, beside the other answer to "which part of this did the
+# student write", so this path and the scope reader downstream cannot drift apart about what a quote is.
+_strip_inline_quotes = decision_resolver.strip_inline_quotes
 
 
 @dataclass(frozen=True)
@@ -93,14 +109,23 @@ class UserActionBoundary:
 
 
 def evaluate(text: str | None, *, has_pending_decision: bool = False, has_active_run: bool = False,
-             source_message_id: str | None = None) -> UserActionBoundary:
-    """Resolve one turn against the refusal/cancellation boundary. No model, no network, no I/O."""
+             source_message_id: str | None = None,
+             scope: directive_scope.ScopeProposal | None = None) -> UserActionBoundary:
+    """Resolve one turn against the refusal/cancellation boundary. No model, no network, no I/O.
+
+    `scope` is an already-validated reading of WHICH THING a negation in this turn was about, and it is
+    only ever consulted on the one branch where the deterministic reading is known to be unable to tell:
+    a turn that reads as rejected while containing an explicit approval of the pending operation. It
+    cannot reach the cancellation branch, cannot create an approval where the deterministic reading found
+    none, and is discarded outright unless it was derived from these exact words. Callers that pass
+    nothing get the function unchanged.
+    """
     trusted = decision_resolver.trusted_reply_text(text)
     norm = decision_resolver.normalize(trusted)
     # Someone else's words may not authorize. They MAY still be part of a refusal, so the stripping is
     # applied only to what the affirmative path is allowed to see — asymmetric on purpose, in the safe
     # direction: removing a quote can turn a yes into a non-yes, never a no into a yes.
-    resolution = decision_resolver.resolve_approval(_INLINE_QUOTE.sub(" ", text or ""))
+    resolution = decision_resolver.resolve_approval(_strip_inline_quotes(text))
 
     cancel = _CANCEL.search(norm)
     names_existing = bool(_EXISTING_ENTITY.search(norm))
@@ -109,6 +134,9 @@ def evaluate(text: str | None, *, has_pending_decision: bool = False, has_active
     # decides how the block is DESCRIBED, and cancellation is the more specific description when the
     # student is calling off Bruce's own work rather than answering no to a question.
     if cancel:
+        # AHEAD OF THE SCOPE PROPOSAL, and that ordering is load-bearing. "ok do it ... nvm no keep it"
+        # calls off Bruce's own work; no reading of which clause governs what may turn calling it off into
+        # permission to run it.
         target = (Target.provider_entity if names_existing
                   else Target.pending_decision if has_pending_decision
                   else Target.active_run if has_active_run
@@ -117,12 +145,16 @@ def evaluate(text: str | None, *, has_pending_decision: bool = False, has_active
                                   negative_span=cancel.group(0), source_message_id=source_message_id)
 
     if resolution is decision_resolver.Resolution.rejected:
-        # A retraction of something asked in the same message reads as withdrawal rather than a bare no,
-        # because the two are handled identically here but read very differently in a log.
-        polarity = Polarity.withdrawal if _ACTION_VERB.search(norm) else Polarity.negative
         target = (Target.pending_decision if has_pending_decision
                   else Target.active_run if has_active_run
                   else Target.proposed_operation)
+        scoped = _scoped(scope, text=text, trusted=trusted, names_existing=names_existing, target=target,
+                         source_message_id=source_message_id)
+        if scoped is not None:
+            return scoped
+        # A retraction of something asked in the same message reads as withdrawal rather than a bare no,
+        # because the two are handled identically here but read very differently in a log.
+        polarity = Polarity.withdrawal if _ACTION_VERB.search(norm) else Polarity.negative
         span = _CANCEL.search(norm) or _ACTION_VERB.search(norm)
         return UserActionBoundary(trusted, polarity, target, negative_span=span.group(0) if span else None,
                                   source_message_id=source_message_id)
@@ -138,6 +170,59 @@ def evaluate(text: str | None, *, has_pending_decision: bool = False, has_active
                                   affirmative_span=norm[:60], source_message_id=source_message_id)
 
     return UserActionBoundary(trusted, Polarity.unrelated, Target.unknown,
+                              source_message_id=source_message_id)
+
+
+def _scoped(scope: directive_scope.ScopeProposal | None, *, text: str | None, trusted: str,
+            names_existing: bool, target: Target,
+            source_message_id: str | None) -> UserActionBoundary | None:
+    """What a validated attachment reading is ALLOWED to do to a deterministic rejection. `None` -> nothing.
+
+    Four refusals come first, and each one has already cost this repository something:
+
+      * NO PROPOSAL. The overwhelmingly common case, including every unambiguous yes and no, and the whole
+        238-case corpus. Nothing changes.
+      * THE WRONG WORDS. The digest is recomputed here over the text this call is judging. A proposal
+        derived from correctly separated trusted words cannot be spent against a message that still has a
+        forwarded email joined to it, and a proposal from an earlier turn cannot be spent on a later one.
+      * A NAMED EXISTING ENTITY. "dont send the reply, can u delete that whole thread" is two operations,
+        one of which touches something that already exists. That needs its own resolution and its own
+        authorization, so no reading of the first clause may speak for it.
+      * A CLAUSE THAT IS NOT A CLEAN AFFIRMATIVE. Belt and braces over `directive_scope.validate`, which
+        already required it: the affirmative this returns is the one downstream mints consent from, so it
+        is re-derived from the student's own words HERE rather than trusted from a field.
+
+    `unclear` resolves to a WITHDRAWAL when the pending operation cannot be taken back. An `unrelated` or
+    a neutral polarity would not satisfy `blocks_execution()`, and `blocks_execution()` is the thing that
+    actually stops the write — without this the clarifying question and the send would race.
+    """
+    if scope is None:
+        return None
+    if scope.trusted_digest != decision_resolver.trusted_digest(text):
+        log.warning("scope_digest_mismatch op=%s", scope.operation_id)
+        return None
+
+    if scope.operation_polarity is directive_scope.Polarity.unclear:
+        polarity = Polarity.withdrawal if scope.pending_destructive else Polarity.ambiguous
+        return UserActionBoundary(trusted, polarity, target, confidence=0.5,
+                                  source_message_id=source_message_id)
+
+    if names_existing:
+        return None
+
+    if scope.operation_polarity is directive_scope.Polarity.approve:
+        if decision_resolver.resolve_approval(scope.clause) is not decision_resolver.Resolution.approved:
+            log.warning("scope_approval_not_affirmative op=%s", scope.operation_id)
+            return None
+        log.info("scope_approval_accepted op=%s reader=%s conf=%.2f", scope.operation_id, scope.reader,
+                 scope.confidence)
+        return UserActionBoundary(trusted, Polarity.affirmative, target,
+                                  affirmative_span=scope.clause[:60], confidence=scope.confidence,
+                                  source_message_id=source_message_id)
+
+    # A reject proposal describes the deterministic answer rather than changing it. It is honoured anyway,
+    # because naming the clause that did the refusing is what a log needs to be worth reading.
+    return UserActionBoundary(trusted, Polarity.withdrawal, target, negative_span=scope.clause[:60],
                               source_message_id=source_message_id)
 
 
