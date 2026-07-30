@@ -153,19 +153,29 @@ The suite was green through every one of these:
 
 ---
 
-## 4. Remaining acceptance failures: 10 passed / 6 failed (was 8/8; **C is closed**)
+## 4. Remaining acceptance failures: 13 passed / 3 failed (was 8/8; **B and C are closed**)
 
 Run: `cd engine && .venv/bin/python -m pytest tests/test_acceptance_cross_tool.py -q`
 
-**A — `calendar.create_event` not reachable from the goal seam (3).** `CalendarCreateExecutor` exists
-(committed at `565024b`) but is not in `goal_handler._EXECUTORS`, so the seam declines with
-`capability_has_no_executor`. Symptoms: every calendar turn declined; "move it to friday" reaches no
-handler; a 4pm the student set becomes all-day.
+**A — `calendar.create_event` not reachable from the goal seam (3), and the only group left.**
+`CalendarCreateExecutor` exists (committed at `565024b`) but is not in `goal_handler._EXECUTORS`, so the
+seam declines with `capability_has_no_executor`. Two of the three failures are exactly that
+(`test_a_calendar_request_never_becomes_a_typed_goal`, `test_move_it_to_friday_lands_on_the_work_in_flight`).
+The third, `test_moving_the_day_of_a_calendar_goal_keeps_the_clock_the_student_already_set`, is grouped
+here because it is a calendar-goal symptom, but its cause is D5 below — `goal_handler.resolve_temporal`,
+not the missing executor row. It runs entirely against `goal_runtime` and `continuation` with no runtime
+and no selection, so nothing in the B fix could reach it.
 
-**B — deterministic multi-goal disambiguation (3).** `goal_runtime.resolve_capability` returns `""` when
-two kinds are open rather than guessing — correct, but nothing then disambiguates. With a newer calendar
-goal open: a drafted subject reaches neither goal, an email confirmation reaches nothing, an inline reply
-is answered by the model. Needs inline-reply and Decision-id targeting to beat recency.
+~~**B — deterministic multi-goal disambiguation (3).**~~ **CLOSED** by `goal_selection`, a pure ordered
+selector the runtime calls with every open typed run instead of taking the newest one.
+`conversation_runtime._open_goal_row` returned THE NEWEST typed run and every downstream question — which
+pending Decision, which draft, which capability — was read off that row; recency is a reading of the clock,
+and the clock knows nothing about the turn. The order is: inline reply target, then the one pending
+Decision (excluding change requests, which `continuation` already ranks ahead of approval), then an
+explicit operation or kind noun, then unique slot compatibility, then recency ONLY when one candidate is
+left, else one question and no write. Evidence arrives in two instalments — a reply and a Decision are
+known before anything reasons, a drafted subject is the reasoner's output — so `refine` adds the second,
+and may only break a tie, never move a turn off a goal `continuation` has already bound.
 
 ~~**C — semantic negation attachment (2).**~~ **CLOSED** — see section 3.
 `test_the_exact_founder_sequence…` and `test_a_negation_that_governs_something_else…` both pass.
@@ -217,10 +227,11 @@ cd /Users/dhruvjain/bruce/engine
 
 # the five gates, in order
 .venv/bin/python -m pytest tests/test_semantic_scope.py tests/test_directive_scope.py -q
+.venv/bin/python -m pytest tests/test_goal_selection.py -q                                         # 42
 .venv/bin/python -m pytest tests/test_action_boundary.py tests/test_authorization_zero_call.py -q  # 281/36
 .venv/bin/python -m pytest tests/ -q -k "authorization"                                            # 314/36
 .venv/bin/python -m pytest tests/test_acceptance_cross_tool.py::test_the_exact_founder_sequence_ends_in_one_verified_send -q
-.venv/bin/python -m pytest tests/test_acceptance_cross_tool.py -q                                   # target 10/6
+.venv/bin/python -m pytest tests/test_acceptance_cross_tool.py -q                                   # 13/3
 
 # one corpus case alone
 .venv/bin/python -m pytest "tests/test_authorization_zero_call.py::test_no_corpus_case_that_forbids_writes_ever_reaches_an_adapter[cancel-pending-10]" -q

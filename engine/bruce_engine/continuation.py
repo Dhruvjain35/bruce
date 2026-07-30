@@ -378,6 +378,19 @@ def _contiguous_value(pattern: re.Pattern[str], text: str) -> str:
     return text[start:end].strip()
 
 
+def patches_a_slot(text: str | None, kind: GoalKind | None) -> bool:
+    """Would this turn write a slot on a goal of THAT kind? The public form of `_amend_patch`.
+
+    Exists for `goal_selection`, which has to ask "could this turn's own words live in this goal" while
+    choosing between two open ones. It asks THIS function rather than reimplementing the reading, because
+    a selector whose idea of compatibility differed from the code that stores the value would pick a goal
+    the turn then silently fails to update — the transcript's failure mode, one layer up.
+    """
+    raw = decision_resolver.trusted_reply_text(text)
+    patch, _roles = _amend_patch(decision_resolver.normalize(raw), raw, kind)
+    return bool(patch)
+
+
 def _amend_patch(normalized: str, raw: str, kind: GoalKind | None) -> tuple[dict[str, str], tuple[str, ...]]:
     """(patch, roles that fired). Roles are returned even when they map to no slot, because "a change was
     requested and I own no slot for it" and "no change was requested" are different turns and must not

@@ -66,22 +66,26 @@ def _context(recent: list) -> str:
     return "Recent conversation (oldest first):\n" + "\n".join(lines[-8:])
 
 
-async def _open_goal_row(user_id: UUID, conversation_id: str) -> dict | None:
-    """The newest open AgentRun that declares a TYPED goal kind — the run a continuation can land on.
+async def _open_goal_candidates(user_id: UUID, conversation_id: str) -> list[dict]:
+    """EVERY open AgentRun that declares a TYPED goal kind, newest first — the runs a turn could land on.
 
-    Selected by KIND rather than by "newest run" for the reason `goal_runtime` spells out: a background
-    audit run, a mission row and a real goal all share this table, and only the last of them has slots a
-    turn can answer into. A run with no declared kind is skipped rather than returned, because handing
+    Runs with no declared kind are skipped rather than returned: a background audit run, a mission row and
+    a real goal all share this table, and only the last of them has slots a turn can answer into. Handing
     `continuation` a run whose `_goal_kind` is None makes every amendment resolve to "I own no slot for
     that" — a change the student asked for, silently understood and silently dropped.
+
+    This used to return the FIRST such run and call it the answer. It returns all of them now because
+    "newest" is a reading of the clock, and with an email goal and a calendar goal both open the clock
+    knows nothing about which one the student just typed at. `goal_selection.select` does the choosing.
     """
     from . import goal_runtime, goal_slots
+    out: list[dict] = []
     for run in await goal_runtime.open_runs(user_id, conversation_id=conversation_id):
         goal = run.get("goal")
         kind, _slots = goal_slots.from_goal_jsonb(goal if isinstance(goal, dict) else None)
         if kind is not None:
-            return run
-    return None
+            out.append(run)
+    return out
 
 
 def _pending_operation(run: dict | None):
@@ -145,7 +149,7 @@ class _Runtime:
     async def _resolve_outcome(self, *, decision, capsule, msg, profile, channel, user_id, pmid,
                                turn_context=None, continuation=None, open_goal=None,
                                conversation_id: str = "", turn_index: int = 0,
-                               mission_lane_ran: bool = False, scope=None):
+                               mission_lane_ran: bool = False, scope=None, selection=None):
         """Two-phase dispatch (invariant 1): PURE evaluate() over every handler, deterministic priority
         selection (claims outrank blocked; single top-priority owner; a tie fails loudly; zero owners ->
         explicit fallback), then execute() ONLY the selected handler (mutation happens here, post-
@@ -158,7 +162,7 @@ class _Runtime:
             channel=channel, pmid=pmid, style=self.style, store=conversation_store,
             turn_context=turn_context, continuation=continuation, open_goal=open_goal,
             conversation_id=conversation_id, turn_index=turn_index, mission_lane_ran=mission_lane_ran,
-            scope=scope)
+            scope=scope, goal_selection=selection)
         verdicts = []
         for h in self.handlers:                               # PURE evaluation — no mutation, no enqueue
             v = await h.evaluate(octx)
@@ -213,14 +217,24 @@ class _Runtime:
         # about being asked things is not answerable from the sentence alone. Reading the row afterwards
         # would mean two boundaries per turn with two different answers, which is the defect this spine
         # exists to remove.
-        from . import continuation as continuation_mod, goal_handler
-        open_goal_row = None
+        from . import continuation as continuation_mod, goal_handler, goal_selection
+        goal_candidates: list[dict] = []
+        selection = goal_selection.Selection(None, goal_selection.NOTHING_OPEN)
         turn_continuation = None
         if goal_handler.enabled():
             try:
-                open_goal_row = await _open_goal_row(user_id, ident)
+                goal_candidates = await _open_goal_candidates(user_id, ident)
+                # WHICH open goal is this turn about. Ordered evidence, never recency: an inline reply
+                # names a message that belongs to one goal, and a yes answers the one goal holding a
+                # question. Both are known before anything reasons, which is exactly why they are the
+                # rules that run here — `goal_selection.refine` adds the model's reading further down.
+                selection = goal_selection.select(
+                    goal_candidates, text=msg.text,
+                    reply_to_message_id=(msg.reply_to_message_id or msg.thread_root_message_id))
+                log.info("goal_selection pmid=%s %s", pmid, selection.telemetry)
             except Exception:
                 log.info("open_goal_read_failed pmid=%s", pmid)   # never costs the turn
+        open_goal_row = selection.run
 
         # INVALIDATE CONFLICTING AUTHORIZATION — step 3 of the authoritative execution order, and it runs
         # here rather than inside the router because it must hold whether or not semantic routing is on.
@@ -293,7 +307,12 @@ class _Runtime:
             except Exception:
                 log.info("continuation_error pmid=%s", pmid)   # never costs the turn; the router still runs
                 turn_continuation = None
-        resolved_continuation = turn_continuation is not None and turn_continuation.resolved
+        # A turn that speaks to work in flight but names none of it is NOT a new request, so it is held
+        # back from the classifier for the same reason a resolved continuation is: routing it would
+        # re-enqueue whatever lane the original ask landed in, and the answer this turn is owed is one
+        # question rather than a second copy of the work.
+        resolved_continuation = ((turn_continuation is not None and turn_continuation.resolved)
+                                 or selection.ambiguous)
 
         # G0.1 FastRouter: classify the cheapest-correct execution path (fast chat / single verified action /
         # foreground agent / durable mission) BEFORE the heavy reasoner, and instrument its latency. This turn
@@ -326,8 +345,10 @@ class _Runtime:
                 # saying "yeah send it" could get the same email twice.
                 trace.absent("router_started", turn_trace.NOT_APPLICABLE)
                 trace.absent("router_finished", turn_trace.NOT_APPLICABLE)
-                log.info("router_skipped pmid=%s reason=continuation kind=%s evidence=%s", pmid,
-                         turn_continuation.kind.value, turn_continuation.evidence)
+                log.info("router_skipped pmid=%s reason=%s kind=%s evidence=%s", pmid,
+                         "continuation" if turn_continuation is not None else selection.rule,
+                         turn_continuation.kind.value if turn_continuation is not None else None,
+                         turn_continuation.evidence if turn_continuation is not None else None)
             else:
                 turn_trace.guard(trace, "router_started")
                 rd, rt = await fast_router.route(
@@ -604,6 +625,22 @@ class _Runtime:
 
             decision = rr.decision
 
+        # THE SECOND INSTALMENT OF EVIDENCE. A drafted subject and a named operation are the reasoner's
+        # output and cannot exist before it runs, so the selector gets them here — and may only break a
+        # tie it could not break above. A goal it ALREADY named is final: `continuation.resolve` has by
+        # now bound this turn's yes, amendment or pointer to that run, and re-selecting underneath it
+        # would leave a confirmation of one goal's Decision sitting on another's.
+        if goal_candidates:
+            try:
+                selection = goal_selection.refine(
+                    selection, goal_candidates, text=msg.text,
+                    reply_to_message_id=(msg.reply_to_message_id or msg.thread_root_message_id),
+                    decision=decision)
+                open_goal_row = selection.run
+                log.info("goal_selection_refined pmid=%s %s", pmid, selection.telemetry)
+            except Exception:
+                log.info("goal_selection_refine_failed pmid=%s", pmid)
+
         # Outcome dispatch (D-INT-1/D-INT-3): two-phase evaluate -> priority select -> execute, presentation
         # runtime-owned. A handler-collision (two claims at the same top priority) is a config bug: it fails
         # loudly (error telemetry inside select_owner) but degrades the USER to a safe honest reply.
@@ -622,6 +659,10 @@ class _Runtime:
                 # this turn and two that can disagree about consent — and, if the model reader is ever
                 # turned on, between one provider call and two.
                 scope=scope_proposal,
+                # WHICH goal, and by which rule. The handler reads `ambiguous` off it to ask one question
+                # instead of guessing between two goals — the guess is how a bare "no" cancels the one the
+                # student was not talking about.
+                selection=selection,
                 # A background mission may ALREADY have sent something on this turn. Nothing else may
                 # act on it, or the student gets the same email twice.
                 mission_lane_ran=bool(mission_plan is not None and mission_plan.enqueued))

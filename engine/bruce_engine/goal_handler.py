@@ -86,6 +86,7 @@ OFF = "goal_spine_off"
 MISSION_LANE = "background_mission_owns_turn"
 NO_EXECUTOR = "capability_has_no_executor"
 UNTOUCHED = "open_goal_untouched_by_this_turn"
+AMBIGUOUS_GOAL = "several_open_goals_and_the_turn_names_none"
 
 DECLINE_REASONS: frozenset[str] = frozenset(
     {OFF, MISSION_LANE, NO_EXECUTOR, UNTOUCHED} | goal_runtime.REASONS)
@@ -275,9 +276,13 @@ APPROVED = "approved"
 
 
 def decision_block(*, decision_id: str, capability: str, fingerprint: str, question: str,
-                   run_id: str, status: str = PENDING) -> dict:
+                   run_id: str, status: str = PENDING, source_message_id: str | None = None) -> dict:
+    """`source_message_id` is the turn the proposal was SHOWN on, and it is what makes an inline reply to
+    that proposal resolvable. Without it, `goal_selection` could only point a reply at a goal through slot
+    provenance — true whenever the proposing turn also stated a value, and an accident when it did."""
     return {"decision_id": decision_id, "status": status, "capability": capability,
-            "arguments_fingerprint": fingerprint, "question": question, "run_id": str(run_id)}
+            "arguments_fingerprint": fingerprint, "question": question, "run_id": str(run_id),
+            "source_message_id": str(source_message_id) if source_message_id else None}
 
 
 def _fingerprint(provider: str, operation: str, arguments: dict) -> str:
@@ -362,6 +367,17 @@ _ABOUT_THE_GOAL: frozenset[str] = frozenset({
 })
 
 
+def _ambiguous(octx) -> bool:
+    """Did the runtime fail to work out WHICH open goal this turn is about?
+
+    Read off the selection the runtime already made rather than re-derived here. A handler that decided
+    this for itself would be a second answer to "which goal", and two answers to that question is the
+    defect the whole selection order exists to remove.
+    """
+    selection = getattr(octx, "goal_selection", None)
+    return bool(selection is not None and getattr(selection, "ambiguous", False))
+
+
 class GoalHandler:
     """The generic goal outcome: create or continue ONE AgentRun-backed goal, ask for exactly what is
     missing, put the operation on screen, and execute it once the student says yes.
@@ -427,6 +443,14 @@ class GoalHandler:
             # The background-mission lane already acted on this turn and may already have SENT something.
             # Two lanes proposing the same send is how a student gets the same email twice.
             return decline(MISSION_LANE)
+        if _ambiguous(octx):
+            # Two goals are open and this turn names neither. CLAIMING rather than declining is the point:
+            # the turn is about work in flight, so leaving it to the model would produce a friendly answer
+            # about neither goal — the transcript's own failure — and guessing would let a bare "no"
+            # cancel the one the student was not talking about. One question, no goal, no write.
+            return co.HandlerVerdict(disposition=co.Disposition.claim, priority=self.priority,
+                                     reason=AMBIGUOUS_GOAL,
+                                     telemetry=getattr(octx, "goal_selection").telemetry)
         capability, reason, verdict = self._verdict(octx)
         if verdict is None or not verdict.create:
             return decline(reason, capability=capability or None)
@@ -456,6 +480,13 @@ class GoalHandler:
 
     async def _execute(self, octx):
         from . import calendar_schedule, conversation_outcomes as co, world_state
+
+        selection = getattr(octx, "goal_selection", None)
+        if _ambiguous(octx):
+            # BEFORE `ensure_goal`, and that ordering is the whole guarantee: nothing below this line runs,
+            # so the turn creates no goal, writes no slot, mints no authorization and touches no provider.
+            log.info("goal_ambiguous candidates=%d", len(selection.candidates))
+            return co.HandlerOutput(text=selection.question, styled=False)
 
         capability, reason, verdict = self._verdict(octx)
         kind = goal_slots.kind_for_capability(capability)
@@ -555,7 +586,8 @@ class GoalHandler:
         if not (isinstance(block, dict) and block.get("arguments_fingerprint") == fingerprint
                 and str(block.get("status") or PENDING) == PENDING):
             block = decision_block(decision_id=str(uuid4()), capability=capability,
-                                   fingerprint=fingerprint, question=question, run_id=view.run_id)
+                                   fingerprint=fingerprint, question=question, run_id=view.run_id,
+                                   source_message_id=octx.pmid)
         await agent_run_store.update_run(
             octx.user_id, UUID(view.run_id), status="awaiting_approval", active_decision=block)
         log.info("goal_proposed run=%s cap=%s decision=%s", view.run_id, capability,
