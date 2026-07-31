@@ -32,6 +32,9 @@ MIGRATION_LANES: dict[str, str] = {
     # The brain spine. agent_runs.status becomes a CHECK-constrained MachineState vocabulary, so an
     # illegal state cannot reach the row even if a caller bypasses transitions.propose_transition.
     "0031": "runtime",             # agent_runs.status CHECK over MachineState (brain spine)
+    # `Fill.resolvable` says a recipient may be looked up and never invented. Nothing could look one up
+    # until this table: people the student INTRODUCED, in their own trusted words, with provenance.
+    "0032": "runtime",             # known_people — conversation-learned recipients
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the

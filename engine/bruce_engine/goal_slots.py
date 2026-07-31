@@ -318,6 +318,40 @@ class GoalKind(str, Enum):
     schedule_event = "schedule_event"
 
 
+class Fill(str, Enum):
+    """HOW a slot may legitimately come to hold a value. The taxonomy, declared once.
+
+    Bruce asks the student for anything it does not have. That is correct for an address and absurd for a
+    subject line, and the difference is not a matter of degree — it is a matter of what being WRONG costs:
+
+      * GENERATABLE — Bruce may write it from the stated objective. Getting it wrong produces a clumsy
+        sentence the student reads on screen and rejects before anything happens. A subject line, an email
+        body, an event title. Requiring these to be dictated is what makes "email sam and thank him" turn
+        into an interrogation about subject lines.
+
+      * RESOLVABLE — Bruce may LOOK IT UP but never invent it. A recipient, an attendee, a referenced
+        person. Getting it wrong sends a real letter to a real stranger, so a lookup that finds nothing, or
+        finds two candidates, is a question — never a guess. This is the category that does not exist yet:
+        nothing populates `turn_context.people`, `gmail.resolve_recipient` is live=False, and the only
+        resolution in the tree is an explicit address or a self-reference. Declaring the category now is
+        what stops the generation work from being retrofitted later.
+
+      * STATED — the student has to say it, and Bruce may neither invent nor infer it. The moment an event
+        starts. The target of a deletion. Anything whose effect cannot be taken back or inspected first.
+
+    THE TEST FOR WHICH ONE: if Bruce filled this slot wrongly and the student approved without noticing,
+    what happens? A bad subject is embarrassing; a bad recipient is a letter to a stranger; a bad delete
+    target is gone. Embarrassing is generatable, stranger is resolvable, gone is stated.
+
+    Optional slots are not in this taxonomy at all — nothing is ever blocked on them, so how they get
+    filled is a convenience question rather than a safety one.
+    """
+
+    generatable = "generatable"
+    resolvable = "resolvable"
+    stated = "stated"
+
+
 @dataclass(frozen=True)
 class _SlotDecl:
     """Declaration only. `required` is left None wherever the tool schema already knows the answer, so
@@ -327,6 +361,9 @@ class _SlotDecl:
     tool_arg: str | None = None
     required: bool | None = None
     value_kind: str = "str"
+    fill: Fill = Fill.stated
+    """How this slot may be filled — see `Fill`. Defaults to STATED, which is the safe direction: a new
+    slot nobody classified must be asked for rather than quietly invented."""
     entity_aliases: tuple[str, ...] = ()
     """What the MODEL calls this slot, declared NEXT TO the slot it fills.
 
@@ -351,6 +388,7 @@ class SlotSpec:
     tool_arg: str | None
     required: bool
     value_kind: str
+    fill: Fill = Fill.stated
     entity_aliases: tuple[str, ...] = ()
 
 
@@ -361,23 +399,43 @@ class SlotSpec:
 # because no send has ever been blocked on not knowing a tone.
 _DECLARED: dict[GoalKind, tuple[str, tuple[_SlotDecl, ...]]] = {
     GoalKind.send_email: ("gmail.send_message", (
-        # `email` is the alias that cost a live turn: the model labels the address with the ARTIFACT's
-        # name, not the slot's. The rest are the other names a reader of the same sentence would give it.
-        _SlotDecl("recipient", tool_arg="to",
+        # RESOLVABLE, never generatable: getting a subject wrong is embarrassing, getting a recipient
+        # wrong is a letter to a stranger. `email` is the alias that cost a live turn — the model labels
+        # the address with the ARTIFACT's name, not the slot's.
+        _SlotDecl("recipient", tool_arg="to", fill=Fill.resolvable,
                   entity_aliases=("email", "email_address", "recipient_email", "to", "to_address",
                                   "address", "recipient_address", "send_to")),
-        _SlotDecl("subject", tool_arg="subject", entity_aliases=("subject_line", "email_subject")),
-        _SlotDecl("body", tool_arg="body",
+        # GENERATABLE. "email sam and thank him for the project" states the objective and nothing else;
+        # demanding a subject line back is the interrogation this taxonomy exists to end. The student
+        # reads both on screen before anything is sent, so a clumsy draft costs one "no".
+        _SlotDecl("subject", tool_arg="subject", fill=Fill.generatable,
+                  entity_aliases=("subject_line", "email_subject")),
+        _SlotDecl("body", tool_arg="body", fill=Fill.generatable,
                   entity_aliases=("body_text", "message", "message_body", "content", "email_body")),
-        _SlotDecl("tone", required=False),
-        _SlotDecl("purpose", required=False),
+        _SlotDecl("tone", required=False, fill=Fill.generatable),
+        # The OBJECTIVE. Optional to execute and load-bearing to compose: it is what the generated
+        # subject and body are written FROM, which is why "thank him for helping me" has to land here.
+        _SlotDecl("purpose", required=False, fill=Fill.stated,
+                  entity_aliases=("intent", "reason", "about", "topic", "objective", "why")),
     )),
     GoalKind.schedule_event: ("calendar.create_event", (
-        _SlotDecl("title", tool_arg="title"),
-        _SlotDecl("start", tool_arg="start"),
-        _SlotDecl("end", tool_arg="end"),
-        _SlotDecl("timezone", tool_arg="timezone"),
-        _SlotDecl("attendees", required=False, value_kind="list"),
+        # GENERATABLE: an event nobody named is still an event, and "rehearsal" written from the ask is
+        # inspected on screen before it is created.
+        _SlotDecl("title", tool_arg="title", fill=Fill.generatable,
+                  entity_aliases=("event", "event_title", "name", "summary")),
+        # STATED. A moment Bruce invented puts a real student in the wrong place at the wrong time, and
+        # nothing on the confirmation screen makes that obvious the way a clumsy sentence is.
+        _SlotDecl("start", tool_arg="start", fill=Fill.stated,
+                  entity_aliases=("start_time", "starts_at", "when", "datetime")),
+        # GENERATABLE: an end is DERIVED from the start when the student did not say one — the duration
+        # rule already lives in `reconcile_temporal`, and this is the same statement one layer up.
+        _SlotDecl("end", tool_arg="end", fill=Fill.generatable,
+                  entity_aliases=("end_time", "ends_at")),
+        _SlotDecl("timezone", tool_arg="timezone", fill=Fill.generatable,
+                  entity_aliases=("tz", "time_zone")),
+        # RESOLVABLE for the same reason a recipient is: an invitation reaches a real person.
+        _SlotDecl("attendees", required=False, value_kind="list", fill=Fill.resolvable,
+                  entity_aliases=("attendee", "guests", "invitees", "participants", "with")),
     )),
 }
 
@@ -409,7 +467,7 @@ def _resolve(kind: GoalKind) -> tuple[SlotSpec, ...]:
     for d in decls:
         declared_type = schema.get(d.tool_arg) if d.tool_arg else None
         if declared_type is None:
-            out.append(SlotSpec(d.name, d.tool_arg, bool(d.required), d.value_kind,
+            out.append(SlotSpec(d.name, d.tool_arg, bool(d.required), d.value_kind, d.fill,
                                 d.entity_aliases))
             continue
         # "?" in the arg schema is the tool saying the argument is optional. An explicit override exists
@@ -417,7 +475,7 @@ def _resolve(kind: GoalKind) -> tuple[SlotSpec, ...]:
         # call without it — and today nothing needs one.
         optional = declared_type.endswith("?")
         required = (not optional) if d.required is None else bool(d.required)
-        out.append(SlotSpec(d.name, d.tool_arg, required, declared_type.rstrip("?"),
+        out.append(SlotSpec(d.name, d.tool_arg, required, declared_type.rstrip("?"), d.fill,
                             d.entity_aliases))
     return tuple(out)
 
@@ -457,6 +515,36 @@ def capability_for(kind: GoalKind | str) -> str:
 
 def kind_for_capability(capability: str) -> GoalKind | None:
     return next((k for k, (cap, _) in _DECLARED.items() if cap == capability), None)
+
+
+def classify_fill(kind: GoalKind | str, names) -> dict[Fill, tuple[str, ...]]:
+    """Split slot NAMES by how each may legitimately be filled.
+
+    Takes names rather than recomputing the gap, so the caller's already-computed `missing` stays the one
+    answer to "what is absent". Two functions deriving that separately is how a view and a step come to
+    disagree about the same goal.
+    """
+    gaps: dict[Fill, list[str]] = {f: [] for f in Fill}
+    for name in names or ():
+        spec = spec_for(kind, name)
+        gaps[spec.fill if spec else Fill.stated].append(name)
+    return {f: tuple(v) for f, v in gaps.items()}
+
+
+def generatable_gap(kind: GoalKind | str, names) -> tuple[str, ...]:
+    """Of these missing slots, the ones Bruce may WRITE from the objective rather than ask for."""
+    return classify_fill(kind, names)[Fill.generatable]
+
+
+def blocking_gap(kind: GoalKind | str, names) -> tuple[str, ...]:
+    """Of these missing slots, the ones that genuinely need the student — everything not generatable.
+
+    A RESOLVABLE slot is in here on purpose: until something can look a person up, "who is sam" is a
+    question, and a lookup that is not built yet must read as "ask" rather than as "invent". When
+    resolution lands it removes names from this list by FILLING them, never by reclassifying them.
+    """
+    gaps = classify_fill(kind, names)
+    return gaps[Fill.resolvable] + gaps[Fill.stated]
 
 
 def missing_required(kind: GoalKind | str, slots: dict[str, SlotValue] | None) -> tuple[str, ...]:

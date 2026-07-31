@@ -223,6 +223,45 @@ class Receipt(Base, TSV):
     evidence: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
 
 
+class KnownPerson(Base, TSV):
+    """Someone the student TOLD Bruce about, and the address they gave for them.
+
+    THE ONLY SOURCE OF A RECIPIENT BRUCE DID NOT READ IN THE CURRENT SENTENCE. `goal_slots.Fill.resolvable`
+    says a recipient may be looked up and never invented; this is the thing it looks up, and it holds
+    nothing Bruce inferred — a row exists only because the student said, in their own trusted words, that
+    a person has an address.
+
+    Every column is there because a wrong recipient is a letter to a real stranger:
+
+      * `source_message_id` + `stated_span` — WHICH message said this, and the verbatim words. A row that
+        cannot point at the sentence that created it is a row nobody can audit.
+      * `confidence` — how sure the extraction was. Resolution has a floor; a low-confidence row is kept
+        (it is still what the student said) and does not answer "who is my teacher" on its own.
+      * `superseded_by_id` — a correction does not edit history. "actually her email is X" writes a NEW
+        row and points the old one at it, so "what did Bruce think last tuesday" stays answerable.
+      * `forgotten_at` — forgetting removes a person from RESOLUTION without deleting the audit trail.
+        A hard delete would make "why did it stop knowing that" unanswerable.
+    """
+
+    __tablename__ = "known_people"
+    id = _pk()
+    user_id = _owner()
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    normalized_name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    relationship: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    # Provenance. `stated_span` is the student's own words — held because the address is acted on later,
+    # far from the turn that supplied it, and "where did this come from" must be answerable then.
+    source_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stated_span: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provenance: Mapped[str] = mapped_column(String(32), nullable=False, server_default="user_stated")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, server_default="1.0")
+    superseded_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("known_people.id", ondelete="SET NULL"), nullable=True)
+    forgotten_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (Index("ix_known_people_user_live", "user_id", "normalized_name"),)
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     id = _pk()

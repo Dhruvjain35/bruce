@@ -174,10 +174,26 @@ def test_unavailable_capability_is_reported_before_slots_are_collected():
 
 
 def test_ask_carries_slot_names_not_prose():
+    """Bruce asks for what only the STUDENT can supply, and writes the rest.
+
+    `recipient` is RESOLVABLE and `subject` is GENERATABLE, so a turn missing both is one question about
+    the address — not a two-part interrogation that includes the subject line Bruce is perfectly able to
+    write. The question and the `missing` list carry the blocking slots only.
+    """
     step = goal_runtime.next_step(_view(missing=("recipient", "subject")), availability_ok=True)
     assert step.disposition == goal_runtime.ASK_MISSING
-    assert step.missing == ("recipient", "subject")
-    assert step.question == goal_runtime.clarifying_question(("recipient", "subject"))
+    assert step.missing == ("recipient",), "Bruce asked for a subject line it could have written"
+    assert step.question == goal_runtime.clarifying_question(("recipient",))
+    assert "subject" not in step.question.lower()
+    assert step.target_state is MachineState.preparing
+
+
+def test_a_gap_bruce_may_write_is_composed_rather_than_asked_for():
+    """The other half of the same rule: everything the student had to give is present, so the turn goes
+    to COMPOSE instead of asking. This is "email sam and thank him" not becoming an interrogation."""
+    step = goal_runtime.next_step(_view(missing=("subject", "body")), availability_ok=True)
+    assert step.disposition == goal_runtime.COMPOSE
+    assert set(step.missing) == {"subject", "body"}
     assert step.target_state is MachineState.preparing
 
 

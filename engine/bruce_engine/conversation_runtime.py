@@ -253,6 +253,19 @@ class _Runtime:
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
         turn_trace.guard(trace, "trusted_input_ready")
 
+        # PEOPLE THE STUDENT INTRODUCES ARE LEARNED BEFORE ANYTHING RESOLVES. "my teacher is ms alvarez,
+        # her email is alvarez@school.edu" is a fact about their life, and it has to be durable by the
+        # time the very next turn says "email my teacher". Deterministic and trusted-text-only — see
+        # `people.extract`. Best-effort: failing to learn costs one question later, and nothing else.
+        try:
+            from . import people as _people
+            learned = await _people.learn(user_id, msg.text, source_message_id=pmid)
+            forgotten = await _people.forget(user_id, msg.text)
+            if learned or forgotten:
+                log.info("people pmid=%s learned=%d forgotten=%d", pmid, len(learned), forgotten)
+        except Exception:
+            log.info("people_learn_failed pmid=%s", pmid)
+
         # THE OPEN GOAL IS READ FIRST, once, and everything below is handed it.
         #
         # It moved above the refusal block deliberately. The boundary that decides whether this turn

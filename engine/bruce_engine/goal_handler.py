@@ -469,6 +469,118 @@ _ABOUT_THE_GOAL: frozenset[str] = frozenset({
 })
 
 
+# --- writing the parts the student did not dictate --------------------------------------------------------
+#
+# `Fill.generatable` says a slot may be WRITTEN from the objective. This is the thing that writes it. It is
+# a seam for the same reason `directive_scope.ScopeReader` is: the composition is a model call, the model
+# is wrong some fraction of the time, and every test in this tree has to be able to say exactly what came
+# back. What it produces is `model_derived` by construction, so `goal_runtime._needs_confirmation` puts it
+# on screen and the student reads it before anything is sent — which is the entire reason writing it is
+# safe. A composer that failed silently would be worse than none, so an unavailable one leaves the slots
+# empty and the turn falls back to asking.
+
+_COMPOSE_TIMEOUT_S = float(os.environ.get("BRUCE_COMPOSE_TIMEOUT_S", "8.0"))
+
+
+class DraftComposer:
+    """The production composer: one structured call, hard deadline, no retry."""
+
+    name = "model"
+
+    def __init__(self, *, timeout_s: float | None = None) -> None:
+        self._timeout = timeout_s or _COMPOSE_TIMEOUT_S
+        self._agent = None
+        self.calls = 0
+
+    def _build(self):
+        from pydantic import BaseModel, Field
+        from pydantic_ai import Agent, NativeOutput
+        from pydantic_ai.models.openai import OpenAIChatModelSettings
+
+        from . import llm
+
+        class _Draft(BaseModel):
+            subject: str = Field("", max_length=200)
+            body: str = Field("", max_length=4000)
+
+        self._agent = Agent(
+            llm.routing_model(), output_type=NativeOutput(_Draft),
+            system_prompt=(
+                "You write ONE short email for a student, from their own stated objective.\n"
+                "You are not deciding whether to send it and you never mention that you are an AI.\n"
+                "Write the way the student would: plain, warm, specific, no corporate filler, no em "
+                "dashes. Keep the body under 120 words unless the objective needs more.\n"
+                "The SUBJECT is a real subject line, not a restatement of the objective.\n"
+                "Honour the stated tone. If a relationship is given (a teacher, a coach), match the "
+                "register: professional for an adult in authority, warm for a friend.\n"
+                "Invent NO facts. If you do not know a detail, leave it out rather than making it up — "
+                "a student will read this before it is sent and a fabricated detail is what they will "
+                "have to catch."),
+            model_settings=OpenAIChatModelSettings(max_tokens=700))
+        return self._agent
+
+    async def compose(self, *, objective: str, recipient: str, tone: str = "",
+                      context: str = "") -> dict:
+        import asyncio
+        agent = self._agent or self._build()
+        body = (f"OBJECTIVE: {objective}\nRECIPIENT: {recipient}"
+                + (f"\nTONE: {tone}" if tone else "")
+                + (f"\nCONTEXT FROM THE CONVERSATION: {context}" if context else ""))
+        self.calls += 1
+        try:
+            res = await asyncio.wait_for(agent.run(body), timeout=self._timeout)
+        except Exception:
+            log.info("draft_compose_failed")        # NO exception text: it can echo the message
+            return {}
+        out = res.output
+        subject = str(getattr(out, "subject", "") or "").strip()
+        text = str(getattr(out, "body", "") or "").strip()
+        return {k: v for k, v in (("subject", subject), ("body", text)) if v}
+
+
+_DEFAULT_COMPOSER: DraftComposer | None = None
+
+
+def default_composer() -> DraftComposer:
+    global _DEFAULT_COMPOSER
+    if _DEFAULT_COMPOSER is None:
+        _DEFAULT_COMPOSER = DraftComposer()
+    return _DEFAULT_COMPOSER
+
+
+def compose_objective(view, msg_text: str | None) -> str:
+    """WHAT the draft is about, from the goal rather than from the raw turn.
+
+    `purpose` is the slot the objective lands in and it is preferred over the message text: by the time a
+    draft is composed the objective may have been stated three turns ago, and re-reading only the latest
+    message is how "make it shorter" became a brand-new subjectless request in the transcript.
+    """
+    for name in ("purpose", "subject"):
+        sv = view.slots.get(name)
+        if sv is not None and sv.filled:
+            return str(sv.value)
+    from . import decision_resolver
+    return decision_resolver.trusted_reply_text(msg_text).strip()
+
+
+def _recent_context(octx) -> str:
+    """A few lines of the conversation, for a draft that has to sound like it belongs in it.
+
+    Bounded and TRUSTED-ONLY. A composer handed a forwarded email would happily quote a stranger's words
+    back into a message the student is about to send, and the student would have to notice. The capsule
+    is the runtime's already-assembled view; anything it cannot give up cheaply is simply not context.
+    """
+    capsule = getattr(octx, "capsule", None)
+    turns = getattr(capsule, "recent_turns", None) or []
+    lines: list[str] = []
+    for turn in list(turns)[-4:]:
+        role = str(getattr(turn, "role", "") or "")
+        text = str(getattr(turn, "text", "") or "").strip()
+        if role and text:
+            lines.append(f"{role}: {text[:200]}")
+    return "\n".join(lines)[:1200]
+
+
 def _ambiguous(octx) -> bool:
     """Did the runtime fail to work out WHICH open goal this turn is about?
 
@@ -496,11 +608,14 @@ class GoalHandler:
     name = "goal"
     priority = 90
 
-    def __init__(self, *, adapter=None) -> None:
+    def __init__(self, *, adapter=None, composer=None) -> None:
         # Injection seam for the provider, exactly like `GmailSendExecutor(adapter=...)`. Never set in
         # production (`default_handlers()` passes nothing); a test hands in a fake so the send is real
         # Bruce code against a fake Google rather than a mocked Bruce.
         self._adapter = adapter
+        # The same seam for the DRAFT. A test says exactly what came back from composition, so a
+        # production-surface assertion is about Bruce's behaviour and not about the model's mood.
+        self._composer = composer
 
     # --- phase 1: pure -------------------------------------------------------------------------------------
 
@@ -633,12 +748,103 @@ class GoalHandler:
         if step.disposition == goal_runtime.BLOCKED_CAPABILITY:
             return await self._blocked(octx, view, capability, status)
         if step.disposition == goal_runtime.ASK_MISSING:
-            return co.HandlerOutput(text=_lower_first(step.question), styled=False)
+            # A RESOLVABLE gap gets one lookup before it becomes a question. `Fill.resolvable` has always
+            # said a recipient may be looked up and never invented; `people` is the thing that looks, and
+            # it answers with exactly one person or with a question of its own.
+            view, step = await self._resolve_people(octx, view, capability, step,
+                                                    turn_index=turn_index, available=available,
+                                                    status=status)
+            if step.disposition == goal_runtime.ASK_MISSING:
+                return co.HandlerOutput(text=_lower_first(step.question), styled=False)
+            block = await self._decision_block(octx, view)
+        if step.disposition == goal_runtime.COMPOSE:
+            view = await self._compose(octx, view, capability, step, turn_index=turn_index, tz=tz)
+            # Re-asked, not assumed. A composer that returned nothing leaves the slots empty and this
+            # lands on ASK_MISSING, which is the honest outcome — Bruce says what it still needs rather
+            # than proposing an email with a blank subject.
+            step = goal_runtime.next_step(view, availability_ok=available, availability_status=status)
+            log.info("goal_step_after_compose run=%s disposition=%s", view.run_id, step.disposition)
+            if step.disposition == goal_runtime.ASK_MISSING:
+                return co.HandlerOutput(text=_lower_first(step.question), styled=False)
+            block = await self._decision_block(octx, view)
         if step.disposition == goal_runtime.PROPOSE_CONFIRMATION:
             return await self._propose(octx, view, capability, block, tz=tz)
         return await self._run(octx, view, capability, block, availability_status=status, tz=tz)
 
     # --- dispositions ---------------------------------------------------------------------------------------
+
+    async def _resolve_people(self, octx, view, capability, step, *, turn_index: int,
+                              available: bool, status: str):
+        """Fill a RESOLVABLE gap from people the student has introduced, or leave the question standing.
+
+        The lookup runs only for slots declared `Fill.resolvable` and only when they are what is blocking
+        — a `stated` gap is never resolved, because nothing may look up a moment the student has to give.
+        A resolution that finds nobody, or finds two, leaves the gap exactly where it was and Bruce asks;
+        the question it asks names PEOPLE rather than addresses, which is the only useful form of it.
+
+        The resolved address is `Source.tool_result`: an observation, not a guess, and not the student
+        asserting it again this turn. That ranks it above a model value and below anything they type,
+        which is what lets "no, send it to the other one" correct it.
+        """
+        from . import people as people_mod
+        gaps = goal_slots.classify_fill(view.kind, step.missing)
+        if "recipient" not in gaps[goal_slots.Fill.resolvable]:
+            return view, step
+        try:
+            res = await people_mod.resolve(octx.user_id, getattr(octx.msg, "text", None),
+                                           recent_text=_recent_context(octx))
+        except Exception:
+            log.info("people_resolve_failed run=%s", view.run_id)
+            return view, step
+        log.info("goal_recipient_resolution run=%s status=%s", view.run_id, res.status)
+        if not res.resolved:
+            return view, replace(step, question=people_mod.clarifying_question(res))
+        view = await goal_runtime.ensure_goal(
+            octx.user_id, capability=capability,
+            conversation_id=getattr(octx, "conversation_id", "") or None,
+            slots_in={"recipient": SlotValue(res.email, Source.tool_result, turn_id=octx.pmid,
+                                             turn_index=turn_index)},
+            turn_index=turn_index, decision=octx.decision)
+        return view, goal_runtime.next_step(view, availability_ok=available, availability_status=status)
+
+    async def _compose(self, octx, view, capability, step, *, turn_index: int, tz: str):
+        """Write the generatable slots from the stated objective, and fold them into the goal.
+
+        Nothing here decides anything. The values land as `model_derived`, which is the truth and which
+        has two consequences the design leans on: `goal_slots.merge_slots` will let any later stated
+        value correct them, and `goal_runtime._needs_confirmation` is guaranteed to put them on screen
+        before a send. A composed draft is a PROPOSAL the student reads, never a decision.
+
+        A composer that returns nothing leaves the slots empty on purpose. The caller re-runs `next_step`,
+        lands on ASK_MISSING, and Bruce says what it still needs — which is the honest failure, and a far
+        better one than proposing an email with an empty subject line.
+        """
+        composer = self._composer or default_composer()
+        recipient = view.slots.get("recipient")
+        tone = view.slots.get("tone")
+        try:
+            drafted = await composer.compose(
+                objective=compose_objective(view, getattr(octx.msg, "text", None)),
+                recipient=str(recipient.value) if recipient is not None and recipient.filled else "",
+                tone=str(tone.value) if tone is not None and tone.filled else "",
+                context=_recent_context(octx))
+        except Exception:
+            log.info("goal_compose_failed run=%s cap=%s", view.run_id, capability)
+            drafted = {}
+        wanted = set(step.missing)
+        values = {name: SlotValue(value, Source.model_derived, turn_id=octx.pmid, turn_index=turn_index)
+                  for name, value in (drafted or {}).items()
+                  # ONLY the slots that were actually missing. A composer that returned a recipient would
+                  # be inventing an address, and this is where that stops being possible.
+                  if name in wanted and value}
+        log.info("goal_composed run=%s cap=%s wanted=%d filled=%d", view.run_id, capability,
+                 len(wanted), len(values))
+        if not values:
+            return view
+        return await goal_runtime.ensure_goal(
+            octx.user_id, capability=capability,
+            conversation_id=getattr(octx, "conversation_id", "") or None,
+            slots_in=values, turn_index=turn_index, decision=octx.decision)
 
     async def _cancel(self, octx, view, capability):
         from . import conversation_outcomes as co

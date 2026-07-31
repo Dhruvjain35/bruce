@@ -466,11 +466,13 @@ def _proposed_goal(decision: Any) -> str:
 # --- 4. what happens next --------------------------------------------------------------------------------
 
 ASK_MISSING = "ask_missing"
+COMPOSE = "compose"
 PROPOSE_CONFIRMATION = "propose_confirmation"
 EXECUTE = "execute"
 BLOCKED_CAPABILITY = "blocked_capability"
 
-DISPOSITIONS: frozenset[str] = frozenset({ASK_MISSING, PROPOSE_CONFIRMATION, EXECUTE, BLOCKED_CAPABILITY})
+DISPOSITIONS: frozenset[str] = frozenset({ASK_MISSING, COMPOSE, PROPOSE_CONFIRMATION, EXECUTE,
+                                          BLOCKED_CAPABILITY})
 
 # Slot name -> the words a student would recognise. DATA, not a handler: a new kind adds rows here and to
 # `goal_slots._DECLARED`, and no code changes. A name with no phrase asks for the name itself — clumsy,
@@ -550,10 +552,23 @@ def next_step(view: GoalView, *, availability_ok: bool, availability_status: str
         return NextStep(BLOCKED_CAPABILITY, view.run_id, view.capability, MachineState.blocked,
                         availability_status=availability_status or "unavailable",
                         decision_id=view.decision_id)
-    if view.missing:
+    # ASKING COMES FIRST, and only for what genuinely needs the student. A recipient nobody can look up
+    # and a moment nobody stated are questions; a subject line is not. Splitting these is what turns
+    # "email sam and thank him" from an interrogation into one confirmation.
+    blocking = goal_slots.blocking_gap(view.kind, view.missing)
+    if blocking:
         return NextStep(ASK_MISSING, view.run_id, view.capability, MachineState.preparing,
-                        missing=view.missing, question=clarifying_question(view.missing),
+                        missing=blocking, question=clarifying_question(blocking),
                         availability_status=availability_status, decision_id=view.decision_id)
+    writable = goal_slots.generatable_gap(view.kind, view.missing)
+    if writable:
+        # Everything the student HAS to supply is present and the rest is Bruce's to write. The composed
+        # values land as `model_derived`, so `guessed_required` is non-empty and `_needs_confirmation`
+        # below is guaranteed to put them on screen before anything runs — the student reads what was
+        # written for them, which is what makes generating it safe at all.
+        return NextStep(COMPOSE, view.run_id, view.capability, MachineState.preparing,
+                        missing=writable, availability_status=availability_status,
+                        decision_id=view.decision_id)
     if _needs_confirmation(view) and not view.confirmed:
         return NextStep(PROPOSE_CONFIRMATION, view.run_id, view.capability, MachineState.awaiting_approval,
                         availability_status=availability_status, decision_id=view.decision_id)
