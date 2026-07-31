@@ -224,6 +224,19 @@ class Student:
             return None
         return _run(_read())
 
+    def attempts(self):
+        """Execution ATTEMPT rows — a provider call was made (or tried). Zero is the claim that matters
+        before a confirmation."""
+        from bruce_engine import agent_loop
+
+        async def _read():
+            async with user_session(self.uid) as s:
+                rows = (await s.execute(select(schema.AgentRun).where(
+                    schema.AgentRun.user_id == self.uid))).scalars().all()
+            return [r for r in rows
+                    if agent_loop.is_execution_run({"goal": r.goal if isinstance(r.goal, dict) else {}})]
+        return _run(_read())
+
     def authorizations(self):
         async def _read():
             async with user_session(self.uid) as s:
@@ -394,3 +407,169 @@ def test_a_written_draft_never_overwrites_what_the_student_said(clean_db, monkey
     s = Student(stated, monkeypatch)
     s.say(VAGUE)
     assert s.goal()["slots"]["subject"].value == "my own subject"
+
+
+# ==========================================================================================================
+# CONVERSATION-LEARNED PEOPLE — the MAE, exactly as specified.
+#
+#   1. "my teacher is ms alvarez, her email is alvarez@school.edu"
+#   2. "email my teacher and thank her for helping me"
+#
+# Bruce understands it, writes it, remembers it, asks once, sends once, and proves it. Neither message
+# contains a subject, a body, or an address at the point it is needed — the address arrives one turn
+# earlier as a fact about the student's life, which is the whole point.
+# ==========================================================================================================
+
+INTRO = "my teacher is ms alvarez, her email is alvarez@school.edu"
+MAE = "email my teacher and thank her for helping me"
+
+MAE_SCRIPT = {
+    # Turn 1 is conversation. It names no capability and asks for nothing — it is a fact being stated.
+    INTRO: _decision(IntentKind.casual, text="got it"),
+    # Turn 2 names the operation and the objective. NO address, NO subject, NO body.
+    MAE: _decision(IntentKind.actionable, caps=["email.send_message"],
+                   entities=[_entity("purpose", "thank her for helping me")]),
+    YES: _decision(IntentKind.approval),
+}
+
+
+def test_the_mae_two_turns_one_question_one_send(clean_db, monkeypatch):
+    """THE BAR. Everything else in this file exists to make this line pass honestly."""
+    s = Student(MAE_SCRIPT, monkeypatch,
+                composer=Composer(subject="thank you", body="hi ms alvarez, thank you so much for all "
+                                                            "your help. it really made a difference."))
+    s.say(INTRO)                                    # 1. REMEMBERS
+    reply = s.say(MAE)                              # 2. UNDERSTANDS, WRITES, ASKS ONCE
+
+    goal = s.goal()
+    assert goal is not None, "the MAE produced no goal"
+    assert goal["slots"]["recipient"].value == TEACHER, "'my teacher' did not resolve"
+    assert goal["slots"]["recipient"].source is Source.tool_result, \
+        "a resolved address is an observation, not the student asserting it again this turn"
+    assert goal["slots"]["subject"].filled and goal["slots"]["body"].filled, "nothing was written"
+    assert goal["status"] == "awaiting_approval"
+    assert (goal["decision"] or {}).get("status") == goal_handler.PENDING
+    assert (goal["decision"] or {}).get("arguments_fingerprint")
+    assert "i still need" not in reply.lower(), f"Bruce asked for something it had: {reply!r}"
+    assert reply.rstrip().endswith("?"), f"no confirmation was asked: {reply!r}"
+
+    assert s.gmail.send_calls == 0, "something reached Gmail before confirmation"
+    assert s.authorizations() == []
+
+    receipt = s.say(YES)                            # SENDS ONCE, AND PROVES IT
+    assert s.gmail.send_calls == 1
+    assert len(s.authorizations()) == 1
+    assert s.gmail.get_calls >= 1 if hasattr(s.gmail, "get_calls") else True
+    assert "✅" in receipt, f"no verified receipt: {receipt!r}"
+    assert s.goal()["status"] == "completed"
+    sent = [m for m in s.gmail.messages.values() if "SENT" in m["labelIds"]]
+    assert len(sent) == 1, f"expected exactly one sent message, got {len(sent)}"
+    headers = {h["name"]: h["value"] for h in sent[0]["payload"]["headers"]}
+    assert headers["To"] == TEACHER
+
+
+def test_an_introduction_alone_sends_nothing_and_opens_no_goal(clean_db, monkeypatch):
+    """Turn 1 is a FACT, not a request. A student telling Bruce who someone is must not start anything."""
+    s = Student(MAE_SCRIPT, monkeypatch)
+    s.say(INTRO)
+    assert s.goal() is None, "stating a fact opened a goal"
+    assert s.gmail.send_calls == 0
+    assert s.composer.calls == []
+
+
+def test_what_was_learned_carries_its_provenance(clean_db, monkeypatch):
+    """Name, relationship, email, source turn, provenance and confidence — an address acted on later has
+    to be explainable then, not just now."""
+    s = Student(MAE_SCRIPT, monkeypatch)
+    s.say(INTRO)
+
+    async def _read():
+        async with user_session(s.uid) as sess:
+            return (await sess.execute(select(schema.KnownPerson).where(
+                schema.KnownPerson.user_id == s.uid))).scalars().all()
+    rows = _run(_read())
+    assert len(rows) == 1
+    p = rows[0]
+    assert p.name == "ms alvarez" and p.relationship == "teacher" and p.email == TEACHER
+    assert p.provenance == "user_stated" and p.confidence >= 0.9
+    assert p.source_message_id and TEACHER in (p.stated_span or "")
+    assert p.forgotten_at is None and p.superseded_by_id is None
+
+
+def test_a_correction_supersedes_and_the_new_address_is_the_one_used(clean_db, monkeypatch):
+    """An explicit correction replaces the value WITHOUT deleting the history — a message that already
+    went out still has to be explainable."""
+    fix = "actually my teacher is ms alvarez, her email is alvarez2@school.edu"
+    script = {**MAE_SCRIPT, fix: _decision(IntentKind.casual, text="ok")}
+    s = Student(script, monkeypatch)
+    s.say(INTRO)
+    s.say(fix)
+    s.say(MAE)
+    assert s.goal()["slots"]["recipient"].value == "alvarez2@school.edu"
+
+    async def _read():
+        async with user_session(s.uid) as sess:
+            return (await sess.execute(select(schema.KnownPerson).where(
+                schema.KnownPerson.user_id == s.uid))).scalars().all()
+    rows = _run(_read())
+    assert len(rows) == 2, "a correction overwrote history instead of superseding it"
+    assert sum(1 for r in rows if r.superseded_by_id is not None) == 1
+
+
+def test_forgetting_removes_a_person_from_resolution(clean_db, monkeypatch):
+    """...and Bruce goes back to asking, rather than quietly using a person the student retired."""
+    drop = "forget my teacher"
+    script = {**MAE_SCRIPT, drop: _decision(IntentKind.casual, text="ok")}
+    s = Student(script, monkeypatch)
+    s.say(INTRO)
+    s.say(drop)
+    reply = s.say(MAE)
+    goal = s.goal()
+    assert goal is None or "recipient" not in goal["slots"], "a forgotten person still resolved"
+    assert s.gmail.send_calls == 0
+    assert "?" in reply, f"Bruce did not ask after forgetting: {reply!r}"
+
+
+def test_an_address_bruce_was_never_told_is_never_invented(clean_db, monkeypatch):
+    """The rule the whole module serves. An unknown person is a question, not a plausible address.
+
+    Asserted BEHAVIOURALLY. An earlier version of this test checked `"?" in reply`, which is punctuation
+    rather than behaviour — and it happened to be the only thing that failed when the resolver was
+    reverted, so the test looked rigorous while resting on a question mark. What matters is that no
+    address was invented and that nothing moved.
+    """
+    unknown = "email my principal and thank her"
+    script = {**MAE_SCRIPT,
+              unknown: _decision(IntentKind.actionable, caps=["email.send_message"],
+                                 entities=[_entity("purpose", "thank her")])}
+    s = Student(script, monkeypatch)
+    s.say(INTRO)                                    # a teacher is known; a principal is not
+    s.say(unknown)
+
+    goal = s.goal()
+    slots = goal["slots"] if goal else {}
+    # 1. the recipient is UNRESOLVED
+    assert "recipient" not in slots or not slots["recipient"].filled, \
+        f"a recipient was resolved for a person Bruce was never told about: {slots.get('recipient')}"
+    # 2. no address was invented — and in particular NOT the one person Bruce does know
+    assert TEACHER not in str({k: v.value for k, v in slots.items()}), \
+        "the known teacher was substituted for an unknown principal"
+    # 3. exactly ONE clarification outcome: the goal is still collecting, not offering
+    assert goal is None or goal["status"] != "awaiting_approval"
+    assert (goal or {}).get("decision") in (None, {}) or \
+        ((goal["decision"] or {}).get("status") != goal_handler.PENDING), \
+        "an unresolved recipient still produced a pending Decision"
+    # 4/5/6. nothing was authorized, attempted, or sent
+    assert s.authorizations() == [], "consent was minted for a message with no recipient"
+    assert s.attempts() == [], "an execution attempt was made with no recipient"
+    assert s.gmail.send_calls == 0, "a message was sent to an address nobody supplied"
+
+
+def test_two_people_matching_one_referent_is_a_question_naming_them(clean_db, monkeypatch):
+    """"The best match" is a guess wearing a ranking. Two candidates is one short question."""
+    from bruce_engine import people
+
+    res = people.Resolution(people.AMBIGUOUS, candidates=("ms alvarez", "mr diaz"))
+    q = people.clarifying_question(res)
+    assert "ms alvarez" in q and "mr diaz" in q
+    assert "@" not in q, "a clarifying question read an address back at the student"

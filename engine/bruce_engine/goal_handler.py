@@ -748,7 +748,15 @@ class GoalHandler:
         if step.disposition == goal_runtime.BLOCKED_CAPABILITY:
             return await self._blocked(octx, view, capability, status)
         if step.disposition == goal_runtime.ASK_MISSING:
-            return co.HandlerOutput(text=_lower_first(step.question), styled=False)
+            # A RESOLVABLE gap gets one lookup before it becomes a question. `Fill.resolvable` has always
+            # said a recipient may be looked up and never invented; `people` is the thing that looks, and
+            # it answers with exactly one person or with a question of its own.
+            view, step = await self._resolve_people(octx, view, capability, step,
+                                                    turn_index=turn_index, available=available,
+                                                    status=status)
+            if step.disposition == goal_runtime.ASK_MISSING:
+                return co.HandlerOutput(text=_lower_first(step.question), styled=False)
+            block = await self._decision_block(octx, view)
         if step.disposition == goal_runtime.COMPOSE:
             view = await self._compose(octx, view, capability, step, turn_index=turn_index, tz=tz)
             # Re-asked, not assumed. A composer that returned nothing leaves the slots empty and this
@@ -764,6 +772,40 @@ class GoalHandler:
         return await self._run(octx, view, capability, block, availability_status=status, tz=tz)
 
     # --- dispositions ---------------------------------------------------------------------------------------
+
+    async def _resolve_people(self, octx, view, capability, step, *, turn_index: int,
+                              available: bool, status: str):
+        """Fill a RESOLVABLE gap from people the student has introduced, or leave the question standing.
+
+        The lookup runs only for slots declared `Fill.resolvable` and only when they are what is blocking
+        — a `stated` gap is never resolved, because nothing may look up a moment the student has to give.
+        A resolution that finds nobody, or finds two, leaves the gap exactly where it was and Bruce asks;
+        the question it asks names PEOPLE rather than addresses, which is the only useful form of it.
+
+        The resolved address is `Source.tool_result`: an observation, not a guess, and not the student
+        asserting it again this turn. That ranks it above a model value and below anything they type,
+        which is what lets "no, send it to the other one" correct it.
+        """
+        from . import people as people_mod
+        gaps = goal_slots.classify_fill(view.kind, step.missing)
+        if "recipient" not in gaps[goal_slots.Fill.resolvable]:
+            return view, step
+        try:
+            res = await people_mod.resolve(octx.user_id, getattr(octx.msg, "text", None),
+                                           recent_text=_recent_context(octx))
+        except Exception:
+            log.info("people_resolve_failed run=%s", view.run_id)
+            return view, step
+        log.info("goal_recipient_resolution run=%s status=%s", view.run_id, res.status)
+        if not res.resolved:
+            return view, replace(step, question=people_mod.clarifying_question(res))
+        view = await goal_runtime.ensure_goal(
+            octx.user_id, capability=capability,
+            conversation_id=getattr(octx, "conversation_id", "") or None,
+            slots_in={"recipient": SlotValue(res.email, Source.tool_result, turn_id=octx.pmid,
+                                             turn_index=turn_index)},
+            turn_index=turn_index, decision=octx.decision)
+        return view, goal_runtime.next_step(view, availability_ok=available, availability_status=status)
 
     async def _compose(self, octx, view, capability, step, *, turn_index: int, tz: str):
         """Write the generatable slots from the stated objective, and fold them into the goal.
