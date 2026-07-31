@@ -203,17 +203,24 @@ def entity_slots(kind: GoalKind, entities) -> dict[str, str]:
     joined to nothing; an entity type that joins to no declared slot is dropped for the same reason, and
     dropping it is safe precisely because dropping it means Bruce ASKS rather than guesses.
     """
-    names = [s.name for s in goal_slots.slot_specs(kind)]
+    specs = goal_slots.slot_specs(kind)
     out: dict[str, str] = {}
     for e in entities or ():
         raw = re.sub(r"[^a-z0-9]+", "_", str(getattr(e, "type", "") or "").lower()).strip("_")
         if not raw:
             continue
         parts = {t for t in raw.split("_") if t}
-        for name in names:
+        for spec in specs:
+            name = spec.name
             if name in out:
                 continue
-            if raw == name or {t for t in re.split(r"[^a-z0-9]+", name.lower()) if t} & parts:
+            # THE DECLARED ALIAS IS CHECKED FIRST and matched WHOLE. Token overlap alone lost a live
+            # recipient: the model labelled the address `email`, the slot is `recipient`, and those two
+            # words share nothing — so a perfectly extracted address was dropped between the model and
+            # the goal, and Bruce asked for what it had just been given. The alias list lives on the slot
+            # (`goal_slots._SlotDecl.entity_aliases`) so it cannot drift from the thing it names.
+            if raw == name or raw in spec.entity_aliases or (
+                    {t for t in re.split(r"[^a-z0-9]+", name.lower()) if t} & parts):
                 value = getattr(e, "normalized", None) or getattr(e, "value", None)
                 if value:
                     out[name] = str(value)
@@ -293,8 +300,41 @@ def resolve_temporal(kind: GoalKind, incoming: dict[str, SlotValue], *, timezone
     return out
 
 
+_ADDRESS = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+
+
+def address_from_trusted_text(kind: GoalKind, text: str | None) -> dict[str, SlotValue | None]:
+    """An address the student TYPED, for a slot that takes one and does not have one yet.
+
+    THE MODEL IS NOT THE ONLY WAY TO KNOW. When the address is sitting in the student's own sentence,
+    asking for it is indefensible however the extraction went wrong — that exact re-ask is the transcript's
+    signature failure and it has now been reached by three different routes. This closes the last one by
+    not depending on the reading at all.
+
+    Three deliberate limits:
+
+      * TRUSTED TEXT ONLY, through `decision_resolver`'s own separation plus inline-quote stripping. An
+        address inside a forwarded email or a pasted line is somebody else's correspondent, and letting it
+        become the recipient is the shape of defect the authorization corpus is full of.
+      * EXACTLY ONE address, or nothing. Two addresses in one sentence is a question ("which of them?"),
+        and picking the first would be a guess about where mail goes.
+      * `user_stated`, because the student typed it — which is the truth, and which lets it correct a
+        model guess through `merge_slots` rather than losing to one.
+
+    It never overwrites: the caller applies it only to a slot that is still empty.
+    """
+    spec = next((s for s in goal_slots.slot_specs(kind) if s.name == "recipient"), None)
+    if spec is None:
+        return {}
+    from . import decision_resolver
+    trusted = decision_resolver.strip_inline_quotes(decision_resolver.trusted_reply_text(text))
+    found = list(dict.fromkeys(_ADDRESS.findall(trusted)))
+    return {"recipient": found[0]} if len(found) == 1 else {}
+
+
 def turn_slots(kind: GoalKind, *, continuation, decision, turn_id: str | None, turn_index: int,
-               timezone_name: str, now: datetime | None = None) -> dict[str, SlotValue]:
+               timezone_name: str, now: datetime | None = None,
+               trusted_text: str | None = None) -> dict[str, SlotValue]:
     """Everything this turn says about the goal, with provenance attached.
 
     The student's own words arrive through `continuation.slot_patch` and are `user_stated`; the model's
@@ -306,6 +346,12 @@ def turn_slots(kind: GoalKind, *, continuation, decision, turn_id: str | None, t
     values: dict[str, SlotValue] = {}
     for name, value in (entity_slots(kind, getattr(decision, "extracted_entities", ())) or {}).items():
         values[name] = SlotValue(value, Source.model_derived, turn_id=turn_id, turn_index=turn_index)
+    # The address the student TYPED, for a recipient the reading did not produce. `user_stated`, because
+    # they typed it — so it outranks a model guess rather than losing to one, and Bruce never asks for
+    # something that is sitting in the sentence it is answering.
+    for name, value in address_from_trusted_text(kind, trusted_text).items():
+        if not (values.get(name) is not None and values[name].filled):
+            values[name] = SlotValue(value, Source.user_stated, turn_id=turn_id, turn_index=turn_index)
     patch = dict(getattr(continuation, "slot_patch", {}) or {}) if continuation is not None else {}
     for name, value in patch.items():
         values[name] = SlotValue(value, Source.user_stated, turn_id=turn_id, turn_index=turn_index)
@@ -554,7 +600,11 @@ class GoalHandler:
         turn_index = turn_index_for(octx)
         tz = await world_state.resolve_timezone(octx.user_id, default=calendar_schedule.DEFAULT_TZ)
         slots_in = turn_slots(kind, continuation=cont, decision=octx.decision, turn_id=octx.pmid,
-                              turn_index=turn_index, timezone_name=tz)
+                              turn_index=turn_index, timezone_name=tz,
+                              # The student's OWN words. `address_from_trusted_text` re-applies the
+                              # trusted separation itself, so a forwarded correspondent can never become
+                              # the recipient just because the model missed the real one.
+                              trusted_text=getattr(octx.msg, "text", None))
 
         view = await goal_runtime.ensure_goal(
             octx.user_id, capability=capability, conversation_id=conversation_id, slots_in=slots_in,
