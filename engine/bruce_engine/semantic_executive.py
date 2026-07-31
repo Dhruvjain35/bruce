@@ -53,7 +53,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from .semantic_contracts import (Derivation, ExecutiveTurn, Family, Mode, OperationFamily, Presentation,
-                                 ReferencedPerson, SemanticTurn, TurnContext as SemTurnContext)
+                                 ReferencedPerson, SemanticTurn, TriageFailure,
+                                 TurnContext as SemTurnContext)
 
 # The confidence below which a reading does not get to move something consequential on its own.
 # Deliberately the same number as `directive_scope.MIN_APPROVAL_CONFIDENCE` — two different floors meaning
@@ -415,11 +416,26 @@ async def interpret(context: Any, *, triage=None) -> ExecutiveTurn:
         open_task=getattr(context, "open_goals", None),
         awaiting_decision=bool(getattr(context, "pending_decision", None)),
     )
+    # `semantic_triage.triage` — NOT `provider.read`. The entry point owns the hard deadline, the single
+    # transport retry, and the honest failure taxonomy (timeout / transport / provider_rejected /
+    # invalid_schema / low_confidence). Calling `read` directly bypassed all three, which is how the first
+    # language evaluation reported 83% goal-kind accuracy that was really ~97% understanding behind a
+    # rate-limited client: every transport blip became an unexplained "asking instead", indistinguishable
+    # from Bruce failing to understand. A failure whose CAUSE is unrecorded cannot be acted on, and that
+    # is the observability gap that hid this entire class of defect for weeks.
     try:
-        reader = triage if triage is not None else semantic_triage.default_provider()
-        reading = await reader.read(body)
+        outcome = await semantic_triage.triage(body, provider=triage)
     except Exception as exc:
         return _fallback(trusted, f"reader unavailable ({type(exc).__name__}) — asking instead")
+
+    if isinstance(outcome, TriageFailure):
+        # `partial` is a semantically usable read that only failed the confidence floor — better than
+        # nothing, and still subject to every validation below.
+        if outcome.partial is None:
+            return _fallback(trusted, f"triage failed: {outcome.reason} ({outcome.elapsed_ms:.0f}ms)")
+        reading = outcome.partial
+    else:
+        reading = outcome
 
     if reading is None:
         return _fallback(trusted, "no usable read")

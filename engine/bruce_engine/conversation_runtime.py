@@ -12,7 +12,8 @@ import logging
 from uuid import UUID
 
 from . import (capability_snapshot, capability_truth, context_compiler, conversation_context, conversation_outcomes,
-               conversation_store, messaging_outbound, response_composer, router_authority, technical_render)
+               conversation_store, messaging_outbound, response_composer, router_authority,
+               semantic_executive, semantic_shadow, technical_render)
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
@@ -418,6 +419,32 @@ class _Runtime:
                          "stage1_ms=%.1f total_ms=%.1f", pmid, router_ec,
                          rd.action.value if rd.action else None, rd.domain, rd.confidence, rd.source,
                          rt.stage0_ms, rt.stage1_ms, rt.total_ms)
+
+                # SEMANTIC EXECUTIVE, SHADOW ONLY. Reads the same turn beside the router and records the
+                # difference; creates no goal, no Decision, no authorization, calls no provider, and sends
+                # no alternate reply. `observe` returns a record the live path deliberately IGNORES — the
+                # student's turn is byte-for-byte what it would have been.
+                #
+                # It runs HERE, after the router, purely because that is where the comparison baseline
+                # exists. This is NOT the eventual order: the executive belongs BEFORE goal selection and
+                # continuation (which today run at :288 and :356 with decision=None, deciding meaning by
+                # regex before anything has read the sentence). Moving it there changes live behaviour and
+                # is gated on the shadow metrics this call exists to collect.
+                #
+                # Off unless BRUCE_SEMANTIC_SHADOW is set, and separate from BRUCE_ROUTER_SEMANTIC on
+                # purpose: that flag grants AUTHORITY, this one only permits OBSERVATION. Conflating them
+                # would mean the only way to measure the executive is to let it decide.
+                if semantic_shadow.enabled():
+                    try:
+                        await semantic_shadow.observe(
+                            user_id, msg.text or "", message_id=pmid,
+                            context=semantic_executive.mini_context(
+                                msg.text or "",
+                                has_open_goal=bool(open_goal_row),
+                                has_pending_decision=bool(locals().get("pending_decision"))),
+                            decision=rd)
+                    except Exception:
+                        log.info("shadow_error pmid=%s", pmid)   # observability never breaks a turn
                 # G0.3 ToolBroker (SHADOW): for a tool-bearing path, shortlist the FEW relevant, live,
                 # connected tools the router→broker seam would hand a planner — never the whole registry.
                 # Recorded for telemetry + the G0.4 planner that will consume it; execution is unchanged this
