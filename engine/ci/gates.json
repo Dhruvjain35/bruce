@@ -328,6 +328,43 @@
       "pinned_head": "0032_known_people",
       "lane": "0032",
       "lane_owner": "runtime"
+    },
+    "language_generalization": {
+      "_why": "These are pinned OUTSIDE the corpus for the same reason the authorization case ids are: a corpus that grades itself can be made green by editing the corpus. Deleting a family, or quietly moving a failing phrasing into known_gaps, must fail here rather than pass silently.",
+      "corpus_file": "tests/data/paraphrase_families.json",
+      "required_families": [
+        "email_thanks_person",
+        "email_running_late",
+        "calendar_create_event",
+        "calendar_move_event"
+      ],
+      "min_held_out_per_family": 5,
+      "max_known_gaps": 1,
+      "corpus_purity_test": "tests/test_language_generalization.py::test_corpus_is_not_referenced_by_production_code",
+      "authority_contract_test": "tests/test_language_generalization.py::test_interpretation_can_never_grant_permission_or_claim_completion",
+      "_thresholds_why": "Measured by eval/language/harness.py over 5 runs, not asserted here \u2014 a rate needs model calls and CI must not require them. run_gates checks STRUCTURE; the rates are a pre-deploy step recorded in the PR.",
+      "rate_thresholds": {
+        "false_action": 0,
+        "conversation_vs_action": 0.98,
+        "goal_kind": 0.95
+      },
+      "rate_gate_test": "tests/test_language_generalization.py::test_language_rates_meet_their_thresholds",
+      "no_silent_skip_test": "tests/test_language_generalization.py::test_language_suite_is_not_silently_skipped"
+    },
+    "semantic_shadow": {
+      "_why": "Shadow mode is only trustworthy while it cannot act. These modules must never appear in semantic_shadow.py \u2014 importing any of them is how an observer becomes an actor.",
+      "module": "bruce_engine/semantic_shadow.py",
+      "forbidden_imports": [
+        "mutation_gateway",
+        "authorization_evidence",
+        "transitions",
+        "agent_run_store",
+        "gmail_adapter",
+        "calendar_adapter"
+      ],
+      "authority_flag": "BRUCE_ROUTER_SEMANTIC",
+      "observation_flag": "BRUCE_SEMANTIC_SHADOW",
+      "flags_must_be_distinct": true
     }
   },
   "hygiene": {

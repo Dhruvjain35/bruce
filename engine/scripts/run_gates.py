@@ -153,6 +153,76 @@ def check_migration(manifest: dict) -> list[str]:
     return problems
 
 
+def check_language_corpus(manifest: dict) -> list[str]:
+    """The generalization corpus must still have teeth.
+
+    Pinned OUTSIDE the corpus for the same reason the authorization case ids are: a corpus that grades
+    itself can be made green by editing the corpus. The cheapest ways to fake this gate are deleting a
+    family and moving a failing phrasing into `known_gaps`, so both are checked directly.
+    """
+    pinned = manifest["safety"].get("language_generalization")
+    if not pinned:
+        return []
+    problems: list[str] = []
+    corpus_path = ENGINE / pinned["corpus_file"]
+    if not corpus_path.exists():
+        return [f"language corpus {pinned['corpus_file']} is gone"]
+    corpus = json.loads(corpus_path.read_text())
+    live = {f["id"]: f for f in corpus.get("families", [])}
+
+    for fam_id in pinned["required_families"]:
+        fam = live.get(fam_id)
+        if fam is None:
+            problems.append(f"language family {fam_id!r} was DELETED from the corpus")
+            continue
+        held = len(fam.get("held_out", []))
+        if held < pinned["min_held_out_per_family"]:
+            problems.append(f"family {fam_id!r} has {held} held-out phrasings, "
+                            f"below the pinned floor of {pinned['min_held_out_per_family']} — a family "
+                            f"tested only on its seeds measures memorization")
+    gaps = len(corpus.get("known_gaps", {}).get("cases", []))
+    if gaps > pinned["max_known_gaps"]:
+        problems.append(f"known_gaps grew to {gaps} (max {pinned['max_known_gaps']}) — phrasings are "
+                        f"being moved out of the families instead of being understood")
+
+    for key in ("corpus_purity_test", "authority_contract_test"):
+        ok, out = _run_pytest([pinned[key]])
+        counts = {m.group("word"): int(m.group("n")) for m in _SUMMARY.finditer(out)}
+        if not ok or counts.get("failed", 0) or counts.get("passed", 0) == 0:
+            problems.append(f"{key}: {pinned[key]} did not pass")
+
+    print(f"  [{'OK ' if not problems else 'FAIL'}] language corpus         "
+          f"{len(live)} families, {gaps} known gap(s)")
+    return problems
+
+
+def check_shadow_is_inert(manifest: dict) -> list[str]:
+    """Shadow mode is only trustworthy while it CANNOT act.
+
+    The whole "measure before authority" argument rests on the observer being unable to become an actor,
+    and that is exactly the kind of property that erodes quietly — one import at a time, each individually
+    reasonable. So it is asserted structurally rather than trusted to review.
+    """
+    pinned = manifest["safety"].get("semantic_shadow")
+    if not pinned:
+        return []
+    problems: list[str] = []
+    mod = ENGINE / pinned["module"]
+    if not mod.exists():
+        return [f"{pinned['module']} is gone — shadow mode cannot be verified inert"]
+    body = mod.read_text()
+    for forbidden in pinned["forbidden_imports"]:
+        if f"import {forbidden}" in body or f"from .{forbidden}" in body:
+            problems.append(f"semantic_shadow imports {forbidden!r} — an observer that can act is not a "
+                            f"shadow, and every metric collected under it becomes unsafe to trust")
+    if pinned.get("flags_must_be_distinct") and pinned["authority_flag"] == pinned["observation_flag"]:
+        problems.append("the authority and observation flags are the same — the only way to measure the "
+                        "executive would be to let it decide")
+    print(f"  [{'OK ' if not problems else 'FAIL'}] shadow inert            "
+          f"{len(pinned['forbidden_imports'])} forbidden imports checked")
+    return problems
+
+
 def check_hygiene(manifest: dict) -> list[str]:
     """Debug tests do not ship, and source inspection is not behavioural proof."""
     problems: list[str] = []
@@ -212,6 +282,8 @@ def main() -> int:
         problems += check_named_tests(manifest)
         problems += check_acceptance_scenarios(manifest)
         problems += check_migration(manifest)
+        problems += check_language_corpus(manifest)
+        problems += check_shadow_is_inert(manifest)
         problems += check_hygiene(manifest)
         problems += check_safety_baseline_unchanged(args.accept_safety_change)
 

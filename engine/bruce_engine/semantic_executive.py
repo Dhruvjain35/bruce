@@ -56,6 +56,20 @@ from .semantic_contracts import (Derivation, ExecutiveTurn, Family, Mode, Operat
                                  ReferencedPerson, SemanticTurn, TriageFailure,
                                  TurnContext as SemTurnContext)
 
+def _eval_timeout() -> float | None:
+    """`None` in production (use the real deadline); generous when an offline evaluation is running.
+
+    Set by BRUCE_EVAL_TIMEOUT_S. Deliberately opt-in and env-driven rather than a parameter threaded
+    through every caller: nothing in the request path can reach it, so no student turn can accidentally
+    inherit an evaluation's patience.
+    """
+    raw = os.environ.get("BRUCE_EVAL_TIMEOUT_S", "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
 # The confidence below which a reading does not get to move something consequential on its own.
 # Deliberately the same number as `directive_scope.MIN_APPROVAL_CONFIDENCE` — two different floors meaning
 # "may this reading be acted on" would drift apart, and the safer one would lose.
@@ -238,14 +252,14 @@ def reconcile_polarity(model_polarity: str, trusted_text: str) -> tuple[str, str
     #
     # Filling in a REJECT where the model saw nothing is safe: it fails closed, and the worst case is one
     # unnecessary question. Filling in an AFFIRM is not the mirror image of that — it MANUFACTURES
-    # AUTHORIZATION FROM A KEYWORD MATCH, and the language eval caught it doing exactly that:
+    # AUTHORIZATION FROM A KEYWORD MATCH, and the language eval caught it doing exactly that.
     #
-    #     decision_resolver.resolve_approval("did u ever send that")  ->  approved
-    #     decision_resolver.resolve_approval("any word from her")     ->  approved
-    #
-    # Both are STATUS QUESTIONS. A student asking whether their draft went out would have had it sent,
-    # because the substring "send that" looks like assent to a matcher that cannot see the question mark
-    # in front of it. Ten of ten false actions in the 5-run evaluation were this.
+    # `decision_resolver.resolve_approval` returns `approved` for STATUS QUESTIONS that happen to contain
+    # an action verb — a student asking whether their draft had gone out would have had it sent, because
+    # a send-shaped substring looks like assent to a matcher that cannot see the question around it. Ten
+    # of ten false actions in the first 5-run evaluation were this one bug. (The exact phrasings live in
+    # tests/data/paraphrase_families.json and deliberately not here: a phrase in the source is a phrase
+    # someone can be tempted to special-case, which is the disease this whole module treats.)
     #
     # So consent requires positive evidence from the layer that actually read the sentence. The model saw
     # the whole turn and reported no assent; a substring matcher is not entitled to overrule that silence.
@@ -424,7 +438,13 @@ async def interpret(context: Any, *, triage=None) -> ExecutiveTurn:
     # from Bruce failing to understand. A failure whose CAUSE is unrecorded cannot be acted on, and that
     # is the observability gap that hid this entire class of defect for weeks.
     try:
-        outcome = await semantic_triage.triage(body, provider=triage)
+        outcome = await semantic_triage.triage(
+            body, provider=triage,
+            # The deadline is a LATENCY budget, and it belongs to a student waiting on a reply. An offline
+            # evaluation is not that: measuring comprehension against a 2.5s wall means a slow call is
+            # scored as a misunderstanding, which is how the language eval reported 0.86 for a system
+            # measuring 0.99 on an unloaded connection. Production keeps its budget untouched.
+            timeout_s=_eval_timeout())
     except Exception as exc:
         return _fallback(trusted, f"reader unavailable ({type(exc).__name__}) — asking instead")
 

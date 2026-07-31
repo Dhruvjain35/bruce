@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -44,6 +45,9 @@ RUNS = 5
 # throttled client. A measurement instrument that changes what it measures is worse than no instrument.
 MAX_CONCURRENCY = 3
 TRANSPORT_RETRIES = 3
+# Measuring COMPREHENSION, not latency. Production keeps its 2.5s student-facing deadline; scoring a slow
+# call as a misunderstanding is how this harness once reported 0.86 for a system measuring 0.99.
+os.environ.setdefault("BRUCE_EVAL_TIMEOUT_S", "30")
 
 # Operations that CHANGE THE WORLD. A false action is only interesting when it could have consequences —
 # proposing a read is a misunderstanding, proposing a write is an incident. Derived from the registry so a
