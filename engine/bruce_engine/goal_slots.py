@@ -327,6 +327,20 @@ class _SlotDecl:
     tool_arg: str | None = None
     required: bool | None = None
     value_kind: str = "str"
+    entity_aliases: tuple[str, ...] = ()
+    """What the MODEL calls this slot, declared NEXT TO the slot it fills.
+
+    MEASURED LIVE, 2026-07-30. The student typed "email dhruvhydrox@gmail.com with subject ... and body
+    ...". The model extracted it perfectly and labelled the address `type='email'`. The slot is called
+    `recipient`. `entity_slots` matches an entity type to a slot by shared word-token, "email" and
+    "recipient" share none, and the address was dropped between the model's output and the goal — so
+    Bruce asked for the recipient it had just been given. That is the transcript's original symptom
+    reached by a third route, after `"sending messages"` (free-text capability) and `email.send_message`
+    (wrong capability namespace).
+
+    The vocabulary lives HERE rather than in the matcher because a slot's synonyms are a fact about the
+    slot: renaming or removing the slot takes its aliases with it, and there is no second list to rot.
+    """
 
 
 @dataclass(frozen=True)
@@ -337,6 +351,7 @@ class SlotSpec:
     tool_arg: str | None
     required: bool
     value_kind: str
+    entity_aliases: tuple[str, ...] = ()
 
 
 # Slot sets, declared against the capability that will execute them. Slots WITH a tool_arg inherit their
@@ -346,9 +361,14 @@ class SlotSpec:
 # because no send has ever been blocked on not knowing a tone.
 _DECLARED: dict[GoalKind, tuple[str, tuple[_SlotDecl, ...]]] = {
     GoalKind.send_email: ("gmail.send_message", (
-        _SlotDecl("recipient", tool_arg="to"),
-        _SlotDecl("subject", tool_arg="subject"),
-        _SlotDecl("body", tool_arg="body"),
+        # `email` is the alias that cost a live turn: the model labels the address with the ARTIFACT's
+        # name, not the slot's. The rest are the other names a reader of the same sentence would give it.
+        _SlotDecl("recipient", tool_arg="to",
+                  entity_aliases=("email", "email_address", "recipient_email", "to", "to_address",
+                                  "address", "recipient_address", "send_to")),
+        _SlotDecl("subject", tool_arg="subject", entity_aliases=("subject_line", "email_subject")),
+        _SlotDecl("body", tool_arg="body",
+                  entity_aliases=("body_text", "message", "message_body", "content", "email_body")),
         _SlotDecl("tone", required=False),
         _SlotDecl("purpose", required=False),
     )),
@@ -389,14 +409,16 @@ def _resolve(kind: GoalKind) -> tuple[SlotSpec, ...]:
     for d in decls:
         declared_type = schema.get(d.tool_arg) if d.tool_arg else None
         if declared_type is None:
-            out.append(SlotSpec(d.name, d.tool_arg, bool(d.required), d.value_kind))
+            out.append(SlotSpec(d.name, d.tool_arg, bool(d.required), d.value_kind,
+                                d.entity_aliases))
             continue
         # "?" in the arg schema is the tool saying the argument is optional. An explicit override exists
         # for the reverse case — a slot Bruce refuses to guess even though the provider would accept the
         # call without it — and today nothing needs one.
         optional = declared_type.endswith("?")
         required = (not optional) if d.required is None else bool(d.required)
-        out.append(SlotSpec(d.name, d.tool_arg, required, declared_type.rstrip("?")))
+        out.append(SlotSpec(d.name, d.tool_arg, required, declared_type.rstrip("?"),
+                            d.entity_aliases))
     return tuple(out)
 
 
