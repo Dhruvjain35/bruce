@@ -1,0 +1,413 @@
+{
+  "_README": [
+    "PARAPHRASE FAMILIES \u2014 the generalization corpus for Bruce's semantic executive.",
+    "",
+    "Every entry in a family means THE SAME THING to a human. Bruce must map all of them to the same",
+    "normalized objective. These strings are DATA and must never be referenced by production code: the",
+    "moment a module matches one of these phrasings, this corpus stops measuring understanding and starts",
+    "measuring memorization. tests/test_language_generalization.py enforces that with a grep.",
+    "",
+    "The 'held_out' members are the real test. 'seed' members are the wordings someone might plausibly",
+    "have written a rule for; held_out are the ones nobody did. A family passes only if the held-out",
+    "wordings land on the same objective as the seeds.",
+    "",
+    "objective.operation is an EXACT ToolBroker registry id. If a rename makes one of these ids stale, the",
+    "suite must fail loudly rather than silently testing nothing."
+  ],
+  "families": [
+    {
+      "id": "email_thanks_person",
+      "objective": {
+        "operation": "gmail.send_message",
+        "kind": "send_email"
+      },
+      "why": "a student wants gratitude delivered to a person by email",
+      "seed": [
+        "email my teacher and thank her for helping me",
+        "send an email to my teacher thanking her"
+      ],
+      "held_out": [
+        "shoot bobby a quick thank-you for yesterday",
+        "can u tell my teacher i appreciate what he did",
+        "send him something nice, make it professional",
+        "write my teacher a heartfelt thank-you and send it",
+        "email that person i mentioned and say thanks",
+        "can u handle that email for me",
+        "yo can u shoot ms alvarez a quick msg abt tmrw",
+        "lmk if u can send my teacher a thank you note",
+        "i wanna thank my teacher, can u write something and send it",
+        "tell my teacher thanks for the extra help pls",
+        "gonna need a thank you email to my teacher",
+        "my teacher helped me a lot, send her a note saying thanks"
+      ]
+    },
+    {
+      "id": "email_running_late",
+      "objective": {
+        "operation": "gmail.send_message",
+        "kind": "send_email"
+      },
+      "why": "a student wants a person told they will be late",
+      "seed": [
+        "email her that i'll be late"
+      ],
+      "held_out": [
+        "tell her i'm gonna be like 10 mins late",
+        "let my teacher know im running behind",
+        "can u let her know ill be a bit late",
+        "message her that im running like 10 min late",
+        "she should know im gonna be late",
+        "tell ms alvarez i'll be ten minutes late"
+      ]
+    },
+    {
+      "id": "calendar_create_event",
+      "objective": {
+        "operation": "calendar.create_event",
+        "kind": "schedule_event"
+      },
+      "why": "a student wants something put on their calendar",
+      "seed": [
+        "add lunch with sam to my calendar friday",
+        "create an event for lunch with sam on friday"
+      ],
+      "held_out": [
+        "put lunch with sam on friday",
+        "block off an hour tomorrow for studying",
+        "can u put this on my schedule",
+        "i got practice thursday at 6 put that down",
+        "throw dentist on there for tmr at 3",
+        "put the game on my calender friday",
+        "save saturday 2pm for the group project",
+        "pencil in coffee with jess next tuesday",
+        "i have a meeting friday at noon, add it"
+      ],
+      "context": {
+        "recent_turns": "the student mentioned a dentist appointment on thursday at 3pm"
+      }
+    },
+    {
+      "id": "calendar_move_event",
+      "objective": {
+        "operation": "calendar.update_event",
+        "kind": "reschedule_event"
+      },
+      "why": "a student wants an existing event moved",
+      "seed": [
+        "move my dentist appointment to friday"
+      ],
+      "held_out": [
+        "can u push practice to saturday instead",
+        "actually make it friday not thursday",
+        "shift that to next week",
+        "bump the meeting an hour later",
+        "that thing tmr needs to be friday now"
+      ],
+      "context": {
+        "has_open_goal": true,
+        "recent_turns": "the student mentioned a dentist appointment on thursday at 3pm"
+      }
+    }
+  ],
+  "continuations": {
+    "_why": [
+      "Follow-ups that only mean something against live state. Each names the state it needs.",
+      "",
+      "`accept` IS A SET, NOT A LOOSENING. Some turns have two equally correct readings and the model",
+      "picks between them non-deterministically: 'nah dont send that' is `decision_response`+decline on",
+      "one call and `cancellation` on the next. Both refuse, both block execution, and the goal-survival",
+      "difference between them is not something the student expressed. Asserting one exact mode would",
+      "test which coin the model flipped, so instead each case asserts the set of correct readings PLUS",
+      "the property that actually matters \u2014 `must_not_execute`, which is checked on every refusal and is",
+      "a STRICTER claim than the mode equality it replaces."
+    ],
+    "cases": [
+      {
+        "text": "send it",
+        "needs": "pending_send_decision",
+        "accept": [
+          "approve"
+        ]
+      },
+      {
+        "text": "yeah go for it",
+        "needs": "pending_send_decision",
+        "accept": [
+          "approve"
+        ]
+      },
+      {
+        "text": "looks good to me, send whenever",
+        "needs": "pending_send_decision",
+        "accept": [
+          "approve"
+        ]
+      },
+      {
+        "text": "ya thats fine",
+        "needs": "pending_send_decision",
+        "accept": [
+          "approve"
+        ]
+      },
+      {
+        "text": "no rush but yeah go ahead",
+        "needs": "pending_send_decision",
+        "accept": [
+          "approve"
+        ]
+      },
+      {
+        "text": "nah dont send that",
+        "needs": "pending_send_decision",
+        "accept": [
+          "reject",
+          "cancel"
+        ],
+        "must_not_execute": true
+      },
+      {
+        "text": "actually never mind",
+        "needs": "pending_send_decision",
+        "accept": [
+          "reject",
+          "cancel"
+        ],
+        "must_not_execute": true
+      },
+      {
+        "text": "hold off on that for now",
+        "needs": "pending_send_decision",
+        "accept": [
+          "reject",
+          "cancel"
+        ],
+        "must_not_execute": true
+      },
+      {
+        "text": "make it shorter",
+        "needs": "open_email_goal",
+        "accept": [
+          "continue_goal"
+        ]
+      },
+      {
+        "text": "make it sound more professional",
+        "needs": "open_email_goal",
+        "accept": [
+          "continue_goal"
+        ]
+      },
+      {
+        "text": "can u make it sound less like a robot",
+        "needs": "open_email_goal",
+        "accept": [
+          "continue_goal"
+        ]
+      },
+      {
+        "text": "make this sound better and send it",
+        "needs": "open_email_goal",
+        "accept": [
+          "continue_goal",
+          "approve"
+        ]
+      },
+      {
+        "text": "use the same person as before",
+        "needs": "open_email_goal",
+        "accept": [
+          "continue_goal"
+        ]
+      },
+      {
+        "text": "tell her instead",
+        "needs": "open_email_goal",
+        "accept": [
+          "continue_goal"
+        ]
+      },
+      {
+        "text": "did u ever send that",
+        "needs": "open_email_goal",
+        "accept": [
+          "answer_question",
+          "continue_goal"
+        ],
+        "must_not_execute": true
+      },
+      {
+        "text": "any word from her",
+        "needs": "open_email_goal",
+        "accept": [
+          "answer_question",
+          "continue_goal"
+        ],
+        "must_not_execute": true
+      }
+    ]
+  },
+  "conversation": {
+    "_why": "ordinary talk that must NOT create or select a goal, even with goals open.",
+    "cases": [
+      "yo wsp",
+      "hey",
+      "what's 2+2",
+      "can u explain the unit circle",
+      "im so tired lol",
+      "whats the weather gonna be like",
+      "do u like pizza",
+      "how does photosynthesis work"
+    ]
+  },
+  "metamorphic": {
+    "_why": "properties that must hold between two wordings, independent of what the objective is.",
+    "slang_invariance": [
+      [
+        "email my teacher and thank her",
+        "shoot my teacher a quick ty"
+      ],
+      [
+        "put lunch on my calendar friday",
+        "throw lunch on there fri"
+      ],
+      [
+        "tell her i will be late",
+        "lmk her im finna be late"
+      ]
+    ],
+    "typo_invariance": [
+      [
+        "put the game on my calendar friday",
+        "put the game on my calender friday"
+      ],
+      [
+        "email my teacher a thank you",
+        "emial my teachr a thank yuo"
+      ],
+      [
+        "schedule tutoring at four",
+        "schedual tutoring at four"
+      ]
+    ],
+    "punctuation_invariance": [
+      [
+        "email my teacher, and thank her for helping me.",
+        "email my teacher and thank her for helping me"
+      ],
+      [
+        "move that to friday, please",
+        "move that to friday please"
+      ]
+    ],
+    "word_order_invariance": [
+      [
+        "email my teacher a thank you for helping me",
+        "for helping me, send my teacher a thank you email"
+      ],
+      [
+        "put lunch with sam on friday",
+        "on friday put lunch with sam down"
+      ]
+    ],
+    "politeness_invariance": [
+      [
+        "send it",
+        "could you please send it when you get a chance"
+      ],
+      [
+        "move that to friday",
+        "would you mind moving that to friday, thanks so much"
+      ]
+    ],
+    "unrelated_negation_must_not_cancel": [
+      "send it, no rush",
+      "yeah send it, i don't need a copy",
+      "go ahead and send it, no need to show me again",
+      "send that, not the other one"
+    ],
+    "operation_refusal_must_block": [
+      "don't send it",
+      "no dont send that",
+      "actually hold off",
+      "wait dont send",
+      "nah skip it for now",
+      "don't send it yet, i wanna read it first"
+    ],
+    "_context": {
+      "_why": "properties whose members use 'that'/'this' need a referent in context, exactly as the deictic families do. Without one, asking IS the correct behaviour and the pair measures nothing about invariance.",
+      "punctuation_invariance": {
+        "has_open_goal": true,
+        "recent_turns": "the student mentioned a dentist appointment on thursday at 3pm"
+      },
+      "politeness_invariance": {
+        "has_pending_decision": true,
+        "has_open_goal": true,
+        "recent_turns": "the student mentioned a dentist appointment on thursday at 3pm"
+      },
+      "word_order_invariance": {
+        "recent_turns": "the student mentioned lunch with sam"
+      }
+    }
+  },
+  "known_gaps": {
+    "_why": [
+      "Phrasings Bruce does NOT yet understand, kept as strict-xfail so they cannot be quietly",
+      "forgotten and cannot quietly start passing without someone noticing. Deleting a case Bruce",
+      "fails is how a suite stays green while the product stays broken."
+    ],
+    "cases": [
+      {
+        "text": "remind me i've got tutoring at four",
+        "expected": "calendar.create_event",
+        "actual": "reads as operation_family=remember (the memory family), so no calendar capability resolves",
+        "why": "'remind me' is a reminder verb and reminder.create is not a live capability. The read is defensible \u2014 the student may want a reminder rather than a calendar block \u2014 and forcing it to calendar would be guessing at which of two real products they meant.",
+        "fix": "a live reminder capability, or a disambiguating question rather than silence"
+      }
+    ]
+  },
+  "deictic": {
+    "_why": [
+      "Deictic language \u2014 'that', 'this', 'it', 'that thing' \u2014 means nothing without a referent, and",
+      "everything with one. These cases assert BOTH directions, which is the whole point:",
+      "",
+      "  * with NO referent, Bruce must CLARIFY. Guessing which event 'that thing' means is how the",
+      "    wrong calendar entry gets moved.",
+      "  * with an inline reply or exactly ONE compatible open goal, Bruce must RESOLVE that goal.",
+      "",
+      "And resolving the goal is enough. 'move that thing to friday' may legitimately return",
+      "target_goal_id=<the calendar goal> + requested_edit={date: friday} + proposed_operation_id=None:",
+      "the executive said which work and what change, and the backend derives calendar.update_event from",
+      "the selected goal plus the edit. Demanding an operation id from the executive here would be asking",
+      "understanding to do the runtime's job."
+    ],
+    "without_referent": [
+      {
+        "text": "move that thing to friday",
+        "expect_mode": "clarify"
+      },
+      {
+        "text": "can u change that",
+        "expect_mode": "clarify"
+      },
+      {
+        "text": "make it friday instead",
+        "expect_mode": "clarify"
+      }
+    ],
+    "with_one_compatible_goal": [
+      {
+        "text": "move that thing to friday",
+        "expect_resolves_goal": true
+      },
+      {
+        "text": "shift that to next week",
+        "expect_resolves_goal": true
+      },
+      {
+        "text": "make it friday instead",
+        "expect_resolves_goal": true
+      }
+    ]
+  }
+}

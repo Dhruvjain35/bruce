@@ -157,3 +157,133 @@ class Derivation:
     confidence: float = 0.0
     rule: str = ""                             # which derivation rule fired — for telemetry and tests
     ambiguity: tuple[str, ...] = field(default_factory=tuple)
+
+
+# =====================================================================================================
+# THE EXECUTIVE CONTRACT
+# =====================================================================================================
+# `SemanticTurn` above answers "what does this message mean" in provider-neutral terms, and `Derivation`
+# answers "how would that run". Neither carries the DETAIL a student supplied — the slots, the people they
+# named, the edits they asked for, how they want to be shown things. Today that detail is re-derived from
+# the raw string by ~28 separate regex/keyword matchers scattered across continuation.py, directive_scope.py
+# and goal_handler.py, each with its own closed vocabulary. That is why "make it sound less like a robot"
+# does nothing: "robot" is not one of the eleven adjectives in the tone list.
+#
+# `ExecutiveTurn` is the whole reading of one turn — meaning, detail and grounding together — assembled by
+# `semantic_executive` from the model's read plus deterministic derivation. It is what goal selection,
+# continuation and slot filling consume INSTEAD of re-reading the string.
+#
+# IT REMAINS A PROPOSAL. There is no field here meaning authorized, executed, completed, verified or sent,
+# and `test_interpretation_can_never_authorize_execute_or_claim_completion` asserts that on the class
+# itself so a future field cannot quietly gain that power. Bruce reads forwarded mail and OCR'd
+# screenshots; if understanding could authorize, a stranger's sentence would be an instruction.
+
+
+class Mode(str, Enum):
+    """What the student is DOING. A view of `TurnRole` widened with the two states the runtime needs to
+    distinguish and the role vocabulary does not: asking ABOUT work, and being unreadable."""
+    conversation = "conversation"
+    new_goal = "new_goal"
+    continue_goal = "continue_goal"
+    answer_question = "answer_question"
+    clarify = "clarify"
+    approve = "approve"
+    reject = "reject"
+    cancel = "cancel"
+
+
+class Fill(str, Enum):
+    """Where a proposed value came from. Provenance travels with the value or the value is worthless."""
+    stated = "stated"        # the student wrote it, this turn, in trusted text
+    carried = "carried"      # already on the goal
+    resolved = "resolved"    # looked up (a known person, an existing event) — never invented
+    generated = "generated"  # composed by Bruce because composing it is safe
+
+
+@dataclass(frozen=True)
+class SlotPatch:
+    """A PROPOSED change to one typed slot. `goal_handler` merges it under its own provenance rules, and
+    a patch always loses to something the student typed. Proposing `recipient` does not set it."""
+    name: str
+    value: str | None = None
+    fill: Fill = Fill.stated
+    source_span: str | None = None
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True)
+class ReferencedPerson:
+    """Someone the student referred to, AS they referred to them — and carrying no address.
+
+    Resolution is `people.resolve`'s job, deliberately not the model's: a model asked for an address
+    produces a plausible one, and a plausible address is a stranger receiving a student's mail.
+    """
+    mention: str                       # "my teacher", "her", "bobby"
+    relationship: str | None = None
+    is_pronoun: bool = False
+    source_span: str | None = None
+
+
+@dataclass(frozen=True)
+class RequestedEdit:
+    """An amendment to something already drafted. `instruction` is free text on purpose — the closed tone
+    list this replaces could not read "less like a robot", and the fix is not a twelfth adjective."""
+    target: str                        # "draft" | "subject" | "body" | "event_title" | ...
+    instruction: str
+    source_span: str | None = None
+
+
+class Presentation(str, Enum):
+    """How the student wants to be SHOWN things. A preference, never a safety decision.
+
+    `hidden_draft` suppresses the draft BODY. It never suppresses the confirmation: what is about to
+    happen, and to whom, stays visible always. Not wanting to read prose is not waiving the right to know
+    an email is about to reach a person.
+    """
+    default = "default"
+    hidden_draft = "hidden_draft"
+    brief = "brief"
+    detailed = "detailed"
+
+
+@dataclass
+class ExecutiveTurn:
+    """One turn, fully understood. Every field is a proposal; none is a permission."""
+    mode: Mode = Mode.conversation
+    reading: SemanticTurn | None = None        # the raw model read this was assembled from
+    derivation: Derivation | None = None       # how the runtime would run it
+
+    target_goal_id: str | None = None
+    target_decision_id: str | None = None
+
+    proposed_goal_kind: str | None = None
+    proposed_operation_id: str | None = None   # EXACT registry id, or None. Never a description.
+
+    slot_patches: tuple[SlotPatch, ...] = field(default_factory=tuple)
+    referenced_people: tuple[ReferencedPerson, ...] = field(default_factory=tuple)
+    referenced_artifacts: tuple[str, ...] = field(default_factory=tuple)
+    requested_edits: tuple[RequestedEdit, ...] = field(default_factory=tuple)
+
+    operation_polarity: str = "neutral"        # neutral | affirm | reject | ambiguous
+    presentation: Presentation = Presentation.default
+
+    # ADVISORY. `goal_slots` computes the real gap from the Fill taxonomy, because a model asked what it
+    # needs will ask for things it could safely have written — which is how Bruce came to ask a student
+    # for a "subject" and a "body".
+    missing_information: tuple[str, ...] = field(default_factory=tuple)
+    response_intent: str | None = None         # what the reply should ACCOMPLISH, never the prose itself
+
+    confidence: float = 0.0
+    supporting_spans: tuple[str, ...] = field(default_factory=tuple)
+
+    # Set by the EXECUTIVE, never by the model: what validation rejected, so a shadow comparison can say
+    # why a reading was downgraded instead of silently reporting a clarification.
+    validation_notes: tuple[str, ...] = field(default_factory=tuple)
+
+    def is_actionable(self) -> bool:
+        """Does this turn want work that needs durable state?
+
+        Deliberately NOT "may we execute" — that belongs to the execution boundary and the authorization
+        evidence, neither of which consults this object.
+        """
+        return self.mode in (Mode.new_goal, Mode.continue_goal)

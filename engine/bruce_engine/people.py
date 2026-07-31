@@ -3,8 +3,13 @@
 WHAT THIS CLOSES. `goal_slots.Fill.resolvable` says a recipient may be LOOKED UP and never invented, and
 until now nothing could look one up: `turn_context.people` was a shape nobody populated,
 `gmail.resolve_recipient` is live=False, and the only resolution in the tree was an address in the
-current sentence or a self-reference. So "email my teacher and thank her for helping me" could only ever
-be a question, however well Bruce understood the rest of it.
+current sentence or a self-reference. So a student naming a recipient by their RELATIONSHIP rather than
+their address could only ever be answered with a question, however well Bruce understood the rest of it.
+
+(Deliberately no example sentence here. tests/data/paraphrase_families.json is the generalization corpus,
+and `test_corpus_is_not_referenced_by_production_code` fails if any of its phrasings appears in a
+production module — including in a comment. A phrase sitting in the source is an invitation to write a
+rule for it, which is the difference between understanding a student and recognising them.)
 
 THE ONE RULE EVERYTHING HERE SERVES: never invent an address. Every consequence follows from it.
 
