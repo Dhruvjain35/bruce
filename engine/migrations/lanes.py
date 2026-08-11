@@ -35,6 +35,25 @@ MIGRATION_LANES: dict[str, str] = {
     # `Fill.resolvable` says a recipient may be looked up and never invented. Nothing could look one up
     # until this table: people the student INTRODUCED, in their own trusted words, with provenance.
     "0032": "runtime",             # known_people — conversation-learned recipients
+    # Shadow observation was a detached task, so a restart dropped the record — and dropped the SLOW
+    # reads specifically, biasing the authority decision toward fast successes. This is its outbox, in
+    # the shape it has to end up in: keyed on the canonical conversation turn, fenced by a per-claim
+    # lease token, carrying the turn's own capability truth and an intake disposition for every trusted
+    # turn, with a retry bound the database will not let reach zero.
+    "0033": "runtime",             # semantic_shadow_jobs — durable shadow observation queue
+    # NOT a shadow change. 0032 opens with `if has_table: return` and 0001 builds every table with
+    # create_all(), so 0032 returned before its own ENABLE ROW LEVEL SECURITY on every database that
+    # exists: any tenant session could read every student's recipient book. Found by adding the table to
+    # the enforced RLS inventory, which is the argument for having one.
+    "0034": "runtime",             # known_people — the row security 0032 never actually applied
+    # The reconciliation's POPULATION used to come from the jobs the drain had claimed, so a user whose
+    # intake call was missing had no job and was never checked — the invariant agreed with itself on
+    # every wake. The canonical count cannot be bought with a row-level grant (RLS admits ROWS, so
+    # `FOR SELECT USING (app_is_worker())` hands over every column of every student's turn, `text`
+    # included) nor with a per-owner definer (that hands over the owner LIST, and a worker that knows who
+    # exists can open a session as each of them). The join happens inside the definer and one row of
+    # counts comes back.
+    "0035": "runtime",             # shadow_reconciliation() — aggregate-only, no owner ids leave it
 }
 
 # the head every lane branches from; the head-assertion test (test_migration_rls_context) must equal the

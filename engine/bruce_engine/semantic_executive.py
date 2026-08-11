@@ -56,20 +56,6 @@ from .semantic_contracts import (Derivation, ExecutiveTurn, Family, Mode, Operat
                                  ReferencedPerson, SemanticTurn, TriageFailure,
                                  TurnContext as SemTurnContext)
 
-def _eval_timeout() -> float | None:
-    """`None` in production (use the real deadline); generous when an offline evaluation is running.
-
-    Set by BRUCE_EVAL_TIMEOUT_S. Deliberately opt-in and env-driven rather than a parameter threaded
-    through every caller: nothing in the request path can reach it, so no student turn can accidentally
-    inherit an evaluation's patience.
-    """
-    raw = os.environ.get("BRUCE_EVAL_TIMEOUT_S", "").strip()
-    try:
-        return float(raw) if raw else None
-    except ValueError:
-        return None
-
-
 # The confidence below which a reading does not get to move something consequential on its own.
 # Deliberately the same number as `directive_scope.MIN_APPROVAL_CONFIDENCE` — two different floors meaning
 # "may this reading be acted on" would drift apart, and the safer one would lose.
@@ -217,8 +203,26 @@ def _people_from(reading: SemanticTurn) -> tuple[ReferencedPerson, ...]:
 
 _SAFEST_FIRST = ("reject", "ambiguous", "affirm", "neutral")
 
+# THE CLOSED VOCABULARY behind `validation_notes`. Every note this module writes has a code here, and the
+# durable shadow record persists the CODE — the note interpolates model-proposed ids, which can be prose
+# naming a real person, and a telemetry table must not become the second place that text lives.
+CODE_UNKNOWN_OPERATION = "unknown_operation_dropped"
+CODE_OPERATION_CANONICALIZED = "operation_canonicalized"
+CODE_OPERATION_UNREACHABLE = "operation_not_reachable"
+CODE_UNKNOWN_GOAL_ID = "unknown_goal_id_dropped"
+CODE_UNKNOWN_DECISION_ID = "unknown_decision_id_dropped"
+CODE_MODEL_ADDRESS_DROPPED = "model_address_dropped"
+CODE_AFFIRM_BELOW_FLOOR = "affirm_below_confidence_floor"
+CODE_SPANS_UNGROUNDED = "spans_not_grounded"
+CODE_POLARITY_VETO_REJECT = "polarity_veto_reject"
+CODE_POLARITY_AFFIRM_REFUSED = "polarity_affirm_not_honoured"
+CODE_POLARITY_DISAGREEMENT = "polarity_disagreement"
+CODE_READER_UNAVAILABLE = "reader_unavailable"
+CODE_TRIAGE_FAILED = "triage_failed"
+CODE_NO_USABLE_READ = "no_usable_read"
 
-def reconcile_polarity(model_polarity: str, trusted_text: str) -> tuple[str, str | None]:
+
+def reconcile_polarity(model_polarity: str, trusted_text: str) -> tuple[str, str | None, str | None]:
     """Combine the model's reading with the DETERMINISTIC authorization reader, safest wins.
 
     Authorization is the one judgement that may never rest on a probabilistic reader alone, and Bruce
@@ -235,7 +239,8 @@ def reconcile_polarity(model_polarity: str, trusted_text: str) -> tuple[str, str
         beats neutral. So neither reader can unilaterally turn a refusal into a send, and a model that
         confidently misreads "don't send it" is overruled by a reader that cannot be talked out of it.
 
-    Returns (polarity, note) where note explains any disagreement, for the shadow comparison.
+    Returns (polarity, note, code) where the note explains any disagreement for a human and the code is
+    the same fact as a closed vocabulary, for the durable shadow record.
     """
     try:
         from . import decision_resolver
@@ -243,10 +248,10 @@ def reconcile_polarity(model_polarity: str, trusted_text: str) -> tuple[str, str
         det = {decision_resolver.Resolution.approved: "affirm",
                decision_resolver.Resolution.rejected: "reject"}.get(res, "neutral")
     except Exception:
-        return model_polarity, None
+        return model_polarity, None, None
 
     if det == model_polarity or det == "neutral":
-        return model_polarity, None
+        return model_polarity, None, None
 
     # THE DETERMINISTIC READER MAY VETO. IT MAY NOT CONSENT.
     #
@@ -266,9 +271,11 @@ def reconcile_polarity(model_polarity: str, trusted_text: str) -> tuple[str, str
     # This asymmetry is the entire safety argument for combining the two readers at all.
     if model_polarity == "neutral":
         if det == "reject":
-            return det, "deterministic reader saw a refusal where the model saw nothing (veto)"
+            return (det, "deterministic reader saw a refusal where the model saw nothing (veto)",
+                    CODE_POLARITY_VETO_REJECT)
         return "neutral", ("deterministic reader saw 'affirm' where the model saw nothing — NOT "
-                           "honoured; a keyword matcher may veto but may never authorize")
+                           "honoured; a keyword matcher may veto but may never authorize"), \
+            CODE_POLARITY_AFFIRM_REFUSED
 
     # THEY DISAGREE -> ASK. Not "take the safer one", which was the first version of this rule and was
     # wrong in a way worth recording: `decision_resolver`'s negation matcher fires on `\bno\b` inside
@@ -281,13 +288,14 @@ def reconcile_polarity(model_polarity: str, trusted_text: str) -> tuple[str, str
     # assent still cannot send (it asks instead), and a deterministic false positive on "no rush" costs
     # one question rather than a wrongly refused request. Nothing consequential runs on a disagreement.
     return "ambiguous", (f"model said {model_polarity!r}, deterministic reader said {det!r} "
-                         f"-> ambiguous (disagreement is uncertainty, so Bruce asks)")
+                         f"-> ambiguous (disagreement is uncertainty, so Bruce asks)"), \
+        CODE_POLARITY_DISAGREEMENT
 
 
 def assemble(reading: SemanticTurn, derivation: Derivation | None, *, trusted_text: str) -> ExecutiveTurn:
     """SemanticTurn + Derivation -> the full ExecutiveTurn. Pure; no validation yet."""
     caps = tuple(getattr(derivation, "capabilities", ()) or ())
-    polarity, note = reconcile_polarity(
+    polarity, note, code = reconcile_polarity(
         _POLARITY.get(getattr(reading.decision_polarity, "value", str(reading.decision_polarity)),
                       "neutral"),
         trusted_text)
@@ -312,6 +320,7 @@ def assemble(reading: SemanticTurn, derivation: Derivation | None, *, trusted_te
         confidence=float(reading.confidence or 0.0),
         supporting_spans=(),
         validation_notes=((note,) if note else ()),
+        validation_codes=((code,) if code else ()),
     )
 
 
@@ -326,6 +335,10 @@ def validate(turn: ExecutiveTurn, *, trusted_text: str, reachable: frozenset[str
     turn citing words the student never wrote was not read from the student.
     """
     notes = list(turn.validation_notes)
+    # The same rejections as a closed vocabulary. Appended BESIDE each note rather than parsed back out of
+    # one, because the note interpolates whatever the model proposed and the shadow row may only carry the
+    # code (see ExecutiveTurn.validation_codes).
+    codes = list(turn.validation_codes)
 
     # 1. THE OPERATION MUST BE REAL. An unknown id matches nothing downstream, which is worse than
     #    proposing none: Bruce says "sure" and no goal exists.
@@ -333,9 +346,11 @@ def validate(turn: ExecutiveTurn, *, trusted_text: str, reachable: frozenset[str
         canon = canonical_operation(turn.proposed_operation_id)
         if canon is None:
             notes.append(f"dropped unknown operation {turn.proposed_operation_id!r}")
+            codes.append(CODE_UNKNOWN_OPERATION)
             turn.proposed_operation_id = None
         elif canon != turn.proposed_operation_id:
             notes.append(f"canonicalized {turn.proposed_operation_id!r} -> {canon!r}")
+            codes.append(CODE_OPERATION_CANONICALIZED)
             turn.proposed_operation_id = canon
 
     # 2. AND REACHABLE BY THIS USER. Understanding cannot manufacture a capability. The OBJECTIVE is kept
@@ -343,14 +358,17 @@ def validate(turn: ExecutiveTurn, *, trusted_text: str, reachable: frozenset[str
     #    have understood.
     if turn.proposed_operation_id and reachable and turn.proposed_operation_id not in reachable:
         notes.append(f"operation {turn.proposed_operation_id!r} is not currently reachable")
+        codes.append(CODE_OPERATION_UNREACHABLE)
         turn.proposed_operation_id = None
 
     # 3. STATE IDS MUST NAME STATE THIS USER OWNS.
     if turn.target_goal_id and known_goal_ids and turn.target_goal_id not in known_goal_ids:
         notes.append(f"dropped unknown goal id {turn.target_goal_id!r}")
+        codes.append(CODE_UNKNOWN_GOAL_ID)
         turn.target_goal_id = None
     if turn.target_decision_id and known_decision_ids and turn.target_decision_id not in known_decision_ids:
         notes.append(f"dropped unknown decision id {turn.target_decision_id!r}")
+        codes.append(CODE_UNKNOWN_DECISION_ID)
         turn.target_decision_id = None
 
     # 4. NO ADDRESSES FROM THE MODEL, EVER. The single most expensive thing it could invent, so it is
@@ -360,6 +378,7 @@ def validate(turn: ExecutiveTurn, *, trusted_text: str, reachable: frozenset[str
         if patch.name == "recipient" and patch.value and "@" in patch.value \
                 and _norm(patch.value) not in _norm(trusted_text):
             notes.append("dropped a model-proposed address (not in the student's own words)")
+            codes.append(CODE_MODEL_ADDRESS_DROPPED)
             continue
         kept.append(patch)
     turn.slot_patches = tuple(kept)
@@ -367,12 +386,14 @@ def validate(turn: ExecutiveTurn, *, trusted_text: str, reachable: frozenset[str
     # 5. AN UNCERTAIN AFFIRM IS NOT AN APPROVAL. Reading it as one is how mail goes out after "i guess?".
     if turn.operation_polarity == "affirm" and turn.confidence < MIN_ACT_CONFIDENCE:
         notes.append(f"affirm below the {MIN_ACT_CONFIDENCE} floor -> ambiguous")
+        codes.append(CODE_AFFIRM_BELOW_FLOOR)
         turn.operation_polarity = "ambiguous"
 
     # 6. GROUNDING. Last, because it invalidates the READING rather than a field. REFUSAL SURVIVES: a
     #    student who may have said "don't send it" is obeyed even if the model cited it badly.
     if not spans_are_grounded(turn.supporting_spans, trusted_text):
         notes.append("supporting spans are not in the student's own words — downgraded")
+        codes.append(CODE_SPANS_UNGROUNDED)
         if turn.operation_polarity != "reject":
             turn.mode = Mode.clarify
             turn.proposed_operation_id = None
@@ -380,6 +401,7 @@ def validate(turn: ExecutiveTurn, *, trusted_text: str, reachable: frozenset[str
             turn.confidence = 0.0
 
     turn.validation_notes = tuple(notes)
+    turn.validation_codes = tuple(codes)
     return turn
 
 
@@ -398,14 +420,15 @@ def _sem_turn_context(context: Any) -> SemTurnContext:
     return SemTurnContext(live_families=frozenset(families), live_capabilities=reachable)
 
 
-def _fallback(trusted: str, note: str) -> ExecutiveTurn:
+def _fallback(trusted: str, note: str, code: str) -> ExecutiveTurn:
     """What Bruce understands with NO model: only what can be decided structurally.
 
     Deliberately not a second attempt at understanding — making it cleverer would rebuild the regex router
     inside the thing that replaced it, and would let the generalization suite pass with no understanding
     having happened. It answers one question, the safety one: did the student refuse?
     """
-    turn = ExecutiveTurn(mode=Mode.clarify, confidence=0.0, validation_notes=(note,))
+    turn = ExecutiveTurn(mode=Mode.clarify, confidence=0.0, validation_notes=(note,),
+                         validation_codes=(code,))
     try:
         from . import decision_resolver
         res = decision_resolver.resolve_approval(trusted)
@@ -416,7 +439,7 @@ def _fallback(trusted: str, note: str) -> ExecutiveTurn:
     return turn
 
 
-async def interpret(context: Any, *, triage=None) -> ExecutiveTurn:
+async def interpret(context: Any, *, triage=None, timeout_s: float | None = None) -> ExecutiveTurn:
     """Read one turn. NEVER raises into the caller — an unreadable turn is a question, not an outage."""
     from . import execution_derivation, semantic_triage
 
@@ -438,27 +461,29 @@ async def interpret(context: Any, *, triage=None) -> ExecutiveTurn:
     # from Bruce failing to understand. A failure whose CAUSE is unrecorded cannot be acted on, and that
     # is the observability gap that hid this entire class of defect for weeks.
     try:
-        outcome = await semantic_triage.triage(
-            body, provider=triage,
-            # The deadline is a LATENCY budget, and it belongs to a student waiting on a reply. An offline
-            # evaluation is not that: measuring comprehension against a 2.5s wall means a slow call is
-            # scored as a misunderstanding, which is how the language eval reported 0.86 for a system
-            # measuring 0.99 on an unloaded connection. Production keeps its budget untouched.
-            timeout_s=_eval_timeout())
+        # `timeout_s=None` means "use the production deadline", which is what every request-path caller
+        # passes. It is a parameter rather than an environment read because the deadline is a LATENCY
+        # budget belonging to a waiting student: an offline evaluation legitimately wants more patience,
+        # and the only safe way to give it that is explicitly, at its own call site. An env-var version of
+        # this existed briefly and was the wrong shape — process-global state is exactly what made this
+        # module's own test gate unreproducible.
+        outcome = await semantic_triage.triage(body, provider=triage, timeout_s=timeout_s)
     except Exception as exc:
-        return _fallback(trusted, f"reader unavailable ({type(exc).__name__}) — asking instead")
+        return _fallback(trusted, f"reader unavailable ({type(exc).__name__}) — asking instead",
+                         CODE_READER_UNAVAILABLE)
 
     if isinstance(outcome, TriageFailure):
         # `partial` is a semantically usable read that only failed the confidence floor — better than
         # nothing, and still subject to every validation below.
         if outcome.partial is None:
-            return _fallback(trusted, f"triage failed: {outcome.reason} ({outcome.elapsed_ms:.0f}ms)")
+            return _fallback(trusted, f"triage failed: {outcome.reason} ({outcome.elapsed_ms:.0f}ms)",
+                             CODE_TRIAGE_FAILED)
         reading = outcome.partial
     else:
         reading = outcome
 
     if reading is None:
-        return _fallback(trusted, "no usable read")
+        return _fallback(trusted, "no usable read", CODE_NO_USABLE_READ)
 
     try:
         derivation = execution_derivation.derive(reading, ctx)
@@ -495,7 +520,15 @@ class _MiniContext:
 def mini_context(text: str, *, has_pending_decision: bool = False, has_open_goal: bool = False,
                  people=None, recent_turns=None, operations=None) -> _MiniContext:
     """Reachable operations default to everything LIVE in the registry: the question being measured is
-    "did Bruce understand", not "is Gmail connected on this laptop today"."""
+    "did Bruce understand", not "is Gmail connected on this laptop today".
+
+    THAT DEFAULT IS FOR EVALUATION ONLY, AND IS NOT CAPABILITY TRUTH. `tool_registry.specs(None)` is a
+    nine-element static table, identical for every user and every turn, from a function whose own
+    docstring says it does NOT check the user's connection. Any caller reasoning about a REAL user's turn
+    must pass `operations` explicitly, from the per-user broker — the shadow observer did not, and the
+    result was a false capability denial recorded against a router that had correctly told a student with
+    no Google connection that Bruce could not schedule anything (see semantic_shadow.turn_capability_truth).
+    """
     from . import tool_registry
 
     ops = operations if operations is not None else tuple(

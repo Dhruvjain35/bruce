@@ -13,7 +13,7 @@ from uuid import UUID
 
 from . import (capability_snapshot, capability_truth, context_compiler, conversation_context, conversation_outcomes,
                conversation_store, messaging_outbound, response_composer, router_authority,
-               semantic_executive, semantic_shadow, technical_render)
+               semantic_shadow, technical_render)
 from .attachment_pipeline import UnreadableAttachment, normalize_image
 from .conversation_contract import ConversationDecision, RiskLevel
 from .conversation_model import ConversationReasoner, VisionInput, production_reasoner
@@ -156,6 +156,24 @@ def _pending_operation(run: dict | None):
                                              summary=str(block.get("question") or ""))
 
 
+def _pending_capability(run: dict | None) -> str | None:
+    """The REGISTRY ID of the operation a still-pending Decision is asking about, or None.
+
+    The same read as `_pending_operation`, reduced to the id. Shadow needs the id and nothing else: it is
+    the comparison baseline for a turn production answered from state ("did the executive mean the same
+    operation the student was being asked about"), and it is a registry id, so it is safe to persist on a
+    telemetry row where the question text would not be.
+    """
+    if not isinstance(run, dict):
+        return None
+    from . import goal_handler, tool_registry
+    block = run.get("active_decision")
+    if not isinstance(block, dict) or str(block.get("status") or "") != goal_handler.PENDING:
+        return None
+    capability = str(block.get("capability") or "")
+    return capability if tool_registry.get(capability) is not None else None
+
+
 def _continuation_state(run: dict | None) -> tuple[dict | None, dict | None, dict | None]:
     """(pending decision, recent draft, recent tool result) — all three read off the ONE run.
 
@@ -249,7 +267,13 @@ class _Runtime:
             return InboundOutcome(status="duplicate", user_id=user_id)
         recent = await conversation_store.load_recent_turns(user_id, channel=ch, channel_identity=ident)
 
-        await conversation_store.persist_user_turn(
+        # THE CANONICAL TURN ID, captured here and carried to the single shadow write below. This row is
+        # the ledger shadow is reconciled against, so the observation must reference it by IDENTITY: the
+        # previous reference was (channel, provider_message_id), which reconciliation had to re-derive to
+        # match a job to a turn — two ledgers joined on a reconstruction rather than on the thing being
+        # counted. It is read ABOVE every branch, exactly like the eligibility decision, so no lane can
+        # reach `intake` without it.
+        conversation_turn_id = await conversation_store.persist_user_turn(
             user_id, channel=ch, channel_identity=ident, provider_message_id=pmid, text=msg.text)
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
         turn_trace.guard(trace, "trusted_input_ready")
@@ -372,6 +396,46 @@ class _Runtime:
         resolved_continuation = ((turn_continuation is not None and turn_continuation.resolved)
                                  or selection.ambiguous)
 
+        # ================================================================================================
+        # SHADOW INTAKE — DECIDED HERE, ABOVE THE ROUTING BRANCHES, FOR EVERY TRUSTED TURN.
+        #
+        # It used to be decided inside the `else` of `if resolved_continuation:` below, which meant every
+        # resolved continuation and every ambiguous goal selection skipped shadow entirely: no
+        # disposition, no row, no trace. That is the approve / reject / cancel / continuation population —
+        # the turns where Bruce actually acts — and the in-process invariant agreed with itself the whole
+        # time because it defined "eligible" as the sum of the dispositions it had recorded. A sample
+        # missing the safety-critical turns over-represents easy ones in exactly the direction that argues
+        # FOR granting the executive authority.
+        #
+        # So eligibility is decided ONCE, up here, from the turn itself and nothing about which lane will
+        # answer it, and the single durable write happens below for whichever lane did. The exclusions
+        # are structural and typed (`classify_turn`): input that is not a student speaking to Bruce in
+        # language. A turn that is neither eligible nor excluded is a GAP, and `semantic_shadow.reconcile`
+        # counts it against `conversation_turns` — a ledger shadow does not write.
+        shadow_disposition = semantic_shadow.INELIGIBLE_DISABLED
+        shadow_reachable = None
+        if semantic_shadow.enabled():
+            _env_for_shadow = envelope
+            if _env_for_shadow is None:
+                try:
+                    from . import input_envelope as _env3
+                    _env_for_shadow = _env3.from_message(msg)
+                except Exception:
+                    _env_for_shadow = None
+            shadow_disposition = semantic_shadow.classify_turn(
+                # TRUSTED TEXT, not `msg.text`: a message that is nothing but a forwarded mail carries no
+                # words the student wrote, and observing it would hand a stranger's sentences to the
+                # executive as if they were the turn.
+                trusted_text=(_env_for_shadow.trusted_text if _env_for_shadow is not None else msg.text),
+                has_untrusted=bool(_env_for_shadow is not None and _env_for_shadow.has_untrusted()))
+            if shadow_disposition == semantic_shadow.ELIGIBLE:
+                # CAPABILITY TRUTH AT THE REQUEST BOUNDARY, per user, from the real broker — never the
+                # global live registry, which is identical for every user and would record a false
+                # capability denial against a router that correctly told an unconnected student that
+                # Bruce has no hands. It is persisted with the job because it must describe THIS turn even
+                # if an integration connects or is revoked before the worker runs.
+                shadow_reachable = await semantic_shadow.turn_capability_truth(user_id)
+
         # G0.1 FastRouter: classify the cheapest-correct execution path (fast chat / single verified action /
         # foreground agent / durable mission) BEFORE the heavy reasoner, and instrument its latency. This turn
         # the decision is SHADOWED — recorded for the router-quality harness, latency telemetry, and the later
@@ -386,6 +450,11 @@ class _Runtime:
         # raised while answering that would cost the student their reply.
         rd = None
         rt = None
+        # WHICH LANE ANSWERED THIS TURN, for the shadow baseline. Bound before the try for the same
+        # reason `rd` is: a router fault must leave it readable, and "the router raised" is itself a
+        # typed production path — an outage is not a capability denial and must never be recorded as one.
+        shadow_production = semantic_shadow.RouterSnapshot.work_in_flight(
+            semantic_shadow.PATH_ROUTER_ERROR)
         shortlisted: tuple[str, ...] | None = None
         mission_plan = None                # C1: set when a routed background mission was durably enqueued
         authoritative_decision = None      # G0 Activation Phase A: set -> skip the reasoner, dispatch on it
@@ -407,6 +476,17 @@ class _Runtime:
                          "continuation" if turn_continuation is not None else selection.rule,
                          turn_continuation.kind.value if turn_continuation is not None else None,
                          turn_continuation.evidence if turn_continuation is not None else None)
+                # THE ROUTER IS SKIPPED; THE OBSERVATION IS NOT. Production still decided this turn — it
+                # decided it from state — so the shadow baseline is that lane and the operation the
+                # student was actually being asked about, not an empty router decision. Recording it as
+                # empty would file every "yeah send it" as work the router missed, and could class it as
+                # a false capability denial against a lane that was busy performing the capability.
+                shadow_production = semantic_shadow.RouterSnapshot.work_in_flight(
+                    semantic_shadow.PATH_CONTINUATION if turn_continuation is not None
+                    else semantic_shadow.PATH_GOAL_AMBIGUOUS,
+                    pending_capability=_pending_capability(open_goal_row),
+                    evidence=(turn_continuation.kind.value if turn_continuation is not None
+                              else selection.rule))
             else:
                 turn_trace.guard(trace, "router_started")
                 rd, rt = await fast_router.route(
@@ -420,31 +500,7 @@ class _Runtime:
                          rd.action.value if rd.action else None, rd.domain, rd.confidence, rd.source,
                          rt.stage0_ms, rt.stage1_ms, rt.total_ms)
 
-                # SEMANTIC EXECUTIVE, SHADOW ONLY. Reads the same turn beside the router and records the
-                # difference; creates no goal, no Decision, no authorization, calls no provider, and sends
-                # no alternate reply. `observe` returns a record the live path deliberately IGNORES — the
-                # student's turn is byte-for-byte what it would have been.
-                #
-                # It runs HERE, after the router, purely because that is where the comparison baseline
-                # exists. This is NOT the eventual order: the executive belongs BEFORE goal selection and
-                # continuation (which today run at :288 and :356 with decision=None, deciding meaning by
-                # regex before anything has read the sentence). Moving it there changes live behaviour and
-                # is gated on the shadow metrics this call exists to collect.
-                #
-                # Off unless BRUCE_SEMANTIC_SHADOW is set, and separate from BRUCE_ROUTER_SEMANTIC on
-                # purpose: that flag grants AUTHORITY, this one only permits OBSERVATION. Conflating them
-                # would mean the only way to measure the executive is to let it decide.
-                if semantic_shadow.enabled():
-                    try:
-                        await semantic_shadow.observe(
-                            user_id, msg.text or "", message_id=pmid,
-                            context=semantic_executive.mini_context(
-                                msg.text or "",
-                                has_open_goal=bool(open_goal_row),
-                                has_pending_decision=bool(locals().get("pending_decision"))),
-                            decision=rd)
-                    except Exception:
-                        log.info("shadow_error pmid=%s", pmid)   # observability never breaks a turn
+                shadow_production = semantic_shadow.RouterSnapshot.of(rd)
                 # G0.3 ToolBroker (SHADOW): for a tool-bearing path, shortlist the FEW relevant, live,
                 # connected tools the router→broker seam would hand a planner — never the whole registry.
                 # Recorded for telemetry + the G0.4 planner that will consume it; execution is unchanged this
@@ -496,6 +552,34 @@ class _Runtime:
         except Exception:
             log.info("router_error pmid=%s", pmid)     # classification never blocks a reply
             authoritative_decision = None
+
+        # SEMANTIC EXECUTIVE, SHADOW ONLY — ONE WRITE, FOR EVERY TRUSTED TURN, WHICHEVER LANE ANSWERED IT.
+        #
+        # Reads the same turn beside production and records the difference; creates no goal, no Decision,
+        # no authorization, calls no provider, and sends no alternate reply. Nothing below reads its
+        # result — the student's turn is byte-for-byte what it would have been.
+        #
+        # UNCONDITIONAL AND OUTSIDE THE BRANCH, and that placement is the fix. Nested in the `else` of
+        # `if resolved_continuation:` it silently excluded every continuation, approval, rejection and
+        # cancellation — the safety-critical population — and nested inside the router's `try` it would
+        # also lose every turn a router fault touched. One call site cannot omit a lane; two call sites is
+        # how the first one came to.
+        #
+        # ONE INSERT, NO MODEL CALL. `intake` writes a row keyed by this turn and returns; the read
+        # happens on the worker. The awaited thing is a single bounded statement, not the executive — a
+        # slow, hanging or failing model cannot add latency to a student's reply or fail their turn. It
+        # cannot raise into the turn either (it swallows everything and logs a label), so it needs no
+        # guard of its own here.
+        #
+        # Off unless BRUCE_SEMANTIC_SHADOW is set, and separate from BRUCE_ROUTER_SEMANTIC on purpose:
+        # that flag grants AUTHORITY, this one only permits OBSERVATION. Conflating them would mean the
+        # only way to measure the executive is to let it decide.
+        await semantic_shadow.intake(
+            user_id, channel=ch, provider_message_id=pmid, decision=shadow_production,
+            disposition=shadow_disposition, reachable=shadow_reachable,
+            conversation_turn_id=conversation_turn_id,
+            has_open_goal=bool(open_goal_row),
+            has_pending_decision=bool(_pending_capability(open_goal_row)))
 
         # SEMANTIC RESCUE (founder alpha; default off, allowlisted, kill-switchable). Stage 0 returned
         # UNKNOWN, which today silently becomes generic chat — so a real request phrased in a way nobody

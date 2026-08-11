@@ -325,8 +325,8 @@
       "test_the_tone_amendment_is_lost_when_the_student_names_the_artifact"
     ],
     "migration": {
-      "pinned_head": "0032_known_people",
-      "lane": "0032",
+      "pinned_head": "0035_shadow_reconciliation",
+      "lane": "0035",
       "lane_owner": "runtime"
     },
     "language_generalization": {
@@ -349,7 +349,23 @@
         "goal_kind": 0.95
       },
       "rate_gate_test": "tests/test_language_generalization.py::test_language_rates_meet_their_thresholds",
-      "no_silent_skip_test": "tests/test_language_generalization.py::test_language_suite_is_not_silently_skipped"
+      "no_silent_skip_test": "tests/test_language_generalization.py::test_language_suite_is_not_silently_skipped",
+      "isolation": {
+        "_why": "The language gate reads REAL model calls, which makes it the one suite a leaked credential can silently degrade. A test elsewhere assigned a fake OPENAI_API_KEY to os.environ without restoring it; every call 401'd, the executive fell back to asking, and the gate reported 0.86 accuracy for a system measuring 0.99. Nothing near the leak failed. These pins make that class of pollution fail loudly instead.",
+        "harness_must_own_its_provider": true,
+        "forbidden_in_harness": [
+          "os.environ.setdefault",
+          "default_provider()"
+        ],
+        "regression_test": "tests/test_language_generalization.py::test_a_leaked_api_key_cannot_silently_degrade_this_gate",
+        "former_polluter": "tests/test_client_reuse.py::test_model_construction_is_measurably_cheaper_than_before",
+        "ordering_proof": "The former polluter must be able to run immediately before the language gate without changing its result. THE GATE IS DEPENDENCY OWNERSHIP plus the regression test plus the AST check below \u2014 not wall-clock time. Runtime was only how the bug was FOUND (12s versus 115s meant no real model call was being made); it is deliberately not asserted anywhere, because a timing assertion would be flaky on loaded CI and would fail for reasons unrelated to the property being protected.",
+        "proved_by_mutation": [
+          "adding a call to os.environ.setdefault in the harness must FAIL the gate",
+          "adding a call to semantic_triage.default_provider() in the harness must FAIL the gate",
+          "neither may match the same names appearing in comments or docstrings that EXPLAIN the ban \u2014 the check is AST-based for exactly this reason, so the explanation can stay in the file"
+        ]
+      }
     },
     "semantic_shadow": {
       "_why": "Shadow mode is only trustworthy while it cannot act. These modules must never appear in semantic_shadow.py \u2014 importing any of them is how an observer becomes an actor.",

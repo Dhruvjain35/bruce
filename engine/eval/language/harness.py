@@ -46,8 +46,10 @@ RUNS = 5
 MAX_CONCURRENCY = 3
 TRANSPORT_RETRIES = 3
 # Measuring COMPREHENSION, not latency. Production keeps its 2.5s student-facing deadline; scoring a slow
-# call as a misunderstanding is how this harness once reported 0.86 for a system measuring 0.99.
-os.environ.setdefault("BRUCE_EVAL_TIMEOUT_S", "30")
+# call as a misunderstanding is how this harness once reported 0.86 for a system measuring 0.99. Passed
+# explicitly to `interpret` — an `os.environ.setdefault` at import time lived here briefly and was exactly
+# the kind of process-global this harness now exists to avoid depending on.
+EVAL_TIMEOUT_S = 30.0
 
 # Operations that CHANGE THE WORLD. A false action is only interesting when it could have consequences —
 # proposing a read is a misunderstanding, proposing a write is an incident. Derived from the registry so a
@@ -103,7 +105,8 @@ class Observation:
     notes: tuple = ()
 
 
-async def _observe(sample: Sample, sem: asyncio.Semaphore) -> Observation | None:
+async def _observe(sample: Sample, sem: asyncio.Semaphore, *, provider=None,
+                   timeout_s: float = EVAL_TIMEOUT_S) -> Observation | None:
     from bruce_engine import semantic_executive as se
 
     ctx = se.mini_context(sample.text, **sample.context)
@@ -113,7 +116,7 @@ async def _observe(sample: Sample, sem: asyncio.Semaphore) -> Observation | None
         # Production behaves differently and correctly — it falls back to asking rather than retrying into
         # a student's latency budget.
         for attempt in range(TRANSPORT_RETRIES):
-            turn = await se.interpret(ctx)
+            turn = await se.interpret(ctx, triage=provider, timeout_s=timeout_s)
             if not any("reader unavailable" in n for n in turn.validation_notes):
                 break
             await asyncio.sleep(1.5 * (attempt + 1))
@@ -124,11 +127,12 @@ async def _observe(sample: Sample, sem: asyncio.Semaphore) -> Observation | None
                        notes=tuple(turn.validation_notes))
 
 
-async def run(runs: int = RUNS) -> dict:
+async def run(runs: int = RUNS, *, provider=None, timeout_s: float = EVAL_TIMEOUT_S) -> dict:
     """Every sample, `runs` times. Returns metrics plus every disagreement, for reading."""
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
     all_samples = samples()
-    tasks = [_observe(s, sem) for _ in range(runs) for s in all_samples]
+    tasks = [_observe(s, sem, provider=provider, timeout_s=timeout_s)
+             for _ in range(runs) for s in all_samples]
     observations = [o for o in await asyncio.gather(*tasks) if o is not None]
 
     writes = _write_ops()
@@ -213,3 +217,49 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+class LanguageEvalHarness:
+    """The evaluation, with its dependencies handed to it rather than discovered from the process.
+
+    WHY THIS EXISTS AS AN OBJECT. The module-level `run()` reached for `semantic_triage.default_provider()`
+    — a process-wide singleton holding a cached Agent, and therefore a cached API key. A test elsewhere in
+    the suite assigned a fake key to `os.environ` without restoring it, and this evaluation inherited it:
+    every model call 401'd, the executive fell back to asking, and the gate read 0.86 for a system that
+    measures 0.99. Nothing near the leaking test failed; the damage surfaced minutes later in the only
+    suite that makes real calls.
+
+    So the harness now OWNS its provider. Construct it, run it, dispose it:
+
+        h = LanguageEvalHarness(provider=SemanticTriage(), timeout_s=30, samples_per_case=5)
+        try:
+            rates = await h.measure()
+        finally:
+            h.close()
+
+    A caller that passes no provider gets a FRESH one, never the singleton — so two evaluations in one
+    process cannot contaminate each other, and neither can anything that ran before them.
+    """
+
+    def __init__(self, *, provider=None, timeout_s: float = EVAL_TIMEOUT_S, seed: int | None = None,
+                 samples_per_case: int = RUNS):
+        from bruce_engine.semantic_triage import SemanticTriage
+
+        # A FRESH provider by default. `default_provider()` would be the singleton, which is the whole
+        # problem. `temperature=...` keeps the configured default (0) rather than sampling.
+        self._owns_provider = provider is None
+        self.provider = provider if provider is not None else SemanticTriage()
+        self.timeout_s = timeout_s
+        self.samples_per_case = samples_per_case
+        # Recorded rather than applied: this harness has no stochastic branching of its own, and the model
+        # is the only source of variance. Storing it keeps a run self-describing and makes it obvious that
+        # reproducibility here comes from temperature 0 plus repetition, not from a seed.
+        self.seed = seed
+
+    async def measure(self) -> dict:
+        return await run(self.samples_per_case, provider=self.provider, timeout_s=self.timeout_s)
+
+    def close(self) -> None:
+        """Drop the provider this harness created. Idempotent; safe on an injected provider (left alone)."""
+        if self._owns_provider:
+            self.provider = None

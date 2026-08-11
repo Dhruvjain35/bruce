@@ -187,3 +187,70 @@ def test_kill_switch_flag(monkeypatch):
     assert tool_broker.authority_enabled() is True
     monkeypatch.setenv("BRUCE_BROKER_AUTHORITY_OFF", "true")
     assert tool_broker.authority_enabled() is False
+
+
+# --- the whole-account snapshot (what the shadow observer records for a turn) -------------------------
+
+def test_reachable_operations_is_the_registry_JOINED_with_this_users_grants():
+    """Every capability this user can actually run, not every capability that exists.
+
+    The shadow observer used to take `tool_registry.specs(None) if s.live` as capability truth — a table
+    identical for every user, from a function whose docstring says it does not check the connection. The
+    difference is not cosmetic: it decided whether a router that told an unconnected student "i can't
+    schedule anything" was recorded as honest or as a false capability denial.
+    """
+    with _connected(True, scopes=(CAL_SCOPE,)):
+        cal_only = _run(tool_broker.reachable_operations(uuid4()))
+    with _connected(False):
+        none = _run(tool_broker.reachable_operations(uuid4()))
+
+    live = {s.capability for s in tool_registry.specs(None) if s.live}
+    assert set(cal_only.operations) <= live, "a capability that is not live was reported reachable"
+    assert "calendar.create_event" in cal_only.operations
+    assert not any(c.startswith("gmail.") for c in cal_only.operations), (
+        "a calendar-only grant reached Gmail — the two hands share one Google integration and only the "
+        "scope check separates them")
+    assert none.operations == (), "an unconnected account was handed live capabilities"
+    assert cal_only.established and none.established, "a successful probe was reported as unknown"
+    assert set(cal_only.operations) != live, (
+        "this user's reachable set equals the global live registry, so the snapshot cannot be "
+        "distinguishing users at all")
+
+
+def test_reachable_operations_probes_each_provider_once_not_each_capability():
+    """A cost claim, and it is on the REQUEST path: this runs while a student waits for a reply.
+
+    `availability()` fetches the integration row per call, and the live registry currently declares nine
+    capabilities across two providers that share ONE Google integration. Asking per capability would be
+    nine reads of the same row on every turn — the kind of quiet regression that is only ever noticed as
+    latency nobody can attribute.
+    """
+    probes: list[str] = []
+
+    async def _conn(uid, provider):
+        probes.append(provider)
+        return tool_broker._Conn(True, (CAL_SCOPE,))
+
+    with patch.object(tool_broker, "_provider_connection", _conn):
+        snap = _run(tool_broker.reachable_operations(uuid4()))
+
+    providers = {s.provider for s in tool_registry.specs(None) if s.live}
+    assert snap.established
+    assert sorted(probes) == sorted(providers), (
+        f"the integration was probed {len(probes)} times for {len(providers)} providers — capability "
+        f"truth is being re-fetched per capability on a student's turn")
+
+
+def test_a_structural_failure_reports_unknown_rather_than_empty():
+    """"Nothing is reachable" and "we could not find out" must be different answers.
+
+    An empty-and-established set is evidence a router was honest; an unknown set is evidence of nothing.
+    Collapsing them lets an outage look like a fully accounted-for account.
+    """
+    def _boom(domain=None):
+        raise RuntimeError("the registry is unavailable")
+
+    with patch.object(tool_registry, "specs", _boom):
+        snap = _run(tool_broker.reachable_operations(uuid4()))
+
+    assert snap.operations == () and snap.established is False

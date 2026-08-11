@@ -111,6 +111,49 @@ def test_every_family_names_a_real_registry_operation():
 # Everything above this line is pure and deterministic and always runs. Everything below needs a model.
 
 
+def test_a_leaked_api_key_cannot_silently_degrade_this_gate():
+    """THE REGRESSION. A fake key in the environment must not make this suite report low accuracy.
+
+    Reproduction, before the fix — deterministic, and the runtime is the tell:
+
+        pytest tests/test_client_reuse.py::test_model_construction_is_measurably_cheaper_than_before \
+               tests/test_language_generalization.py::test_language_rates_meet_their_thresholds
+        -> 1 failed, 1 passed in 12.09s      (the gate alone takes ~115s and passes)
+
+    That test assigned `os.environ["OPENAI_API_KEY"] = "sk-test-aaa"` and never restored it. Every model
+    call then 401'd, `triage` correctly classified the 4xx as provider_rejected and did not retry, the
+    executive fell back to asking, and the rates read 0.86 for a system measuring 0.99 — a green-looking
+    codebase reporting that Bruce could not understand students.
+
+    Two things make that impossible now, and this test asserts the second: the leaking test uses
+    `monkeypatch`, and the harness constructs its OWN provider instead of inheriting the process-wide
+    singleton whose cached Agent carries whatever key was last set.
+
+    Deliberately NO model call here — it asserts the wiring, so it runs everywhere, including without a
+    key. Pair it with `test_polluter_then_gate` in the run matrix for the end-to-end proof.
+    """
+    import os
+    from unittest.mock import patch
+
+    from eval.language.harness import LanguageEvalHarness
+    from bruce_engine import semantic_triage
+
+    singleton = semantic_triage.default_provider()
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-leaked"}):
+        harness = LanguageEvalHarness(samples_per_case=1)
+        try:
+            assert harness.provider is not singleton, (
+                "the harness took the process-wide provider — whose cached Agent holds whatever key the "
+                "last test to touch os.environ left behind. That is the pollution this gate exists to "
+                "prevent, and it is why a leaked fake key could report 0.86 accuracy.")
+            assert harness.timeout_s > 2.5, (
+                "the harness must measure comprehension against its own deadline, not the 2.5s LATENCY "
+                "budget that belongs to a waiting student — otherwise a slow call scores as a "
+                "misunderstanding")
+        finally:
+            harness.close()
+
+
 @pytest.fixture(scope="module")
 def rates():
     """ONE measurement, shared by every rate assertion below.
@@ -122,8 +165,13 @@ def rates():
     """
     import asyncio
 
-    from eval.language.harness import run
-    return asyncio.run(run())
+    from eval.language.harness import LanguageEvalHarness
+
+    harness = LanguageEvalHarness()      # its OWN provider, never the process singleton
+    try:
+        return asyncio.run(harness.measure())
+    finally:
+        harness.close()
 
 
 @live_model

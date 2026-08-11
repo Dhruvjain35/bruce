@@ -280,6 +280,15 @@ class ExecutiveTurn:
     # why a reading was downgraded instead of silently reporting a clarification.
     validation_notes: tuple[str, ...] = field(default_factory=tuple)
 
+    # THE SAME FACTS, AS CLOSED VOCABULARY. `validation_notes` are prose written for a human reading an
+    # eval, and they interpolate whatever the model proposed — an operation id can be a whole sentence
+    # about a named teacher, because the model is free to emit prose where an id was asked for. That is
+    # fine in an offline eval and NOT fine in a telemetry row, which is why the durable shadow record
+    # persists these codes instead. A parallel field rather than a parsed one on purpose: deriving codes
+    # by matching note prefixes would go silently wrong the day someone rewords a note, and "silently
+    # wrong" is how a privacy rule stops holding.
+    validation_codes: tuple[str, ...] = field(default_factory=tuple)
+
     def is_actionable(self) -> bool:
         """Does this turn want work that needs durable state?
 

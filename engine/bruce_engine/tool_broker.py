@@ -94,19 +94,72 @@ class Availability:
         return self.status == OK
 
 
-async def availability(user_id: UUID, capability: str) -> Availability:
+async def availability(user_id: UUID, capability: str, *, conn: _Conn | None = None) -> Availability:
     """The ONE capability-truth check. Collapses the previously-divergent liveness/connection/scope checks:
-    live (registry) → connected (integration) → scoped (granted scopes)."""
+    live (registry) → connected (integration) → scoped (granted scopes).
+
+    `conn` lets a caller that is asking about MANY capabilities probe each provider once and hand the
+    answer in — see `reachable_operations`, which would otherwise fetch the same Google integration row
+    nine times on a single student's turn. It is an optimization of the FETCH, never of the RULE: the
+    liveness, connection and scope decisions below are unchanged and stay in this one function, because a
+    second copy of them is exactly the divergence this module was created to end.
+    """
     spec = tool_registry.get(capability)
     if spec is None or not spec.live:
         return Availability(capability, UNSUPPORTED, live=bool(spec and spec.live), connected=False, scoped=False)
-    conn = await _provider_connection(user_id, spec.provider)
+    conn = conn if conn is not None else await _provider_connection(user_id, spec.provider)
     if not conn.connected:
         return Availability(capability, DISCONNECTED, live=True, connected=False, scoped=False)
     if spec.requires_scope and spec.requires_scope not in conn.scopes:
         return Availability(capability, INSUFFICIENT_SCOPE, live=True, connected=True, scoped=False,
                             missing_scopes=(spec.requires_scope,))
     return Availability(capability, OK, live=True, connected=True, scoped=True)
+
+
+@dataclass(frozen=True)
+class ReachableOperations:
+    """EVERY capability this ONE user can actually run RIGHT NOW — registration + liveness + connection +
+    granted scopes, all four, for a single user at a single moment.
+
+    WHY THIS EXISTS AT ALL. The shadow observer built its context with `tool_registry.specs(None)`, whose
+    own docstring says it does NOT check the user's connection. That is a nine-element table identical for
+    every user and every turn, and using it as "capability truth" broke the metric in the worst possible
+    direction: a user with NO Google connection asks for a calendar event, the live router truthfully says
+    Bruce has no hands, the executive proposes `calendar.create_event` because it is globally live — and a
+    FALSE CAPABILITY DENIAL is recorded against a router that was right. The flagship number the authority
+    decision rests on then over-counts in the direction that argues FOR granting authority.
+
+    `established` is the difference between "this user can reach nothing" and "we could not find out".
+    They are the same empty tuple and must never be the same fact: an unknown truth may never be counted
+    as a denial, or the metric is manufactured out of an outage. Note the direction of the broker's own
+    fail-closed contract — a provider probe that raises resolves to DISCONNECTED, which can only SHRINK
+    this set and therefore only SUPPRESS a denial, never invent one.
+    """
+    operations: tuple[str, ...] = ()
+    established: bool = False
+
+
+async def reachable_operations(user_id: UUID) -> ReachableOperations:
+    """The per-user capability snapshot for one turn. One integration fetch per PROVIDER, not per tool.
+
+    Deliberately routed through `availability` rather than reimplementing live/connected/scoped here:
+    this module exists because four divergent connection checks were scattered through the runtime, and a
+    fifth one hiding inside a telemetry helper would be the same defect wearing a different name.
+    """
+    conns: dict[str, _Conn] = {}
+    ops: list[str] = []
+    try:
+        for spec in tool_registry.specs(None):
+            if not spec.live:                       # not implemented/wired — never reachable for anyone
+                continue
+            if spec.provider not in conns:
+                conns[spec.provider] = await _provider_connection(user_id, spec.provider)
+            if (await availability(user_id, spec.capability, conn=conns[spec.provider])).ok:
+                ops.append(spec.capability)
+    except Exception:
+        # The registry or the probe failed structurally. UNKNOWN, not empty — see `established`.
+        return ReachableOperations((), established=False)
+    return ReachableOperations(tuple(sorted(ops)), established=True)
 
 
 @dataclass(frozen=True)

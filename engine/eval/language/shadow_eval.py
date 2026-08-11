@@ -120,8 +120,14 @@ async def run(turns: list[str], *, label: str) -> dict:
     for text, turn, dec in zip(turns, execs, routers):
         modes[turn.mode.value] += 1
         router_sources[getattr(dec, "source", None) or "stage0"] += 1
-        ok, divergence = semantic_shadow.compare(turn, dec, reachable=frozenset())
-        agree += ok
+        # `reachable=frozenset()` deliberately: this harness routes offline against a synthetic baseline,
+        # so it cannot establish what THIS user could reach on that turn, and `compare` treats an unknown
+        # reachable set as "do not classify a capability denial". The production-denial metric is
+        # collected on real traffic in the durable shadow queue; the denial list below is the harness's
+        # own, opposite measure (the EXECUTIVE proposing nothing on a turn it read as work).
+        cmp = semantic_shadow.compare(turn, dec, reachable=frozenset())
+        agree += cmp.agrees
+        divergence = cmp.divergence
         if divergence:
             divergences.append((divergence, text))
 

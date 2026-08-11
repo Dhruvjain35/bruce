@@ -18,6 +18,7 @@ import uuid
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -998,6 +999,102 @@ class IntakeJob(Base, TSV):
     )
 
 
+class SemanticShadowJob(Base, TSV):
+    """One turn queued for SHADOW observation by the semantic executive — durable, never best effort.
+
+    Shadow used to be a detached asyncio task. It could not delay or break a turn (that part was right
+    and is preserved: the request path still only writes this row), but a restart or a cancelled worker
+    dropped the observation — and dropped the SLOW ones specifically, since the fast ones had already
+    finished. The sample deciding whether the executive may be given authority would have been biased
+    toward fast successful reads, which are the least informative reads it contains.
+
+    Same lease/claim machine as IntakeJob, deliberately: pending -> processing -> completed |
+    retryable_failed | terminal_failed, with attempts bounding retries and an expired lease making a
+    crashed worker's row reclaimable. RLS is intake_jobs' tenant_or_worker (migration 0033).
+
+    TWO PROPERTIES THIS SHAPE BUYS STRUCTURALLY:
+      * UNIQUE(user_id, channel, provider_message_id) — exactly one job per turn, enforced by the
+        constraint rather than by a SELECT-then-INSERT that races two webhook deliveries.
+      * the observation lives ON this row, so a retried job UPDATEs one record instead of inserting a
+        second one. Convergence is a property of the table, not of the worker's care.
+
+    Holds NO turn text: `channel` + `provider_message_id` reference conversation_turns, which is where
+    the student's words live and where a deletion reaches them. `outcome` is the typed result (ok,
+    timeout, transport, provider_rejected, invalid_schema, budget_exceeded, turn_missing) — a failed
+    observation is recorded as data and is NEVER marked completed.
+    """
+
+    __tablename__ = "semantic_shadow_jobs"
+    id = _pk()
+    user_id = _owner()
+    # THE CANONICAL TURN (migration 0033), and the idempotency key that matters. The invariant this table
+    # protects is "exactly one shadow job per eligible CONVERSATION TURN", and until this column existed
+    # the only way to say so was (user_id, channel, provider_message_id) — a key made of the PROVIDER's
+    # metadata rather than of the thing being counted. Two consequences, both measured:
+    #   * reconciliation had to match shadow rows to turns by re-deriving the same triple, so the two
+    #     ledgers were joined on a guess instead of on an identity;
+    #   * any narrowing of that triple (dropping `channel`, which no test caught) silently swallowed the
+    #     second channel's turn — a LOSS, and losses bias the authority sample toward the turns that
+    #     happened to arrive on the channel that won the race.
+    # ON DELETE CASCADE because the row exists only to describe that turn: a deletion that reaches the
+    # student's words must reach the telemetry that points at them.
+    conversation_turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversation_turns.id", ondelete="CASCADE"), nullable=True)
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, server_default="pending", index=True)
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # THE RETRY BOUND, and its default is load-bearing in a way a bound usually is not. `claim` requires
+    # `attempts < max_attempts`, so a max_attempts of 0 makes a BRAND NEW row unclaimable — every fresh
+    # observation is lost, the backlog reads empty, and nothing raises. The CHECK in __table_args__ makes
+    # that state unrepresentable rather than merely unintended (migration 0033).
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # THE FENCE (migration 0034). `lease_owner` is `cloudrun-<node>-<pid>` and two workers on one
+    # container share it, so it can never prove WHICH claim a write belongs to; a token minted per claim
+    # can. Every completion write requires it, so a stale worker updates zero rows.
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)  # TYPE/reason only, no content
+    router_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    context_flags: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    # WHAT SHADOW DID WITH THIS TURN (migration 0035): `eligible`, or a typed exclusion reason. Persisted
+    # rather than counted in memory because reconciliation compares this table against conversation_turns:
+    # an exclusion that leaves nothing behind is indistinguishable from a turn that was dropped, and
+    # telling those two apart is the only thing the reconciliation can actually do.
+    intake_disposition: Mapped[str] = mapped_column(String(40), nullable=False, server_default="eligible")
+    # THE TURN'S CAPABILITY TRUTH (migration 0035): the registry ids THIS user could actually run at the
+    # moment of the turn, from the per-user broker at the request boundary. NULL means it could not be
+    # established, which is deliberately NOT the same as `[]` — an unknown truth may never be counted as a
+    # capability denial. Registry ids only, so nothing here is PII.
+    reachable_operations: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    observation: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    agrees: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    divergence: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # One of the four numbers the authority decision rests on, so it is a COLUMN like `agrees` and
+    # `divergence` rather than a JSONB field: it has to be countable in SQL. NULL means the turn was
+    # never read (a failed observation), which is deliberately not the same as False.
+    false_capability_denial: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    observed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        # THE CANONICAL IDEMPOTENCY KEY (migration 0033). One shadow job per conversation turn, stated
+        # over the turn itself rather than over the provider metadata that happens to identify it.
+        UniqueConstraint("conversation_turn_id", name="uq_semantic_shadow_job_conversation_turn"),
+        # INGRESS DEDUPE, kept and demoted. It still stops a redelivered webhook from racing two inserts
+        # in the window before the canonical id is known, and it still covers rows written before that column existed —
+        # but it is source metadata, not the invariant.
+        UniqueConstraint("user_id", "channel", "provider_message_id", name="uq_semantic_shadow_job_turn"),
+        # SILENT TOTAL LOSS, made unrepresentable (migration 0033). `claim` takes a row only while
+        # `attempts < max_attempts`; at 0 that is false the moment the row is written, so every fresh job
+        # is permanently unclaimable — no error, no backlog, no observations, and a queue that looks
+        # perfectly drained. A bound whose zero value means "never try" belongs in the database.
+        CheckConstraint("max_attempts > 0", name="ck_semantic_shadow_job_max_attempts_positive"),
+        Index("ix_semantic_shadow_jobs_claimable", "status", "lease_expires_at"),
+    )
+
+
 class EventCandidate(Base, TSV):
     """A structured event extracted from a message, captured for REVIEW (Bite 1 conversation brain).
 
@@ -1521,4 +1618,14 @@ RLS_TABLES: tuple[str, ...] = (
     "agent_runs",
     "agent_run_events",
     "calendar_event_entities",
+    # added 0032/0033 — and BACKFILLED into this inventory, which is the point of the entry. These three
+    # carried their policies from the day their migrations landed, but they were absent from the enforced
+    # list, so the all-tables FORCE-RLS test skipped them: the guarantee existed and nothing checked it.
+    # `intake_jobs` and `semantic_shadow_jobs` are the tenant_or_worker class (a worker claims across
+    # users; an owner sees only their own rows) and `known_people` is tenant_isolation — every one of them
+    # holds or references a student's own data, which is exactly where a silently-missed policy costs the
+    # most. See test_postgres_integration::test_rls_is_owner_scoped_for_the_job_and_people_tables.
+    "intake_jobs",
+    "semantic_shadow_jobs",
+    "known_people",
 )

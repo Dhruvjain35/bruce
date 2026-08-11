@@ -185,6 +185,54 @@ def check_language_corpus(manifest: dict) -> list[str]:
         problems.append(f"known_gaps grew to {gaps} (max {pinned['max_known_gaps']}) — phrasings are "
                         f"being moved out of the families instead of being understood")
 
+    iso = pinned.get("isolation")
+    if iso:
+        harness = (ENGINE / "eval" / "language" / "harness.py")
+        body = harness.read_text() if harness.exists() else ""
+        # AST, not substring. Three of these names appear in this file's own comments EXPLAINING why they
+        # are forbidden, and a check that cannot tell code from prose about the code pressures people to
+        # delete the explanation — destroying exactly the knowledge that stops the bug recurring. Match
+        # what EXECUTES.
+        import ast as _ast
+
+        def _dotted(node) -> str:
+            """Full dotted name of a call target. Walks the WHOLE attribute chain.
+
+            The first version of this stopped one level up, so `os.environ.setdefault` resolved to
+            `environ.setdefault` and matched nothing — the check ran, printed OK, and caught nothing.
+            Found by mutation-proving the gate rather than by reading it.
+            """
+            parts = []
+            while isinstance(node, _ast.Attribute):
+                parts.append(node.attr)
+                node = node.value
+            if isinstance(node, _ast.Name):
+                parts.append(node.id)
+            return ".".join(reversed(parts))
+
+        called: set[str] = set()
+        try:
+            for node in _ast.walk(_ast.parse(body)):
+                if isinstance(node, _ast.Call):
+                    name = _dotted(node.func)
+                    if name:
+                        called.add(name)
+                        called.add(name.rsplit(".", 1)[-1])       # bare form, for `default_provider()`
+        except SyntaxError as exc:
+            problems.append(f"eval/language/harness.py does not parse: {exc}")
+
+        for banned in iso["forbidden_in_harness"]:
+            needle = banned.rstrip("()")
+            if banned in called or f"{needle}()" in called or needle in called:
+                problems.append(
+                    f"eval/language/harness.py CALLS {banned!r} — the language gate must own its "
+                    f"dependencies. Reaching for process-global state is how a leaked API key made this "
+                    f"gate report 0.86 for a system measuring 0.99, with nothing near the leak failing.")
+        ok, out = _run_pytest([iso["regression_test"]])
+        counts = {m.group("word"): int(m.group("n")) for m in _SUMMARY.finditer(out)}
+        if not ok or counts.get("failed", 0) or counts.get("passed", 0) == 0:
+            problems.append(f"isolation regression test did not pass: {iso['regression_test']}")
+
     for key in ("corpus_purity_test", "authority_contract_test"):
         ok, out = _run_pytest([pinned[key]])
         counts = {m.group("word"): int(m.group("n")) for m in _SUMMARY.finditer(out)}

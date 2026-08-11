@@ -91,6 +91,14 @@ _RLS_TABLES = [
     "relay_control_audit",
     # Added 0016. relay device bootstrap tokens + append-only registration audit (worker-only).
     "relay_bootstrap_tokens", "relay_registration_audit",
+    # BACKFILLED, and the backfill is the point. All three carried their policies from the day their
+    # migrations landed (0005, 0032, 0033) and none of them was in this list, so the all-tables FORCE-RLS
+    # assertion above SKIPPED them: the guarantee existed and nothing checked it, which is the same shape
+    # as a guarantee that does not exist. intake_jobs and semantic_shadow_jobs are the tenant_or_worker
+    # class (a worker claims across users; an owner sees only their own rows) and known_people is
+    # tenant_isolation — every one of them holds or references a student's own data.
+    # test_rls_is_owner_scoped_for_the_job_and_people_tables proves the per-table denial.
+    "intake_jobs", "semantic_shadow_jobs", "known_people",
 ]
 
 
@@ -366,6 +374,63 @@ def test_08_force_rls_enabled_on_all_user_tables(clean_db):
             for t in _RLS_TABLES:
                 assert t in got, f"table {t} not found"
                 assert got[t] == (True, True), f"{t} rowsecurity/force = {got[t]} (want (True, True))"
+        finally:
+            await conn.close()
+
+    asyncio.run(run())
+
+
+def test_rls_is_owner_scoped_for_the_job_and_people_tables(clean_db):
+    """FORCE-RLS is not isolation. It says the owner cannot bypass the policy; it says nothing about what
+    the policy ALLOWS, and a policy of `USING (true)` would satisfy test_08 completely.
+
+    These three tables were absent from the enforced inventory until now, so neither half was checked for
+    them. All three hold or point at a student's own data: `known_people` is the recipients they
+    introduced by name, `intake_jobs` and `semantic_shadow_jobs` reference the turns they typed. Each row
+    is written under one owner and then read back under ANOTHER owner's context, which is the only
+    question that matters — and the owner's own read is the positive control, so a table that is simply
+    empty cannot pass this by accident.
+    """
+
+    async def run():
+        a, b = uuid4(), uuid4()
+        await users_repo.ensure(a)
+        await users_repo.ensure(b)
+
+        inserts = {
+            "known_people": (
+                "INSERT INTO known_people (user_id, name, normalized_name, email) "
+                "VALUES ($1, 'ms alvarez', 'ms alvarez', 'alvarez@school.edu')"),
+            # intake_jobs points at a real source and mission (both NOT NULL FKs), created under the same
+            # owner in the same transaction — the row has to be legal before its visibility means anything.
+            "intake_jobs": (
+                "WITH s AS (INSERT INTO sources (user_id, kind) VALUES ($1, 'text') RETURNING id), "
+                "     m AS (INSERT INTO missions (user_id) VALUES ($1) RETURNING id) "
+                "INSERT INTO intake_jobs (user_id, source_id, mission_id, source_kind, status) "
+                "SELECT $1, s.id, m.id, 'text', 'pending' FROM s, m"),
+            "semantic_shadow_jobs": (
+                "INSERT INTO semantic_shadow_jobs (user_id, channel, provider_message_id, status) "
+                "VALUES ($1, 'imessage', 'pm-rls', 'pending')"),
+        }
+
+        conn = await asyncpg.connect(**_app_conn_params())
+        try:
+            for table, sql in inserts.items():
+                async with conn.transaction():
+                    await conn.execute("SELECT set_config('app.user_id', $1, true)", str(a))
+                    await conn.execute(sql, a)
+                    mine = await conn.fetchval(f"SELECT count(*) FROM {table}")
+                assert mine == 1, f"{table}: the owner cannot see the row they just wrote"
+
+                async with conn.transaction():
+                    await conn.execute("SELECT set_config('app.user_id', $1, true)", str(b))
+                    theirs = await conn.fetchval(f"SELECT count(*) FROM {table}")
+                    stolen = await conn.execute(
+                        f"UPDATE {table} SET user_id = user_id WHERE user_id = $1", a)
+                assert theirs == 0, (
+                    f"{table}: another owner read this student's rows — FORCE RLS was on and the policy "
+                    f"was not owner-scoped, which test_08 alone cannot detect")
+                assert stolen.endswith(" 0"), f"{table}: another owner could WRITE this student's rows"
         finally:
             await conn.close()
 

@@ -303,8 +303,13 @@ async def warmup() -> bool:
         return False
 
 
-def _classify_failure(exc: Exception) -> str:
+def classify_failure(exc: Exception) -> str:
     """Name the failure honestly, because the name decides whether it is retried and who has to fix it.
+
+    PUBLIC because a second caller now depends on the taxonomy: the durable shadow queue records WHY a
+    read failed as the job's typed outcome, and it must be the same word this module would have used.
+    Two classifiers would drift, and the drift would show up as a failure class that looks like it only
+    ever happens in shadow.
 
     A 4xx from the provider is a CONFIGURATION or POLICY rejection — a bad model setting, a refused
     request — and retrying it just spends the deadline to be told the same thing. This distinction is not
@@ -344,7 +349,7 @@ async def triage(body: str, *, provider: SemanticTriage | None = None, timeout_s
             return TriageFailure("timeout", ms)
         except Exception as exc:
             ms = (time.perf_counter() - t0) * 1000.0
-            reason = _classify_failure(exc)
+            reason = classify_failure(exc)
             if reason == "transport" and attempt == 1:
                 log.info("triage retry=transport ms=%.0f", ms)      # NO exception text: it can echo the message
                 continue

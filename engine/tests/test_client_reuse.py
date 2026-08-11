@@ -75,11 +75,19 @@ def test_no_user_state_is_reachable_from_a_shared_model(monkeypatch):
         assert forbidden not in flat, f"a shared model object exposes {forbidden}"
 
 
-def test_model_construction_is_measurably_cheaper_than_before():
+def test_model_construction_is_measurably_cheaper_than_before(monkeypatch):
     """5.454ms per construction before this change, measured. The point is the transport, but the
-    construction saving is real and is asserted so a regression to per-call providers is visible."""
+    construction saving is real and is asserted so a regression to per-call providers is visible.
+
+    `monkeypatch`, NOT `os.environ[...]`. This test used to assign the fake key directly and never restore
+    it, leaking `sk-test-aaa` into every subsequent test in the process. Nothing failed nearby — the
+    damage landed much later, on the only suite that makes REAL model calls: every call 401'd, `triage`
+    correctly classified the 4xx as provider_rejected and did not retry, the executive fell back to
+    asking, and the language rate gate read 0.86 for a system that measures 0.99. The tell was the clock:
+    that gate takes ~115s honestly and failed in 12.
+    """
     import time
-    os.environ["OPENAI_API_KEY"] = "sk-test-aaa"
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-aaa")
     llm.conversation_model()
     started = time.perf_counter()
     for _ in range(200):
