@@ -33,6 +33,7 @@ import os
 import pathlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CORPUS = json.loads((ROOT / "tests" / "data" / "paraphrase_families.json").read_text())
@@ -45,6 +46,9 @@ RUNS = 5
 # throttled client. A measurement instrument that changes what it measures is worse than no instrument.
 MAX_CONCURRENCY = 3
 TRANSPORT_RETRIES = 3
+# Seconds, multiplied by the attempt number. A module constant rather than a literal so the integrity
+# suite can zero it: what that suite asserts is the NUMBER of attempts, never the wall time between them.
+TRANSPORT_BACKOFF_S = 1.5
 # Measuring COMPREHENSION, not latency. Production keeps its 2.5s student-facing deadline; scoring a slow
 # call as a misunderstanding is how this harness once reported 0.86 for a system measuring 0.99. Passed
 # explicitly to `interpret` — an `os.environ.setdefault` at import time lived here briefly and was exactly
@@ -95,6 +99,52 @@ def samples() -> list[Sample]:
     return out
 
 
+class ReadOutcome(str, Enum):
+    """WHAT AN OBSERVATION ACTUALLY IS — and therefore whether it may enter a rate.
+
+    Only `valid` is a reading of the student's sentence. The other four are facts about the machinery,
+    and each has a different owner: folding any of them into a comprehension percentage attributes a
+    billing, latency or schema problem to the model's understanding. That is not a hypothetical — see
+    the module header of tests/test_language_eval_integrity.py for the day it cost.
+    """
+
+    valid = "valid"                          # a real reading; score it
+    provider_failure = "provider_failure"    # 429/5xx/network, or a 4xx auth/config rejection
+    timeout = "timeout"                      # the deadline was spent before an answer arrived
+    malformed = "malformed"                  # the model returned a shape that could not be parsed
+    degraded = "degraded"                    # a partial or unusable read; a weak signal, not a reading
+
+
+# Closed-vocabulary codes (semantic_executive) -> what the observation IS. Anything not listed here is a
+# validation note about a read that DID happen (a dropped operation id, a polarity veto), which is a
+# genuine reading and stays `valid`.
+_OUTCOME_BY_CODE = {
+    "reader_unavailable": ReadOutcome.provider_failure,
+    "triage_failed_transport": ReadOutcome.provider_failure,
+    "triage_failed_provider_rejected": ReadOutcome.provider_failure,
+    "triage_failed_timeout": ReadOutcome.timeout,
+    "triage_failed_invalid_schema": ReadOutcome.malformed,
+    "triage_failed_low_confidence": ReadOutcome.degraded,
+    "triage_failed": ReadOutcome.degraded,   # generic fallback: a failure whose reason we cannot name
+    "no_usable_read": ReadOutcome.degraded,
+}
+
+# Retrying a spent deadline just spends it again, and a 4xx returns the same answer — the same reasoning
+# semantic_triage.triage applies one layer down. Only a genuine transport blip earns another attempt.
+_RETRYABLE = {ReadOutcome.provider_failure}
+
+
+def classify_read(codes) -> ReadOutcome:
+    """The SAFEST class wins. A turn carrying both a transport code and a schema code failed at the
+    transport first; reporting the later one would point the fix at the wrong owner."""
+    seen = [_OUTCOME_BY_CODE[c] for c in codes if c in _OUTCOME_BY_CODE]
+    for rank in (ReadOutcome.provider_failure, ReadOutcome.timeout, ReadOutcome.malformed,
+                 ReadOutcome.degraded):
+        if rank in seen:
+            return rank
+    return ReadOutcome.valid
+
+
 @dataclass
 class Observation:
     sample: Sample
@@ -103,10 +153,12 @@ class Observation:
     polarity: str
     confidence: float
     notes: tuple = ()
+    codes: tuple = ()
+    outcome: ReadOutcome = ReadOutcome.valid
 
 
 async def _observe(sample: Sample, sem: asyncio.Semaphore, *, provider=None,
-                   timeout_s: float = EVAL_TIMEOUT_S) -> Observation | None:
+                   timeout_s: float = EVAL_TIMEOUT_S) -> Observation:
     from bruce_engine import semantic_executive as se
 
     ctx = se.mini_context(sample.text, **sample.context)
@@ -115,16 +167,24 @@ async def _observe(sample: Sample, sem: asyncio.Semaphore, *, provider=None,
         # question this harness asks is whether Bruce understood, and an HTTP 429 is not an answer to it.
         # Production behaves differently and correctly — it falls back to asking rather than retrying into
         # a student's latency budget.
+        #
+        # The predicate is the CODE, not the note. It used to be `"reader unavailable" in note`, but the
+        # note the executive emits for a triage failure is `f"triage failed: {reason} ({ms}ms)"` — so the
+        # substring never matched, the retry never ran, and a 100% outage was scored as 100% real reads.
+        # That single mismatch is the whole of DEFECT-17.
         for attempt in range(TRANSPORT_RETRIES):
             turn = await se.interpret(ctx, triage=provider, timeout_s=timeout_s)
-            if not any("reader unavailable" in n for n in turn.validation_notes):
+            outcome = classify_read(turn.validation_codes)
+            if outcome not in _RETRYABLE:
                 break
-            await asyncio.sleep(1.5 * (attempt + 1))
-        else:
-            return None
+            if attempt < TRANSPORT_RETRIES - 1:
+                await asyncio.sleep(TRANSPORT_BACKOFF_S * (attempt + 1))
+    # A retry-exhausted sample is RECORDED, never dropped. Returning None shrank `observations`, which
+    # hid the reason and left the caller to infer an outage from a missing count.
     return Observation(sample=sample, op=turn.proposed_operation_id, mode=turn.mode.value,
                        polarity=turn.operation_polarity, confidence=turn.confidence,
-                       notes=tuple(turn.validation_notes))
+                       notes=tuple(turn.validation_notes), codes=tuple(turn.validation_codes),
+                       outcome=outcome)
 
 
 async def run(runs: int = RUNS, *, provider=None, timeout_s: float = EVAL_TIMEOUT_S) -> dict:
@@ -133,7 +193,32 @@ async def run(runs: int = RUNS, *, provider=None, timeout_s: float = EVAL_TIMEOU
     all_samples = samples()
     tasks = [_observe(s, sem, provider=provider, timeout_s=timeout_s)
              for _ in range(runs) for s in all_samples]
-    observations = [o for o in await asyncio.gather(*tasks) if o is not None]
+    recorded = [o for o in await asyncio.gather(*tasks) if o is not None]
+    expected_total = runs * len(all_samples)
+
+    # EVERY class present, always. A missing key and a zero are different facts, and `.get(k, 0)` on a
+    # metrics blob silently turns the first into the second.
+    outcome_counts = {o.value: 0 for o in ReadOutcome}
+    for o in recorded:
+        outcome_counts[o.outcome.value] += 1
+
+    # ONLY a real reading may enter a rate. Everything below this line scores `observations`, so a failed
+    # read cannot depress a comprehension percentage by being counted as a wrong answer.
+    observations = [o for o in recorded if o.outcome is ReadOutcome.valid]
+
+    # THE REFUSAL. A run that did not measure every sample does not get to report a number — it reports
+    # that it failed and why. Strict on purpose: a tolerance is a place for a partial outage to hide,
+    # because 5% of calls failing looks exactly like a 5% comprehension dip, which sits inside the noise
+    # band of a real model. Re-running a fifty-cent evaluation is cheaper than shipping authority on a
+    # rate that quietly averaged in an outage.
+    valid = len(observations) == expected_total
+    invalidated_by = None
+    if not valid:
+        broken = {k: v for k, v in outcome_counts.items() if k != ReadOutcome.valid.value and v}
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(broken.items(), key=lambda kv: -kv[1]))
+        invalidated_by = (
+            f"only {len(observations)} of {expected_total} reads were valid ({detail or 'reads missing'}) — "
+            f"these are facts about the machinery, not about comprehension, so no rate is reported")
 
     writes = _write_ops()
     by_text: dict[str, list[Observation]] = defaultdict(list)
@@ -191,20 +276,33 @@ async def run(runs: int = RUNS, *, provider=None, timeout_s: float = EVAL_TIMEOU
     # WHY a read produced nothing. Without this the harness reports a rate and cannot say whether the
     # misses were misunderstanding or a rate-limited transport, which are opposite problems with opposite
     # fixes. A miss whose cause is unrecorded is a miss nobody can act on.
-    reasons = Counter(n for o in observations for n in o.notes)
+    #
+    # Keyed on the CLOSED VOCABULARY CODE, not the prose note. The note interpolates elapsed ms, so one
+    # outage fragmented into a key per latency value — 8 keys of 2-4 counts each instead of one key of
+    # 62 — and a diagnostic that fragments cannot be read. Counted over every RECORDED observation,
+    # because the failures are precisely what was just excluded from `observations`.
+    reasons = Counter(c for o in recorded for c in o.codes)
 
     return {
         "runs": runs,
+        # Did this run measure anything? Read this BEFORE any rate below it.
+        "valid": valid,
+        "invalidated_by": invalidated_by,
+        "read_outcomes": outcome_counts,
         "failure_reasons": dict(reasons.most_common(8)),
-        "observations": len(observations),
-        "expected_observations": runs * len(all_samples),
+        # Every sample accounted for, including the ones that failed — a dropped sample hides its reason.
+        "observations": len(recorded),
+        "expected_observations": expected_total,
+        "valid_observations": len(observations),
         "false_action_count": len(false_actions),
         "false_actions": false_actions[:20],
-        "conversation_vs_action": (conv_correct / conv_total) if conv_total else 0.0,
-        "goal_kind": (kind_correct / kind_total) if kind_total else 0.0,
-        "clarification_rate": clarifications / len(observations) if observations else 0.0,
-        "paraphrase_equivalence": equivalence,
-        "per_family_rate": {k: sum(v) / len(v) for k, v in per_family.items()},
+        # None, not 0.0, on an invalidated run. A zero is a number, and a number gets quoted; this is the
+        # difference between "Bruce understands 17% of turns" and "the account had no credits".
+        "conversation_vs_action": ((conv_correct / conv_total) if conv_total else 0.0) if valid else None,
+        "goal_kind": ((kind_correct / kind_total) if kind_total else 0.0) if valid else None,
+        "clarification_rate": (clarifications / len(observations) if observations else 0.0) if valid else None,
+        "paraphrase_equivalence": equivalence if valid else {},
+        "per_family_rate": {k: sum(v) / len(v) for k, v in per_family.items()} if valid else {},
         "wobbling_phrasings": wobble,
     }
 

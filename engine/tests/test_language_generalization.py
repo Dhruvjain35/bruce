@@ -185,9 +185,21 @@ def test_language_rates_meet_their_thresholds(rates):
         ["language_generalization"]["rate_thresholds"]
     r = rates
 
-    assert r["observations"] == r["expected_observations"], (
-        f"only {r['observations']} of {r['expected_observations']} observations were recorded — a "
-        f"transport failure this large makes every rate below meaningless")
+    # DID THIS RUN MEASURE ANYTHING? Read before any rate below it.
+    #
+    # The predecessor of this assertion compared `observations` to `expected_observations`, and could
+    # never fire: a failed read still produced an Observation, so the counts matched at a 100% outage.
+    # That is how `429 credit_balance_exhausted` on every one of 310 calls was reported as
+    # "conversation-vs-action 0.1739" — a billing event wearing a comprehension regression's clothes.
+    # The harness now classifies each read and refuses to compute a rate it did not measure.
+    assert r["valid"], (
+        f"THE LANGUAGE EVALUATION DID NOT MEASURE COMPREHENSION.\n"
+        f"  {r['invalidated_by']}\n"
+        f"  read outcomes: {r['read_outcomes']}\n"
+        f"  failure codes: {r['failure_reasons']}\n"
+        f"  Do NOT read this as a comprehension result and do NOT quote a rate from this run. "
+        f"provider_failure means billing or credentials; timeout means latency; malformed means the "
+        f"prompt or schema. Fix that first, then measure.")
 
     problems = []
     if r["false_action_count"] > pinned["false_action"]:
@@ -209,6 +221,12 @@ def test_paraphrase_families_are_internally_consistent(rates):
     disagree with each other is Bruce recognising wordings, even if its average happens to look fine.
     """
     r = rates
+    # An invalidated run reports NO equivalence data, and an empty dict satisfies the filter below
+    # vacuously — so this gate would go green on a total outage without this line. Same failure shape as
+    # the one the rates gate just grew a guard for, one file over.
+    assert r["valid"], (
+        f"the evaluation did not measure comprehension, so family agreement is unknown, not proven: "
+        f"{r['invalidated_by']}")
     weak = {k: v for k, v in r["paraphrase_equivalence"].items() if v < 0.90}
     assert not weak, (f"families whose members disagree on the objective: {weak}. "
                       f"Wobbling phrasings: {r['wobbling_phrasings'][:8]}")

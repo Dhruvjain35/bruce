@@ -221,6 +221,35 @@ CODE_READER_UNAVAILABLE = "reader_unavailable"
 CODE_TRIAGE_FAILED = "triage_failed"
 CODE_NO_USABLE_READ = "no_usable_read"
 
+# WHY THE REASON GETS ITS OWN CODE. `CODE_TRIAGE_FAILED` collapsed FOUR failures with four different
+# owners into one label — a spent deadline (latency), a 429 (billing), a 4xx (configuration) and an
+# unusable shape (prompt/schema). The reason survived only inside the prose note, which also interpolates
+# elapsed ms, so anything counting notes fragmented one outage into a key per latency value.
+#
+# That collapse is how a dead OpenAI balance was reported as "Bruce understands 17% of turns" on
+# 2026-08-10: the language harness could see THAT a read failed but not WHY, so it scored the failure as
+# a wrong reading. Splitting the code is what lets an evaluator refuse to report a comprehension rate it
+# did not measure — see tests/test_language_eval_integrity.py.
+#
+# These stay CONSTANTS rather than an f-string over `outcome.reason`: `validation_codes` is persisted to
+# the durable shadow record precisely because it is a closed, repo-owned vocabulary, and interpolating a
+# value from the transport layer is how open-ended text gets into a telemetry table.
+CODE_TRIAGE_TIMEOUT = "triage_failed_timeout"
+CODE_TRIAGE_TRANSPORT = "triage_failed_transport"
+CODE_TRIAGE_PROVIDER_REJECTED = "triage_failed_provider_rejected"
+CODE_TRIAGE_INVALID_SCHEMA = "triage_failed_invalid_schema"
+CODE_TRIAGE_LOW_CONFIDENCE = "triage_failed_low_confidence"
+
+# Keyed by `TriageFailure.reason` (semantic_contracts.py:140). An unrecognised reason falls back to the
+# generic code rather than inventing one, so the vocabulary cannot be widened from the transport layer.
+TRIAGE_FAILURE_CODES = {
+    "timeout": CODE_TRIAGE_TIMEOUT,
+    "transport": CODE_TRIAGE_TRANSPORT,
+    "provider_rejected": CODE_TRIAGE_PROVIDER_REJECTED,
+    "invalid_schema": CODE_TRIAGE_INVALID_SCHEMA,
+    "low_confidence": CODE_TRIAGE_LOW_CONFIDENCE,
+}
+
 
 def reconcile_polarity(model_polarity: str, trusted_text: str) -> tuple[str, str | None, str | None]:
     """Combine the model's reading with the DETERMINISTIC authorization reader, safest wins.
@@ -477,7 +506,7 @@ async def interpret(context: Any, *, triage=None, timeout_s: float | None = None
         # nothing, and still subject to every validation below.
         if outcome.partial is None:
             return _fallback(trusted, f"triage failed: {outcome.reason} ({outcome.elapsed_ms:.0f}ms)",
-                             CODE_TRIAGE_FAILED)
+                             TRIAGE_FAILURE_CODES.get(outcome.reason, CODE_TRIAGE_FAILED))
         reading = outcome.partial
     else:
         reading = outcome
