@@ -1,8 +1,12 @@
-"""MUTATION PROOF for the language-evaluation integrity gate (DEFECT-17).
+"""MUTATION PROOFS for the fixes whose value is entirely in what they REFUSE to do.
 
-A test that passes both with and without the fix proves nothing. This runner damages the fix in ten
-specific ways and requires `tests/test_language_eval_integrity.py` to go RED for every one of them. A
-mutation that SURVIVES is a hole in the suite, reported as a failure of this runner — not a pass.
+A test that passes both with and without the fix proves nothing. This runner damages each fix in specific
+ways and requires the suite that claims to protect it to go RED every time. A mutation that SURVIVES is a
+hole in the suite, reported as a failure of this runner — not a pass.
+
+Covered here:
+  * DEFECT-17 — the language evaluator must tell a dead account from a dead model
+  * DEFECT-4  — the model must be given exact executable operation ids, and only executable ones
 
 WHY A SEPARATE RUNNER FROM scripts/mutation_runner.py. That one rsyncs a tree and mutates cluster-wide
 Postgres roles (`bruce_app`, `bruce_shadow_recon`) which outlive `DROP DATABASE`; a failed reset silently
@@ -27,12 +31,17 @@ import sys
 ENGINE = pathlib.Path(__file__).resolve().parents[1]
 HARNESS = ENGINE / "eval" / "language" / "harness.py"
 EXECUTIVE = ENGINE / "bruce_engine" / "semantic_executive.py"
-SUITE = "tests/test_language_eval_integrity.py"
+SNAPSHOT = ENGINE / "bruce_engine" / "capability_snapshot.py"
+
+EVAL_SUITE = "tests/test_language_eval_integrity.py"
+CAPS_SUITE = "tests/test_capability_ids_in_context.py"
 
 
 class Mutation:
-    def __init__(self, name: str, path: pathlib.Path, old: str, new: str, why: str) -> None:
+    def __init__(self, name: str, path: pathlib.Path, old: str, new: str, why: str,
+                 suite: str = EVAL_SUITE) -> None:
         self.name, self.path, self.old, self.new, self.why = name, path, old, new, why
+        self.suite = suite
 
 
 MUTATIONS = [
@@ -48,9 +57,24 @@ MUTATIONS = [
         "every failure classified as a genuine reading"),
     Mutation(
         "run_always_valid", HARNESS,
-        "    valid = len(observations) == expected_total",
+        "    valid = not reasons_invalid",
         "    valid = True",
         "a run always claims it measured something"),
+    Mutation(
+        "machinery_tolerance_introduced", HARNESS,
+        "    if machinery:",
+        "    if machinery > 5:",
+        "a provider outage or spent deadline is tolerated instead of invalidating"),
+    Mutation(
+        "model_quality_bound_removed", HARNESS,
+        "    if quality_fraction > MAX_MODEL_QUALITY_FRACTION:",
+        "    if False:",
+        "unbounded garbage: a model failing half the time scores on the half that parsed"),
+    Mutation(
+        "malformed_reclassified_as_machinery", HARNESS,
+        "_MACHINERY = {ReadOutcome.provider_failure, ReadOutcome.timeout}",
+        "_MACHINERY = {ReadOutcome.provider_failure, ReadOutcome.timeout, ReadOutcome.malformed}",
+        "one rare unparseable response throws away an affordable measurement again"),
     Mutation(
         "rates_reported_on_invalid_run", HARNESS,
         '        "conversation_vs_action": ((conv_correct / conv_total) if conv_total else 0.0) if valid else None,',
@@ -86,6 +110,34 @@ MUTATIONS = [
         "                             TRIAGE_FAILURE_CODES.get(outcome.reason, CODE_TRIAGE_FAILED))",
         "                             CODE_TRIAGE_FAILED)",
         "timeout / transport / malformed collapse back into one unusable label"),
+
+    # --- DEFECT-4: exact executable operation ids in the model's context ------------------------------
+    Mutation(
+        "capability_ids_removed_from_context", SNAPSHOT,
+        "            ops = advertised_operations(self)",
+        "            ops = ()",
+        "the ids stop reaching the model — DEFECT-4 restored",
+        CAPS_SUITE),
+    Mutation(
+        "executability_filter_removed", SNAPSHOT,
+        "        out.extend(cap for cap in family.capabilities if goal_handler.executable(cap))",
+        "        out.extend(family.capabilities)",
+        "unexecutable ids advertised: NOT_AN_OPERATION_ID becomes capability_has_no_goal_kind, "
+        "same dead end for the student",
+        CAPS_SUITE),
+    Mutation(
+        "broker_truth_ignored", SNAPSHOT,
+        "        if not family.usable:\n            continue",
+        "        if False:\n            continue",
+        "a disconnected account is advertised because its capability happens to have an executor",
+        CAPS_SUITE),
+    Mutation(
+        "executability_hardcoded_instead_of_derived", SNAPSHOT,
+        "        out.extend(cap for cap in family.capabilities if goal_handler.executable(cap))",
+        '        out.extend(cap for cap in family.capabilities\n'
+        '                   if cap in ("gmail.send_message", "calendar.create_event"))',
+        "a second hard-coded list that will drift from the executor registry",
+        CAPS_SUITE),
 ]
 
 
@@ -93,8 +145,8 @@ def _sha(p: pathlib.Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def _suite_is_red() -> bool:
-    proc = subprocess.run([sys.executable, "-m", "pytest", SUITE, "-q", "-p", "no:randomly", "-x"],
+def _suite_is_red(suite: str) -> bool:
+    proc = subprocess.run([sys.executable, "-m", "pytest", suite, "-q", "-p", "no:randomly", "-x"],
                           cwd=ENGINE, capture_output=True, text=True)
     return proc.returncode != 0
 
@@ -104,13 +156,15 @@ def main() -> int:
     originals = {p: p.read_bytes() for p in targets}
     before = {p: _sha(p) for p in targets}
 
-    print(f"MUTATION PROOF — {len(MUTATIONS)} mutations against {SUITE}\n")
+    suites = sorted({m.suite for m in MUTATIONS})
+    print(f"MUTATION PROOFS — {len(MUTATIONS)} mutations across {len(suites)} suites\n")
 
-    # The suite must be GREEN before anything is damaged, or every result below is meaningless.
-    if _suite_is_red():
-        print("ABORT: the suite is already red on an unmutated tree. Fix that first.")
-        return 2
-    print("baseline: suite GREEN on the unmutated tree\n")
+    # Every suite must be GREEN before anything is damaged, or each result below is meaningless.
+    for suite in suites:
+        if _suite_is_red(suite):
+            print(f"ABORT: {suite} is already red on an unmutated tree. Fix that first.")
+            return 2
+    print("baseline: every suite GREEN on the unmutated tree\n")
 
     caught, survived = [], []
     try:
@@ -126,7 +180,7 @@ def main() -> int:
                 continue
             try:
                 m.path.write_text(text.replace(m.old, m.new, 1))
-                if _suite_is_red():
+                if _suite_is_red(m.suite):
                     caught.append(m)
                     print(f"  [CAUGHT  ] {m.name}\n              {m.why}")
                 else:

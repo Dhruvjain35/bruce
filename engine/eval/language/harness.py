@@ -133,6 +133,26 @@ _OUTCOME_BY_CODE = {
 # semantic_triage.triage applies one layer down. Only a genuine transport blip earns another attempt.
 _RETRYABLE = {ReadOutcome.provider_failure}
 
+# TWO KINDS OF FAILURE, TWO DIFFERENT RULES — because they answer different questions.
+#
+# MACHINERY failures say nothing whatsoever about comprehension: a 429 is a billing fact and a spent
+# deadline is a latency fact. There is no honest way to fold either into a percentage about understanding,
+# so a SINGLE one invalidates the run. Zero tolerance is right here precisely because these are not
+# properties of the model at all.
+_MACHINERY = {ReadOutcome.provider_failure, ReadOutcome.timeout}
+
+# MODEL-QUALITY failures are the opposite: an unparseable response IS the model's behaviour, and it is a
+# real thing to measure. Invalidating a whole run over one of them is how a measurement stops being
+# affordable enough to take — the first honest baseline (2026-08-11, 310 reads) was thrown away over
+# exactly one malformed response, 0.32%, while `false_action` was 0 and `provider_failure` was 0.
+#
+# So they are BOUNDED rather than forbidden: reported as their own rate, excluded from the comprehension
+# rates they would otherwise distort, and above the bound they invalidate the run. Without a bound this
+# would be the hiding place the strict rule existed to close — a model returning garbage half the time
+# would post an excellent score on the half that parsed.
+_MODEL_QUALITY = {ReadOutcome.malformed, ReadOutcome.degraded}
+MAX_MODEL_QUALITY_FRACTION = 0.02
+
 
 def classify_read(codes) -> ReadOutcome:
     """The SAFEST class wins. A turn carrying both a transport code and a schema code failed at the
@@ -206,19 +226,31 @@ async def run(runs: int = RUNS, *, provider=None, timeout_s: float = EVAL_TIMEOU
     # read cannot depress a comprehension percentage by being counted as a wrong answer.
     observations = [o for o in recorded if o.outcome is ReadOutcome.valid]
 
-    # THE REFUSAL. A run that did not measure every sample does not get to report a number — it reports
-    # that it failed and why. Strict on purpose: a tolerance is a place for a partial outage to hide,
-    # because 5% of calls failing looks exactly like a 5% comprehension dip, which sits inside the noise
-    # band of a real model. Re-running a fifty-cent evaluation is cheaper than shipping authority on a
-    # rate that quietly averaged in an outage.
-    valid = len(observations) == expected_total
-    invalidated_by = None
-    if not valid:
-        broken = {k: v for k, v in outcome_counts.items() if k != ReadOutcome.valid.value and v}
-        detail = ", ".join(f"{k}={v}" for k, v in sorted(broken.items(), key=lambda kv: -kv[1]))
-        invalidated_by = (
-            f"only {len(observations)} of {expected_total} reads were valid ({detail or 'reads missing'}) — "
-            f"these are facts about the machinery, not about comprehension, so no rate is reported")
+    # THE REFUSAL. A run that did not measure what it claims to measure does not get to report a number.
+    machinery = sum(outcome_counts[o.value] for o in _MACHINERY)
+    model_quality = sum(outcome_counts[o.value] for o in _MODEL_QUALITY)
+    quality_fraction = (model_quality / expected_total) if expected_total else 0.0
+    missing = expected_total - len(recorded)
+
+    reasons_invalid = []
+    if machinery:
+        detail = ", ".join(f"{o.value}={outcome_counts[o.value]}" for o in _MACHINERY
+                           if outcome_counts[o.value])
+        reasons_invalid.append(
+            f"{machinery} of {expected_total} reads failed in the MACHINERY ({detail}) — a provider "
+            f"outage or a spent deadline says nothing about comprehension, so no rate is reported")
+    if quality_fraction > MAX_MODEL_QUALITY_FRACTION:
+        detail = ", ".join(f"{o.value}={outcome_counts[o.value]}" for o in _MODEL_QUALITY
+                           if outcome_counts[o.value])
+        reasons_invalid.append(
+            f"{model_quality} of {expected_total} reads ({quality_fraction:.2%}) were unusable model "
+            f"output ({detail}), over the {MAX_MODEL_QUALITY_FRACTION:.0%} bound — too much of the "
+            f"corpus went unread for the remainder to stand for it")
+    if missing:
+        reasons_invalid.append(f"{missing} reads were never recorded at all")
+
+    valid = not reasons_invalid
+    invalidated_by = "; ".join(reasons_invalid) if reasons_invalid else None
 
     writes = _write_ops()
     by_text: dict[str, list[Observation]] = defaultdict(list)
@@ -294,6 +326,11 @@ async def run(runs: int = RUNS, *, provider=None, timeout_s: float = EVAL_TIMEOU
         "observations": len(recorded),
         "expected_observations": expected_total,
         "valid_observations": len(observations),
+        # Reported ALWAYS, including on a valid run. These are the reads the comprehension rates below
+        # were computed WITHOUT, so a rate quoted without them beside it is missing its own denominator.
+        "machinery_failures": machinery,
+        "model_quality_failures": model_quality,
+        "model_quality_fraction": quality_fraction,
         "false_action_count": len(false_actions),
         "false_actions": false_actions[:20],
         # None, not 0.0, on an invalidated run. A zero is a number, and a number gets quoted; this is the

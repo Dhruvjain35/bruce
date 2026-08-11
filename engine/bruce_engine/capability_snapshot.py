@@ -68,6 +68,18 @@ class CapabilitySnapshot:
         parts = []
         if can:
             parts.append("Right now you CAN use: " + ", ".join(can) + ".")
+            # THE LIST THE PROMPT ALREADY PROMISED. `conversation_model` instructs the model that "the
+            # context contains the operations Bruce can run right now, as exact ids" and that
+            # `required_capabilities` "MUST contain only exact operation ids copied from that list".
+            # Until this line there was no such list anywhere in the context — the families above are
+            # words like "email", not ids — so the model was ordered to copy from something it could not
+            # see and wrote prose instead. `goal_runtime` then rejected the prose as NOT_AN_OPERATION_ID,
+            # `GoalHandler` declined, and the student got a sentence where an email was meant.
+            ops = advertised_operations(self)
+            if ops:
+                parts.append("Operations you may call, as exact ids — copy one of these verbatim into "
+                             "required_capabilities, and treat anything not listed as nonexistent: "
+                             + ", ".join(ops) + ".")
         else:
             parts.append("Right now you have NO connected tools.")
         cannot = self.unusable()
@@ -75,6 +87,38 @@ class CapabilitySnapshot:
             parts.append("You cannot use: " + ", ".join(f"{f.family} ({f.reason})" for f in cannot) + ".")
         parts.append("Never claim a tool you cannot use, and never deny one you can.")
         return " ".join(parts)
+
+
+def advertised_operations(snap: CapabilitySnapshot) -> tuple[str, ...]:
+    """The exact operation ids the model may name — TWO truths, both required.
+
+      * BROKER truth: the capability is usable for THIS student right now. Already carried on
+        `FamilyState.capabilities`, which `snapshot()` fills from `tool_broker.availability`.
+      * EXECUTOR truth: the capability can be carried all the way to a verified provider call.
+
+    The second filter is the one that is easy to skip and expensive to skip. `FAMILIES` declares five
+    ids; only two of them have both a goal kind and an executor. `turn_context`'s `available_operations`
+    is wider still — every registry spec that is `live` and broker-ok, which includes `gmail.get_message`,
+    `gmail.get_thread` and `gmail.verify_sent`, none of which have an executor at all.
+
+    Advertising any of those would not fix the defect, it would rename it: the model would copy a real id,
+    `GoalHandler` would find nothing to run, and the turn would decline with `capability_has_no_goal_kind`
+    instead of `NOT_AN_OPERATION_ID`. Identical outcome for the student, new label in the logs.
+
+    DERIVED, never restated. `goal_handler.executable` is the single authority on carryability, so a
+    capability that gains an executor becomes visible to the model the same day and one that loses its
+    executor disappears the same day. A second hard-coded list here is a list that would drift.
+    """
+    # Local import: `goal_handler` pulls in the executor and adapter layers, and this module is imported
+    # by the context path on every turn. Keeping the edge lazy keeps that import graph one-directional.
+    from . import goal_handler
+
+    out: list[str] = []
+    for family in snap.families:
+        if not family.usable:
+            continue
+        out.extend(cap for cap in family.capabilities if goal_handler.executable(cap))
+    return tuple(dict.fromkeys(out))          # stable order, de-duplicated
 
 
 async def snapshot(user_id: UUID, families: dict[str, tuple[str, ...]] | None = None) -> CapabilitySnapshot:

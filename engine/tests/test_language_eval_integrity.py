@@ -218,14 +218,39 @@ def test_a_healthy_provider_still_produces_real_rates():
     assert isinstance(r["goal_kind"], float)
 
 
-def test_a_single_unrecoverable_read_in_an_otherwise_healthy_run_still_invalidates():
-    """STRICT ON PURPOSE. The alternative is a tolerance, and a tolerance is a place for a partial outage
-    to hide: 5% of calls failing looks like a 5% comprehension dip, which sits inside the noise band of a
-    real model. Re-running a run that cost fifty cents is cheaper than shipping authority on a number
-    that quietly averaged in an outage.
+def test_one_machinery_failure_invalidates_even_though_it_is_a_single_read():
+    """ZERO TOLERANCE, but only for the machinery. A spent deadline is a LATENCY fact and a 429 is a
+    BILLING fact; neither is evidence about comprehension, so there is no honest fraction of them to
+    accept. One is enough to refuse."""
 
-    The injected failure is MALFORMED rather than transport, because transport is retryable and would
-    legitimately recover — see the next test, which is the other half of this property.
+    class OneHang:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def read(self, body: str) -> SemanticTurn:
+            self.n += 1
+            if self.n == 3:
+                await asyncio.sleep(30)
+            return _healthy_turn()
+
+    r = _measure(OneHang(), timeout_s=0.2)
+
+    assert r["valid"] is False, "a machinery failure was averaged into an otherwise green run"
+    assert r["read_outcomes"]["timeout"] == 1
+    assert r["machinery_failures"] == 1
+    assert r["conversation_vs_action"] is None
+    assert "MACHINERY" in r["invalidated_by"]
+
+
+def test_a_rare_malformed_read_is_reported_but_does_not_throw_away_the_run():
+    """THE OTHER RULE, learned from the first honest baseline.
+
+    On 2026-08-11 a real 310-read run came back 309 valid, 0 provider failures, 0 false actions — and was
+    discarded over ONE unparseable response, 0.32%. That is not a measurement failure, it is a measurable
+    property of the model, and a gate nobody can afford to run is a gate that stops being run.
+
+    So model-quality failures are BOUNDED rather than forbidden: excluded from the comprehension rates
+    they would distort, reported as their own number, and fatal only above the bound.
     """
 
     class OneBadShape:
@@ -240,10 +265,35 @@ def test_a_single_unrecoverable_read_in_an_otherwise_healthy_run_still_invalidat
 
     r = _measure(OneBadShape())
 
-    assert r["valid"] is False, "one unexplained failure was averaged into an otherwise green run"
+    assert r["model_quality_fraction"] < H.MAX_MODEL_QUALITY_FRACTION
+    assert r["valid"] is True, f"one malformed read discarded the whole run: {r['invalidated_by']!r}"
     assert r["read_outcomes"]["malformed"] == 1
-    assert r["read_outcomes"]["valid"] == r["expected_observations"] - 1
+    assert r["model_quality_failures"] == 1
+    # The rate exists, and it was computed WITHOUT the bad read rather than scoring it as a wrong answer.
+    assert isinstance(r["conversation_vs_action"], float)
+    assert r["valid_observations"] == r["expected_observations"] - 1
+
+
+def test_malformed_output_above_the_bound_still_invalidates():
+    """The bound is what stops the tolerance from becoming a hiding place: a model returning garbage half
+    the time must not post an excellent score on the half that happened to parse."""
+
+    class HalfGarbage:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def read(self, body: str) -> SemanticTurn:
+            self.n += 1
+            if self.n % 2 == 0:
+                raise ValueError("model returned prose")
+            return _healthy_turn()
+
+    r = _measure(HalfGarbage())
+
+    assert r["model_quality_fraction"] > H.MAX_MODEL_QUALITY_FRACTION
+    assert r["valid"] is False
     assert r["conversation_vs_action"] is None
+    assert "bound" in r["invalidated_by"]
 
 
 def test_a_transient_blip_that_recovers_on_retry_does_not_invalidate():
