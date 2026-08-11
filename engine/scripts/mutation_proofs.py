@@ -33,8 +33,11 @@ HARNESS = ENGINE / "eval" / "language" / "harness.py"
 EXECUTIVE = ENGINE / "bruce_engine" / "semantic_executive.py"
 SNAPSHOT = ENGINE / "bruce_engine" / "capability_snapshot.py"
 
+INBOUND = ENGINE / "bruce_engine" / "messaging_inbound.py"
+
 EVAL_SUITE = "tests/test_language_eval_integrity.py"
 CAPS_SUITE = "tests/test_capability_ids_in_context.py"
+LINK_SUITE = "tests/test_link_grants_access.py"
 
 
 class Mutation:
@@ -138,6 +141,39 @@ MUTATIONS = [
         '                   if cap in ("gmail.send_message", "calendar.create_event"))',
         "a second hard-coded list that will drift from the executor registry",
         CAPS_SUITE),
+
+    # --- DEFECT-3: a redeemed link code must actually grant the conversation entitlement ---------------
+    Mutation(
+        "grant_removed_from_redemption", INBOUND,
+        "                await _grant_conversation_access(r.user_id)\n",
+        "",
+        "DEFECT-3 restored: linked, told 'you're in', and refused by the access gate on the next message",
+        LINK_SUITE),
+    Mutation(
+        "grant_swallows_its_own_failure_silently", INBOUND,
+        '        await access_control.activate_production_entitlement(\n'
+        '            user_id, capability="conversation", reason="link code redeemed", actor=GRANT_ACTOR)',
+        "        return",
+        "the grant becomes a no-op that still reports success",
+        LINK_SUITE),
+    Mutation(
+        "grant_actor_is_indistinguishable_from_an_operator", INBOUND,
+        'GRANT_ACTOR = "system:link_redemption"',
+        'GRANT_ACTOR = "system"',
+        "the audit log can no longer tell an automatic grant from an operator's CLI recovery",
+        LINK_SUITE),
+    Mutation(
+        "grant_widened_beyond_conversation", INBOUND,
+        '            user_id, capability="conversation", reason="link code redeemed", actor=GRANT_ACTOR)',
+        '            user_id, capability="calendar", reason="link code redeemed", actor=GRANT_ACTOR)',
+        "redeeming a conversation link code confers a capability the code was never for",
+        LINK_SUITE),
+    Mutation(
+        "a_failing_grant_takes_the_link_down_with_it", INBOUND,
+        "    except Exception:\n        log.exception(\"entitlement_grant_failed_after_link\")",
+        "    except Exception:\n        raise",
+        "a spent single-use code plus a transient store outage tells the student nothing happened",
+        LINK_SUITE),
 ]
 
 

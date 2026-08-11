@@ -118,6 +118,43 @@ async def _send(channel: MessagingChannel, *, to: str, user_id: UUID | None, kin
     await channel.send_message(to=to, message=OutboundMessage(text=text))
 
 
+# The actor recorded on the CapabilityAudit row. Named for the PATH, not for "system", so an audit reader
+# can tell an automatic link-redemption grant from an operator running the recovery CLI.
+GRANT_ACTOR = "system:link_redemption"
+
+
+async def _grant_conversation_access(user_id: UUID) -> None:
+    """Give a freshly linked user the entitlement their next message needs.
+
+    WHY HERE. `activate_production_entitlement` describes itself as "the AUTOMATIC path D1 calls on
+    verified signup — never an operator action", and D1 does not exist: outside tests its only caller was
+    `scripts/capability_admin`. So `conversation_access` returned `no_grant` for everyone, and a person
+    who had just been told "you're in" had their next message fall past `conversation_runtime.handle`
+    into the legacy intake path — a canned acknowledgement from a system that cannot send mail.
+
+    WHY THIS DOES NOT WIDEN ACCESS. The invitation is the code, not this call. Link codes are minted by
+    an operator, are single-use and expire, so granting on redemption automates the grant without
+    changing who can obtain one. A number that was never given a code still gets `LINK_PROMPT`.
+
+    WHY IT IS OUTSIDE THE REDEMPTION SESSION. `admin_session()` refuses to open when a tenant
+    `app.user_id` is already set on the connection. `redeem_link_code` uses a `worker_session` and never
+    sets one, and has committed and exited before this runs — so the ordering here is the requirement,
+    not an accident.
+
+    WHY A FAILURE IS NOT FATAL. The link is already committed and the single-use code is already spent.
+    Raising here would tell the student nothing happened while their code is gone. They stay linked and
+    honestly un-entitled, and the operator gets an exception-level alert carrying no message content and
+    no handle.
+    """
+    from . import access_control      # local import: same conversation_runtime cycle-avoidance as below
+
+    try:
+        await access_control.activate_production_entitlement(
+            user_id, capability="conversation", reason="link code redeemed", actor=GRANT_ACTOR)
+    except Exception:
+        log.exception("entitlement_grant_failed_after_link")
+
+
 async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> InboundOutcome:
     now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -161,6 +198,7 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
                             dedup_key=f"linkfail:{msg.provider_message_id}")
                 return InboundOutcome(status="link_error")
             if r.status == "linked":
+                await _grant_conversation_access(r.user_id)
                 await _send(channel, to=reply_target, user_id=r.user_id, kind="acknowledged",
                             text=LINKED_TEXT, dedup_key=f"linked:{msg.provider_message_id}")
                 return InboundOutcome(status="linked", user_id=r.user_id)
