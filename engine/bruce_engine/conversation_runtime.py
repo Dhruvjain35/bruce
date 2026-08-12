@@ -262,9 +262,6 @@ class _Runtime:
             turn_trace.record(trace.finish())
             return InboundOutcome(status="skipped_group", user_id=user_id)
 
-        if await self._already_answered(user_id, ch, pmid):     # webhook redelivery -> no 2nd reply
-            turn_trace.record(trace.finish())
-            return InboundOutcome(status="duplicate", user_id=user_id)
         recent = await conversation_store.load_recent_turns(user_id, channel=ch, channel_identity=ident)
 
         # THE CANONICAL TURN ID, captured here and carried to the single shadow write below. This row is
@@ -273,8 +270,25 @@ class _Runtime:
         # match a job to a turn — two ledgers joined on a reconstruction rather than on the thing being
         # counted. It is read ABOVE every branch, exactly like the eligibility decision, so no lane can
         # reach `intake` without it.
-        conversation_turn_id = await conversation_store.persist_user_turn(
+        # THE CLAIM, and it is the gate. `claim_inbound_turn` is an INSERT ... ON CONFLICT DO NOTHING on
+        # `uq_turn_msg_role`, so Postgres — not a SELECT — decides which delivery of this message owns
+        # the turn. Exactly one caller gets `claimed=True` no matter how many arrive at once.
+        #
+        # It replaces `_already_answered`, which asked whether an ASSISTANT turn existed. That row is
+        # written by `_finalize` at the END of the turn, so two concurrent deliveries both saw no
+        # assistant row and both ran the reasoner, the composer, and any Gmail send. Sequential
+        # redelivery was covered; genuine concurrency was not, and that window is precisely where a
+        # retry of a timed-out inbound POST (DEFECT-5) would land and send the mail twice.
+        #
+        # Placed here, AFTER `load_recent_turns`, on purpose: this row is the current user turn, and
+        # claiming before the read would put the student's own message into its own history window.
+        # It is still far above every model call, which is the only ordering the invariant needs.
+        claim = await conversation_store.claim_inbound_turn(
             user_id, channel=ch, channel_identity=ident, provider_message_id=pmid, text=msg.text)
+        if not claim.claimed:
+            turn_trace.record(trace.finish())
+            return InboundOutcome(status="duplicate", user_id=user_id)
+        conversation_turn_id = claim.turn_id
         profile = self.style.derive_profile([t.text for t in recent if t.role == "user" and t.text])
         turn_trace.guard(trace, "trusted_input_ready")
 
@@ -952,16 +966,6 @@ class _Runtime:
         styled = enforce_no_dashes(styled)
         assert "—" not in styled, "em dash must never ship to a plain-text channel"
         return styled
-
-    async def _already_answered(self, user_id, channel, pmid) -> bool:
-        from .db import user_session
-        from sqlalchemy import select
-        from . import schema
-        async with user_session(user_id) as s:
-            return (await s.execute(select(schema.ConversationTurn.id).where(
-                schema.ConversationTurn.user_id == user_id, schema.ConversationTurn.channel == channel,
-                schema.ConversationTurn.provider_message_id == pmid,
-                schema.ConversationTurn.role == "assistant"))).scalar_one_or_none() is not None
 
     async def _finalize(self, user_id, ch, ident, pmid, reply, reply_target, *,
                         decision: ConversationDecision | None, event_candidate_id=None, intent=None,

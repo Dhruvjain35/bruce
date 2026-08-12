@@ -7,6 +7,8 @@ hole in the suite, reported as a failure of this runner — not a pass.
 Covered here:
   * DEFECT-17 — the language evaluator must tell a dead account from a dead model
   * DEFECT-4  — the model must be given exact executable operation ids, and only executable ones
+  * DEFECT-3  — a redeemed link code must grant the entitlement it implies
+  * N7        — one inbound message, at most one active turn, at most one consequential execution
 
 WHY A SEPARATE RUNNER FROM scripts/mutation_runner.py. That one rsyncs a tree and mutates cluster-wide
 Postgres roles (`bruce_app`, `bruce_shadow_recon`) which outlive `DROP DATABASE`; a failed reset silently
@@ -14,16 +16,31 @@ disables RLS for every subsequent test in the session, which is why CONTRIBUTING
 casually. This seam is pure in-process evaluator logic. It needs no database, no roles and no tree copy,
 so it takes none of that risk.
 
-SAFETY. Every target file's original bytes are held in memory and restored in a `finally`, and the run
-ends by re-hashing all of them against the originals. If a restore ever fails the runner says so loudly
-and exits non-zero — a mutated file left on disk is a far worse outcome than a failed proof.
+SAFETY, and a `finally` is NOT enough.
 
-    cd engine && .venv/bin/python scripts/mutation_language_eval.py
+An in-memory original restored in a `finally` survives an exception. It does not survive a kill. This
+runner was interrupted mid-mutation on 2026-08-11 and left `conversation_runtime.py` on disk with its
+claim gate deleted — a working tree that looked exactly like a deliberate edit and would have been
+committed as one. SIGKILL does not run `finally`.
+
+So the originals go to DISK before anything is touched:
+
+  * `.mutation-backup/` receives a copy of every target file plus a manifest, flushed and fsynced BEFORE
+    the first mutation is written.
+  * Startup checks for that directory. If it is there, a previous run died: this run RESTORES from it and
+    exits non-zero rather than mutating a tree whose baseline is unknown.
+  * A clean run removes it last, after re-hashing every file against its original.
+
+The failure this closes is specific and expensive: a mutation left on disk is indistinguishable from
+intent, in a repo whose entire discipline is that a green suite proves nothing by itself.
+
+    cd engine && .venv/bin/python scripts/mutation_proofs.py
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import pathlib
 import subprocess
 import sys
@@ -34,10 +51,13 @@ EXECUTIVE = ENGINE / "bruce_engine" / "semantic_executive.py"
 SNAPSHOT = ENGINE / "bruce_engine" / "capability_snapshot.py"
 
 INBOUND = ENGINE / "bruce_engine" / "messaging_inbound.py"
+STORE = ENGINE / "bruce_engine" / "conversation_store.py"
+RUNTIME = ENGINE / "bruce_engine" / "conversation_runtime.py"
 
 EVAL_SUITE = "tests/test_language_eval_integrity.py"
 CAPS_SUITE = "tests/test_capability_ids_in_context.py"
 LINK_SUITE = "tests/test_link_grants_access.py"
+CLAIM_SUITE = "tests/test_inbound_turn_claim.py"
 
 
 class Mutation:
@@ -174,26 +194,168 @@ MUTATIONS = [
         "    except Exception:\n        raise",
         "a spent single-use code plus a transient store outage tells the student nothing happened",
         LINK_SUITE),
+
+    # --- N7: one inbound message -> at most one active turn -> at most one consequential execution ----
+    Mutation(
+        "claim_gate_removed_from_runtime", RUNTIME,
+        "        if not claim.claimed:\n"
+        "            turn_trace.record(trace.finish())\n"
+        "            return InboundOutcome(status=\"duplicate\", user_id=user_id)\n",
+        "",
+        "the claim is taken and then ignored: both concurrent deliveries run the model and send",
+        CLAIM_SUITE),
+    Mutation(
+        "claim_always_reports_success", STORE,
+        "        if won is not None:\n            return TurnClaim(turn_id=won, claimed=True)",
+        "        if True:\n            return TurnClaim(turn_id=won, claimed=True)",
+        "every delivery believes it owns the turn — the defect, restored at the primitive",
+        CLAIM_SUITE),
+    # THE PRE-FIX IMPLEMENTATION, VERBATIM. An earlier version of this mutation put a SELECT in FRONT of
+    # the upsert but left `on_conflict_do_nothing` in place — so Postgres still picked the winner and the
+    # mutation SURVIVED. It deserved to: it was a redundant read, not a reintroduced defect, and reading
+    # it as "a hole in the suite" would have sent someone to strengthen a test that was already correct.
+    # A mutation has to actually remove the atomicity to be a test of it.
+    Mutation(
+        "atomic_claim_reverts_to_check_then_act", STORE,
+        "        won = (await s.execute(\n"
+        "            pg_insert(table)\n"
+        "            .values(user_id=user_id, channel=channel, channel_identity=channel_identity,\n"
+        "                    provider_message_id=provider_message_id, role=\"user\", text=text)\n"
+        "            .on_conflict_do_nothing(constraint=\"uq_turn_msg_role\")\n"
+        "            .returning(table.c.id))).scalar_one_or_none()",
+        "        _existing = await _turn_id(s, user_id, channel, provider_message_id, \"user\")\n"
+        "        if _existing is not None:\n"
+        "            return TurnClaim(turn_id=_existing, claimed=False)\n"
+        "        _row = schema.ConversationTurn(\n"
+        "            user_id=user_id, channel=channel, channel_identity=channel_identity,\n"
+        "            provider_message_id=provider_message_id, role=\"user\", text=text)\n"
+        "        s.add(_row)\n"
+        "        await s.flush()\n"
+        "        won = _row.id",
+        "the SELECT-then-INSERT that shipped before N7: concurrent deliveries all read None and all "
+        "insert, so the unique index raises instead of electing one winner",
+        CLAIM_SUITE),
+    Mutation(
+        "loser_is_told_it_created_the_row", STORE,
+        "        return TurnClaim(turn_id=await _turn_id(s, user_id, channel, provider_message_id, \"user\"),\n"
+        "                         claimed=False)",
+        "        return TurnClaim(turn_id=await _turn_id(s, user_id, channel, provider_message_id, \"user\"),\n"
+        "                         claimed=True)",
+        "the redelivery path claims ownership of a turn another delivery already owns",
+        CLAIM_SUITE),
 ]
+
+
+BACKUP_DIR = ENGINE / ".mutation-backup"
 
 
 def _sha(p: pathlib.Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def _backup_name(p: pathlib.Path) -> str:
+    return str(p.relative_to(ENGINE)).replace("/", "__")
+
+
+def _write_durably(path: pathlib.Path, data: bytes) -> None:
+    """Bytes that must survive the process dying one instruction later."""
+    with open(path, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _stage_backups(targets: list[pathlib.Path]) -> None:
+    """Copy every target to disk BEFORE the first mutation. This is the whole crash-safety story."""
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    for p in targets:
+        _write_durably(BACKUP_DIR / _backup_name(p), p.read_bytes())
+    _write_durably(BACKUP_DIR / "MANIFEST.txt",
+                   ("files restored by the next run of scripts/mutation_proofs.py\n"
+                    + "\n".join(str(p.relative_to(ENGINE)) for p in targets) + "\n").encode())
+    dir_fd = os.open(BACKUP_DIR, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _recover_orphaned_backups() -> bool:
+    """A backup directory at startup means a previous run was killed mid-mutation. Put the tree back.
+
+    Restoring and REFUSING to continue is deliberate. The alternative — restore and carry on — would run
+    a proof whose baseline nobody has looked at, and the entire value of this runner is that its baseline
+    is known good.
+    """
+    if not BACKUP_DIR.exists():
+        return False
+    print(f"RECOVERY: {BACKUP_DIR.relative_to(ENGINE)} exists, so a previous run died mid-mutation.")
+    restored = []
+    for backup in sorted(BACKUP_DIR.iterdir()):
+        if backup.name == "MANIFEST.txt":
+            continue
+        target = ENGINE / backup.name.replace("__", "/")
+        if target.read_bytes() != backup.read_bytes():
+            target.write_bytes(backup.read_bytes())
+            restored.append(str(target.relative_to(ENGINE)))
+    for f in BACKUP_DIR.iterdir():
+        f.unlink()
+    BACKUP_DIR.rmdir()
+    if restored:
+        print("  RESTORED (these were left MUTATED on disk):")
+        for r in restored:
+            print(f"    {r}")
+        print("  Re-run to take the proof on a known-good tree.")
+    else:
+        print("  every file already matched its backup; nothing needed restoring.")
+    return True
+
+
+# A mutated tree can DEADLOCK a suite rather than fail it — a concurrency test whose fix is removed can
+# wait on a signal that now never arrives. Waiting forever is indistinguishable from thinking, so every
+# run is bounded twice: pytest's own per-test timeout, and a hard subprocess timeout under it. A hang is
+# a RED result, because a suite that cannot finish has not passed.
+SUITE_TIMEOUT_S = 300
+
+
 def _suite_is_red(suite: str) -> bool:
-    proc = subprocess.run([sys.executable, "-m", "pytest", suite, "-q", "-p", "no:randomly", "-x"],
-                          cwd=ENGINE, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", suite, "-q", "-p", "no:randomly", "-x",
+             f"--timeout={SUITE_TIMEOUT_S // 2}"],
+            cwd=ENGINE, capture_output=True, text=True, timeout=SUITE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(f"      (suite exceeded {SUITE_TIMEOUT_S}s and was killed — counted as RED)")
+        return True
     return proc.returncode != 0
 
 
 def main() -> int:
-    targets = sorted({m.path for m in MUTATIONS})
+    # `--only <substring>` runs a subset. For iterating on ONE mutation's own correctness — a mutation
+    # can be wrong (too weak to reintroduce the defect) just as a test can, and finding that out should
+    # not cost a full sweep. A real proof is still the unfiltered run.
+    only = None
+    if "--only" in sys.argv:
+        only = sys.argv[sys.argv.index("--only") + 1]
+    mutations = [m for m in MUTATIONS if only is None or only in m.name]
+    if not mutations:
+        print(f"no mutation matches {only!r}")
+        return 2
+
+    targets = sorted({m.path for m in mutations})
+
+    # A killed run leaves its backups behind. Put the tree back and refuse to proceed on a baseline
+    # nobody has inspected — see the module docstring for the day this mattered.
+    if _recover_orphaned_backups():
+        return 4
+
     originals = {p: p.read_bytes() for p in targets}
     before = {p: _sha(p) for p in targets}
+    _stage_backups(targets)          # ON DISK, before a single byte is mutated
 
-    suites = sorted({m.suite for m in MUTATIONS})
-    print(f"MUTATION PROOFS — {len(MUTATIONS)} mutations across {len(suites)} suites\n")
+    suites = sorted({m.suite for m in mutations})
+    print(f"MUTATION PROOFS — {len(mutations)} mutations across {len(suites)} suites"
+          + (f"  [filtered: {only}]" if only else "") + "\n")
 
     # Every suite must be GREEN before anything is damaged, or each result below is meaningless.
     for suite in suites:
@@ -204,7 +366,7 @@ def main() -> int:
 
     caught, survived = [], []
     try:
-        for m in MUTATIONS:
+        for m in mutations:
             text = m.path.read_text()
             if m.old not in text:
                 print(f"  [ERROR   ] {m.name}: anchor not found in {m.path.name} — mutation is stale")
@@ -232,10 +394,15 @@ def main() -> int:
     drifted = [p for p in targets if before[p] != after[p]]
     if drifted:
         print("\nFATAL: a mutated file was not restored: " + ", ".join(str(p) for p in drifted))
+        print(f"Backups are intact in {BACKUP_DIR.relative_to(ENGINE)}; re-run to restore from them.")
         return 3
+    # Only NOW is it safe to drop the backups: the tree is provably back to where it started.
+    for f in BACKUP_DIR.iterdir():
+        f.unlink()
+    BACKUP_DIR.rmdir()
     print("\nrestore verified: every target file matches its original sha256")
 
-    print(f"\n{len(caught)} caught, {len(survived)} survived, {len(MUTATIONS)} total")
+    print(f"\n{len(caught)} caught, {len(survived)} survived, {len(mutations)} total")
     if survived:
         print("\nSURVIVING MUTATIONS (each is a property the suite does not actually test):")
         for m in survived:

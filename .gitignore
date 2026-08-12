@@ -38,3 +38,7 @@ ios/**/xcuserdata/
 
 # local Claude Code agent config (never commit)
 .claude/
+
+# scripts/mutation_proofs.py stages originals here before mutating. A directory left behind means a
+# killed run; the next run restores from it and refuses to start. It must never be committed.
+.mutation-backup/
