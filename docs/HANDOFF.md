@@ -6,6 +6,86 @@
 
 ---
 
+# §0.0 — READ FIRST: WHAT 2026-08-12 CHANGED
+
+**The body of this document is preserved as written on 2026-08-10. Where this section disagrees with it, THIS SECTION IS CURRENT.** Every line here was measured, not inferred, and names the command that produced it.
+
+## The identity block in §0 is stale — that is expected, not a warning
+
+```
+branch   feat/semantic-executive          (unchanged)
+HEAD     b08324f                          (was 4cb5ded; 5 commits added)
+tree     CLEAN — 0 uncommitted files      (was 19 modified + 20 untracked)
+```
+
+The §0 fingerprint `ff44cbc1…` described the *uncommitted* tree. That tree is now committed; the fingerprint is a historical record of what went into `86cba91`, not a check you can still run.
+
+| commit | what |
+|---|---|
+| `86cba91` | **WIP CHECKPOINT (NOT CERTIFIED)** — the ~5,000 uncommitted lines, preserved as a recovery point. Do not merge or deploy because it is committed. |
+| `6d6b38e` | DEFECT-17 — the language gate could not tell a dead account from a dead model |
+| `a410544` | DEFECT-4 — exact executable capability ids reach the model; eval strictness refined |
+| `9181146` | DEFECT-3 — link-code redemption grants the conversation entitlement |
+| `b08324f` | N7 — one inbound message, one turn, one consequential execution |
+
+## Four claims in this document are WRONG. Do not act on them.
+
+**1. DEFECT-1 is NOT a cross-tenant data exposure.** Measured on staging 2026-08-11:
+
+```
+rls known_people            enabled=True forced=True
+policy known_people_owner   cmd=ALL (correct tenant predicate)
+priv bruce_app SELECT/INSERT/UPDATE/DELETE = False, False, False, False
+live known_people           n_live_tup=0   (across 182 conversation_turns)
+```
+
+Row security **is** on and forced — 0032 took its `create_table` branch here, so the early return never fired. The real defect is that **`bruce_app` holds no privileges at all**: 0032 issues no `GRANT`, and 0002's blanket grant ran before the table existed. Every `people.learn` and `people.resolve` has been throwing, and both call sites swallow it. `known_people` is **silently dead, not leaking**. §5.1 T4 ("write+read is live") is false.
+
+`0034` is still the right fix — it carries the missing GRANT — but this is a **feature repair, not a privacy emergency**. Note `0034.down_revision` is `0033`, so N3 must run `alembic upgrade 0034_known_people_row_security`, **never `upgrade head`** (which is what the `bruce-migrate` job does by default, and which would drag in `0035`).
+
+**§4's `pg_class` query alone cannot tell the two apart.** Add `has_table_privilege('bruce_app','known_people','SELECT')` or the diagnosis is a coin flip.
+
+**2. N7's stated safety premise was false.** §6 N7 says a double-post is safe because `_already_answered` and the `conv:{pmid}` key dedupe. They do not. `_already_answered` reads the **assistant** turn, written by `_finalize` at the *end* of the turn, so it is blind to a turn still in flight; `conv:{pmid}` guards only the iMessage row; Gmail dedupe is check-then-act with authorization consumed after `perform()`. **As written, N7 would have double-sent real email.** Fixed in `b08324f` by an atomic claim (`INSERT … ON CONFLICT DO NOTHING` on the pre-existing `uq_turn_msg_role`) taken *before* any model work. The DEFECT-5 timeout/retry change is still **unshipped** — the claim makes it safe to write, nothing more.
+
+**3. DEFECT-2 is resolved.** Credits were added 2026-08-11. `SemanticTriage().read(...)` returns a `SemanticTurn` in 2.38s, confidence 0.98.
+
+**4. §9 item 3 is now partly obsolete.** The language numbers finally have a committed artifact: `engine/eval/language/baselines/2026-08-11-post-defect-17.json`.
+
+## The first trustworthy language baseline
+
+Taken *after* DEFECT-17 was fixed, so it is the first run whose instrument could have detected an outage and did not have to.
+
+```
+read_outcomes   310/310 valid, 0 machinery failures, 0 malformed
+false_action    0        (threshold 0)      PASS
+conv_vs_action  1.0000   (threshold 0.98)   PASS
+goal_kind       0.9737   (threshold 0.95)   PASS
+weakest family  0.9091   calendar_create_event  (threshold 0.90)  PASS
+```
+
+`goal_kind` landing on **0.9737** is the number commit `4cb5ded` claimed and §10 marked INVALID. **The old number was right; it had no evidence.** Now it does.
+
+## Settled `[UNVERIFIED]` items
+
+- **§3.3 🔴 confirmed on the real instance.** `rolsuper=False, rolcreaterole=True, rolbypassrls=False` → `_can_provision_bypassrls_role()` is False → **`0035` will skip creating `shadow_reconciliation()` on Cloud SQL.** The deciding term is `rolbypassrls`, not `rolsuper`.
+- **§6 N2's gate invocation returns 0** — but prints `safety baseline  unchanged`, **not** `changed, accepted:`. `check_safety_baseline_unchanged` diffs against `HEAD`, and the `pinned_head` bump was committed in `86cba91`, so the acknowledgement is a **no-op**. Do not read that green line as an independent re-approval.
+- **§11 Q1 — the relay.** It IS installed on this Mac, under a separate macOS account `bruce-relay` (uid 502) — which is why §1.5's checks from the founder's account found nothing. It is **not running**: zero non-system processes, `~/.bruce-relay/` last written 2026-07-31, `last_seen_at` 9.8 days stale. **No outbound backlog** — all 178 rows are `sent` (129) or `terminal_failed` (49); a restart drains nothing. One active device, five revoked.
+- **§11 Q2 — founder access is INVALID.** `ProductionAccountEntitlement`: **0 rows repo-wide** (`n_live_tup=0`, a real zero). `StagingTestEnrollment`: 25 rows, all expired, newest lapsed `2026-07-31 02:19 UTC` — so `brain-spine-handoff.md`'s "expired 07-29" is close but wrong. The founder's `users` row and messaging identity both exist and are healthy.
+
+## A trap that caught two reads in one session — including one of mine
+
+`users` carries policy `tenant_self ALL (id = app_current_user())` with **no worker or admin escape**. A worker+admin session sees **0 of 30 rows**. My first probe reported `user_row=MISSING` for the founder; the row exists. `conversation_turns` is the same shape — a worker session reads 0 against `n_live_tup=182`.
+
+**Extend §8.4's rule:** it is not enough to compare against `n_live_tup`. A read proving a ZERO must prove *that session* can see rows **in that table** — `n_live_tup` proves only that rows exist, not that you can see them.
+
+## Verification tooling added
+
+`engine/scripts/mutation_proofs.py` — 26 mutations across DEFECT-17 / DEFECT-4 / DEFECT-3 / N7, all caught. Unlike `mutation_runner.py` it touches no database and no cluster roles. It stages originals to `.mutation-backup/` **fsynced before the first mutation**, because a kill does not run `finally` — it was interrupted once and left `conversation_runtime.py` on disk with its claim gate deleted, looking exactly like a deliberate edit. On startup an orphaned backup dir triggers restore-and-refuse. `--only <substring>` runs a subset.
+
+**A hang counts as RED.** A mutated tree can deadlock a suite rather than fail it; waiting forever is indistinguishable from thinking.
+
+---
+
 ## HOW TO READ THIS DOCUMENT
 
 Every claim below is tagged with one of six categories. **Do not promote a claim from one category to another without re-running its verification command.**
@@ -479,6 +559,8 @@ The founder's window is two days. Against the evidence above — no model credit
 # §6 — NEXT ACTION
 
 The smallest exact sequence. **Do not restart repo discovery.** Do §7 first (30 minutes), then start at N1.
+
+> **STATUS AS OF 2026-08-12 — see §0.0.** N1 ✅ done (credits added). N2 ✅ done, as a WIP checkpoint `86cba91` explicitly NOT certified. N3 ⛔ **not done and its instructions are wrong** — apply `0034` by name, never `head`, and read §0.0 first because DEFECT-1 is a dead feature, not a leak. N4 ⛔ blocked: the relay is installed under macOS account `bruce-relay` and is **down**. N5 ✅ done (`a410544`) — and it was cheaper than described, because `turn_context.render_for_model` already emitted the block; the filter to *executable* ids is the load-bearing part. N6 ✅ done (`9181146`) — the session-nesting warning below is wrong in mechanism; `redeem_link_code` uses a `worker_session` and sets no `app.user_id`, so calling after it returns is sufficient. N7 ✅ done (`b08324f`) **but not as written** — the described fix would have double-sent email; see §0.0. N8–N12 not started.
 
 Every step is strict TDD: **failing production-surface test first → prove the exact failure reason → implement → revert the fix and prove the test goes red → restore.**
 
