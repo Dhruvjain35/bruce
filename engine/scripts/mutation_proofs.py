@@ -54,10 +54,13 @@ INBOUND = ENGINE / "bruce_engine" / "messaging_inbound.py"
 STORE = ENGINE / "bruce_engine" / "conversation_store.py"
 RUNTIME = ENGINE / "bruce_engine" / "conversation_runtime.py"
 
+GOALH = ENGINE / "bruce_engine" / "goal_handler.py"
+
 EVAL_SUITE = "tests/test_language_eval_integrity.py"
 CAPS_SUITE = "tests/test_capability_ids_in_context.py"
 LINK_SUITE = "tests/test_link_grants_access.py"
 CLAIM_SUITE = "tests/test_inbound_turn_claim.py"
+BYTES_SUITE = "tests/test_approved_bytes_are_sent_bytes.py"
 
 
 class Mutation:
@@ -243,6 +246,35 @@ MUTATIONS = [
         "                         claimed=True)",
         "the redelivery path claims ownership of a turn another delivery already owns",
         CLAIM_SUITE),
+
+    # --- DEFECT-13: what the student approves must be what actually ships -----------------------------
+    Mutation(
+        "draft_stored_raw_again", GOALH,
+        "        values = {name: SlotValue(hygienic_draft_value(value), Source.model_derived,",
+        "        values = {name: SlotValue(value, Source.model_derived,",
+        "the slot keeps the raw composer output again: the student reads one body and the professor "
+        "receives another",
+        BYTES_SUITE),
+    Mutation(
+        "hygiene_flattens_newlines", GOALH,
+        '    return re.sub(r"(?<=\\n)[ \\t]+", "", out)',
+        '    return re.sub(r"\\s{2,}", " ", out)',
+        "paragraph breaks destroyed — every real email becomes one run-on line",
+        BYTES_SUITE),
+    Mutation(
+        "hygiene_is_a_noop_on_the_wrong_channel", GOALH,
+        '    out = gate_outbound_text(value, ChannelKind.self_hosted_imessage.value)',
+        '    out = gate_outbound_text(value, "email")',
+        "the gate returns the text untouched for a non-plain-text channel, so cleaning silently does "
+        "nothing and the divergence returns without any visible change",
+        BYTES_SUITE),
+    Mutation(
+        "line_start_tidy_removed", GOALH,
+        '    return re.sub(r"(?<=\\n)[ \\t]+", "", out)',
+        "    return out",
+        "a stripped phrase leaves the draft with lines starting in whitespace — gate-stable, but it "
+        "looks damaged to the student being asked to approve it",
+        BYTES_SUITE),
 ]
 
 
