@@ -969,7 +969,7 @@ class _Runtime:
 
     async def _finalize(self, user_id, ch, ident, pmid, reply, reply_target, *,
                         decision: ConversationDecision | None, event_candidate_id=None, intent=None,
-                        trace=None, trusted_text: str | None = None):
+                        trace=None, trusted_text: str | None = None, payload=None):
         # persist the assistant turn, then enqueue EXACTLY ONE outbound (idempotent on conv:{pmid}).
         if decision is not None:
             await conversation_store.persist_assistant_turn(
@@ -994,9 +994,18 @@ class _Runtime:
         turn_trace.guard(trace, "relay_send_started")
         if trace is not None:
             trace.absent("relay_guid_received", turn_trace.NOT_APPLICABLE)
+        # `reply` is BRUCE SPEAKING and goes through the voice gate inside enqueue. `payload` is the
+        # student's own outgoing message, quoted for approval, and is appended AFTER that gate has run —
+        # verbatim, because they are approving these exact bytes and an approval that binds something
+        # they never read is not an approval.
+        #
+        # Passed as a SEPARATE ARGUMENT rather than interpolated into `reply` on purpose: splicing it
+        # here would hand the gate a plain string, the type would be gone, and the draft would be styled
+        # on its way to the screen — which is the confusion `consequential_payload` exists to end.
+        # `ApprovedConsequentialPayload.__str__` raises, so that mistake cannot be made quietly.
         await messaging_outbound.enqueue(
             user_id=user_id, to_handle=reply_target, channel=ChannelKind.self_hosted_imessage,
-            kind=kind, text=reply, idempotency_key=f"conv:{pmid}")
+            kind=kind, text=reply, idempotency_key=f"conv:{pmid}", payload=payload)
 
         # The memory stack finally has a caller. This runs AFTER the reply is enqueued, deliberately: the
         # student's answer is already safe, so a memory failure costs a remembered preference rather than

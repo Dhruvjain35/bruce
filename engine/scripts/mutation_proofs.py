@@ -64,6 +64,7 @@ CAPS_SUITE = "tests/test_capability_ids_in_context.py"
 LINK_SUITE = "tests/test_link_grants_access.py"
 CLAIM_SUITE = "tests/test_inbound_turn_claim.py"
 BYTES_SUITE = "tests/test_approved_bytes_are_sent_bytes.py"
+FINALIZE_SUITE = "tests/test_finalize_payload_path.py"
 
 
 class Mutation:
@@ -281,6 +282,21 @@ MUTATIONS = [
         "approval binds a whitespace-flattened body again, so an email reflowed after approval still "
         "passes execution_gate.require",
         BYTES_SUITE),
+    Mutation(
+        "finalize_drops_the_payload_seam", RUNTIME,
+        "            kind=kind, text=reply, idempotency_key=f\"conv:{pmid}\", payload=payload)",
+        "            kind=kind, text=reply, idempotency_key=f\"conv:{pmid}\")",
+        "the boundary stops being live at the only call site that matters: the proposal reaches the "
+        "student as one gated string again, so the draft is styled on its way to the screen",
+        FINALIZE_SUITE),
+    Mutation(
+        "finalize_splices_the_payload_into_bruce_text", RUNTIME,
+        "            kind=kind, text=reply, idempotency_key=f\"conv:{pmid}\", payload=payload)",
+        "            kind=kind, text=(reply + (payload.render_for_display() if payload else \"\")),\n"
+        "            idempotency_key=f\"conv:{pmid}\")",
+        "the payload is interpolated upstream, so the gate receives it as a plain string and the type "
+        "boundary is gone even though the bytes still reach the student",
+        FINALIZE_SUITE),
     Mutation(
         "payload_interpolates_into_text_silently", PAYLOAD,
         "        raise PayloadEnteredVoicePipeline(\n"
