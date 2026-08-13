@@ -592,42 +592,6 @@ def _ambiguous(octx) -> bool:
     return bool(selection is not None and getattr(selection, "ambiguous", False))
 
 
-def hygienic_draft_value(value):
-    """Make a composed value ALREADY be the bytes the student will read.
-
-    THE DEFECT THIS CLOSES. A proposal is rendered to the student through `enforce_no_dashes` and then
-    `messaging_outbound.gate_outbound_text`, which strips `PROHIBITED_PHRASES`, collapses `[ \\t]{2,}` and
-    rewrites em dashes. The slot kept the RAW composer output, and that raw string is what
-    `gmail_send_args` hands the adapter. So the student read one thing and the recipient received another
-    — and in the loudest direction: the gate DELETES filler from the copy on screen while that filler
-    still ships. "I'd be happy to" was invisible to the student and landed in the professor's inbox.
-
-    It is not an em-dash edge case. The composer prompt already discourages em dashes, so that trigger is
-    model-dependent; `[ \\t]{2,}` is not. Any ordinary double space after a sentence showed single-spaced
-    and shipped double-spaced, on every proposal.
-
-    WHY COMPOSE TIME. Cleaning at approve time would leave the stored value dirty, and the execution
-    fingerprint would still bind something the student never saw. Cleaned here, shown == stored ==
-    fingerprinted == sent, and the outbound gate becomes a no-op because it is idempotent.
-
-    WHY IT REUSES THE GATE rather than reimplementing it: one function means the two can never drift, and
-    a drift here is invisible until a real email is already wrong. The gate collapses only spaces and
-    tabs, never newlines, so paragraph breaks survive — `email_quality.scrub`'s `\\s{2,}` would not, and
-    is deliberately not used.
-    """
-    if not value or not isinstance(value, str):
-        return value
-    from .messaging import ChannelKind
-    from .messaging_outbound import gate_outbound_text
-
-    out = gate_outbound_text(value, ChannelKind.self_hosted_imessage.value)
-    # Removing a phrase mid-line can leave the next line starting with a space ("\\n\\n talk about…").
-    # The gate cannot see that — it only collapses RUNS of two or more, and `.strip()` reaches the ends of
-    # the string, not the start of every line. Tidying it keeps the visible draft from looking damaged,
-    # and does not reintroduce anything the gate would object to, so the result stays gate-stable.
-    return re.sub(r"(?<=\n)[ \t]+", "", out)
-
-
 class GoalHandler:
     """The generic goal outcome: create or continue ONE AgentRun-backed goal, ask for exactly what is
     missing, put the operation on screen, and execute it once the student says yes.
@@ -868,11 +832,15 @@ class GoalHandler:
             log.info("goal_compose_failed run=%s cap=%s", view.run_id, capability)
             drafted = {}
         wanted = set(step.missing)
-        # CLEANED BEFORE IT IS STORED, so the slot already holds the bytes the student will read. The raw
-        # value used to be persisted here and handed straight to `gmail_send_args`, while the proposal the
-        # student saw went through the outbound gate — so the two diverged and the recipient received text
-        # that was never on screen. See `hygienic_draft_value`.
-        values = {name: SlotValue(hygienic_draft_value(value), Source.model_derived,
+        # STORED EXACTLY AS COMPOSED. These become the consequential payload — the bytes the student will
+        # read and approve — and nothing between here and the provider may restyle them.
+        #
+        # A previous version ran them through the outbound VOICE gate here, to stop the shown copy and the
+        # sent copy diverging. It closed the divergence by damaging the payload: PROHIBITED_PHRASES
+        # stripping turned "I'd be happy to talk about the extension" into "talk about the extension" in
+        # the professor's inbox. The voice gate governs how BRUCE sounds; it has no authority over a
+        # message the student is sending. See `consequential_payload`.
+        values = {name: SlotValue(value, Source.model_derived,
                                   turn_id=octx.pmid, turn_index=turn_index)
                   for name, value in (drafted or {}).items()
                   # ONLY the slots that were actually missing. A composer that returned a recipient would

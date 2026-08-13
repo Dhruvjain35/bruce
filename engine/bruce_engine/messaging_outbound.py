@@ -45,11 +45,35 @@ _PLAIN_TEXT_CHANNELS = frozenset({"self_hosted_imessage", "imessage", "sms"})
 
 
 def gate_outbound_text(text: str, channel_value: str) -> str:
-    """FINAL channel-safety floor for EVERY outbound (integration invariant 7 — no bypasses). Applied
-    inside enqueue(), so no caller — the conversation runtime, a legacy ACK, an error, a status update —
-    can ship an em dash or a corporate filler phrase to a plain-text channel. Rich voice styling happens
-    upstream; this is the last-line HARD guarantee, not a substitute for it. Idempotent."""
+    """FINAL channel-safety floor for EVERY BRUCE-AUTHORED outbound (integration invariant 7 — no
+    bypasses). Applied inside enqueue(), so no caller — the conversation runtime, a legacy ACK, an error,
+    a status update — can ship an em dash or a corporate filler phrase to a plain-text channel. Rich voice
+    styling happens upstream; this is the last-line HARD guarantee, not a substitute for it. Idempotent.
+
+    ITS DOMAIN IS BRUCE'S SPEECH, AND ONLY THAT. An `ApprovedConsequentialPayload` — the exact bytes a
+    student read and approved for delivery — is not Bruce speaking, and these rules have no authority over
+    it. PROHIBITED_PHRASES, the persona rules and the punctuation rules all exist to govern how BRUCE
+    sounds; applying them to an approved email body rewrote a message after the student had agreed to it.
+
+    The refusal below is structural rather than a carve-out INSIDE this function on purpose. A protected
+    span would leave the payload inside this gate's domain, one refactor from being styled again. Making
+    it a type error means routing a payload here fails at the call site, loudly, instead of surfacing in
+    a recipient's inbox.
+
+    Nothing here is weakened: every rule still applies, in full, to everything this function accepts.
+    """
+    from .consequential_payload import ApprovedConsequentialPayload, PayloadEnteredVoicePipeline
     from .conversation_style import PROHIBITED_PHRASES, enforce_no_dashes
+
+    if isinstance(text, ApprovedConsequentialPayload):
+        raise PayloadEnteredVoicePipeline(
+            "gate_outbound_text accepts Bruce-authored conversational text only. This is an "
+            "ApprovedConsequentialPayload: its bytes are bound by an authorization and must reach the "
+            "provider unchanged. Pass it to enqueue(payload=...) instead.")
+    if text is not None and not isinstance(text, str):
+        raise PayloadEnteredVoicePipeline(
+            f"gate_outbound_text accepts Bruce-authored conversational text only, got "
+            f"{type(text).__name__}")
     if not text or channel_value not in _PLAIN_TEXT_CHANNELS:
         return text
     import re
@@ -63,11 +87,30 @@ def gate_outbound_text(text: str, channel_value: str) -> str:
 
 
 async def enqueue(*, user_id: UUID | None, to_handle: str, channel: ChannelKind, kind: str, text: str,
-                  idempotency_key: str, mission_id: UUID | None = None, deep_link: str | None = None) -> None:
+                  idempotency_key: str, mission_id: UUID | None = None, deep_link: str | None = None,
+                  payload=None) -> None:
     """Durably queue an outbound reply. Idempotent on idempotency_key. Runs in the recipient's context
     when known (user_id) so RLS scopes it; a pre-link prompt (user_id None) is queued in a worker
-    session. EVERY outbound passes through gate_outbound_text first — no bypasses."""
-    text = gate_outbound_text(text, channel.value)      # HARD channel-safety floor, applied to all callers
+    session. EVERY Bruce-authored outbound passes through gate_outbound_text first — no bypasses.
+
+    `payload` is an `ApprovedConsequentialPayload`: the exact bytes a student is being asked to approve
+    for delivery. It is appended AFTER the gate has run on Bruce's own words, and is never itself gated —
+    which is the whole point. The student has to be shown the bytes that will actually be sent, or the
+    approval binds something they never read; and those bytes are the student's message, not Bruce's
+    speech, so the persona and punctuation rules have no authority over them.
+
+    The two are kept as separate arguments rather than pre-concatenated by the caller so that the type
+    boundary survives to this line. Interpolating a payload into `text` upstream would hand it to the
+    gate as a plain string, which is exactly the confusion `consequential_payload` exists to end — and
+    `ApprovedConsequentialPayload.__str__` raises, so that mistake fails loudly instead of silently.
+    """
+    text = gate_outbound_text(text, channel.value)      # HARD channel-safety floor, Bruce's words only
+    if payload is not None:
+        from .consequential_payload import ApprovedConsequentialPayload
+        if not isinstance(payload, ApprovedConsequentialPayload):
+            raise TypeError(f"payload must be an ApprovedConsequentialPayload, got {type(payload).__name__}")
+        shown = payload.render_for_display()            # VERBATIM: not gated, not styled, not stripped
+        text = f"{text}\n\n{shown}" if text else shown
 
     async def _write(s):
         existing = (await s.execute(

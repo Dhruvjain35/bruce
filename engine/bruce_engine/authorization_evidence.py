@@ -200,6 +200,15 @@ _EMAILISH = ("to", "cc", "bcc", "from", "recipient", "account", "sender")
 
 def _normalize_value(key: str, value):
     if isinstance(value, str):
+        # CONSEQUENTIAL TEXT BINDS EXACTLY. `_WS.sub(" ", ...)` is right for an argument whose whitespace
+        # carries no meaning, and wrong for the fields a student actually read before approving: "\n\n"
+        # and "\n" are two different emails, and an approval that cannot tell them apart is not an
+        # approval. Flattening here meant a body whose paragraph breaks were replaced by spaces after
+        # approval still matched its own fingerprint and sailed through `execution_gate.require`.
+        # See consequential_payload.EXACT_TEXT_FIELDS — one list, so the two cannot disagree.
+        from .consequential_payload import EXACT_TEXT_FIELDS
+        if key.lower() in EXACT_TEXT_FIELDS:
+            return value
         v = _WS.sub(" ", value).strip()
         # Addresses are case-insensitive in practice; the body of an email is not.
         if key.lower() in _EMAILISH or key.lower().endswith("_email"):

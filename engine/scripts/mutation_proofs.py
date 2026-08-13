@@ -55,6 +55,9 @@ STORE = ENGINE / "bruce_engine" / "conversation_store.py"
 RUNTIME = ENGINE / "bruce_engine" / "conversation_runtime.py"
 
 GOALH = ENGINE / "bruce_engine" / "goal_handler.py"
+OUTBOUND = ENGINE / "bruce_engine" / "messaging_outbound.py"
+AE = ENGINE / "bruce_engine" / "authorization_evidence.py"
+PAYLOAD = ENGINE / "bruce_engine" / "consequential_payload.py"
 
 EVAL_SUITE = "tests/test_language_eval_integrity.py"
 CAPS_SUITE = "tests/test_capability_ids_in_context.py"
@@ -247,33 +250,44 @@ MUTATIONS = [
         "the redelivery path claims ownership of a turn another delivery already owns",
         CLAIM_SUITE),
 
-    # --- DEFECT-13: what the student approves must be what actually ships -----------------------------
+    # --- the typed boundary: voice policy owns Bruce's speech, authorization owns approved payloads ----
     Mutation(
-        "draft_stored_raw_again", GOALH,
-        "        values = {name: SlotValue(hygienic_draft_value(value), Source.model_derived,",
+        "post_approval_styling_reintroduced", GOALH,
         "        values = {name: SlotValue(value, Source.model_derived,",
-        "the slot keeps the raw composer output again: the student reads one body and the professor "
-        "receives another",
+        "        from .messaging_outbound import gate_outbound_text as _vg\n"
+        "        values = {name: SlotValue(_vg(value, \"self_hosted_imessage\"), Source.model_derived,",
+        "the voice gate restyles the payload after approval — the first, WRONG fix for DEFECT-13, which "
+        "shipped 'talk about the extension' to the professor",
+        BYTES_SUITE),
+    # NOT `if False:` on the first guard alone — that falls straight through to the generic non-str
+    # guard, which still raises, so the mutation changed nothing observable and SURVIVED on its own
+    # redundancy. The boundary is enforced twice on purpose; a mutation of it has to actually let a
+    # payload into the gate's body.
+    Mutation(
+        "voice_gate_accepts_payloads_again", OUTBOUND,
+        "    if isinstance(text, ApprovedConsequentialPayload):\n"
+        "        raise PayloadEnteredVoicePipeline(",
+        "    if isinstance(text, ApprovedConsequentialPayload):\n"
+        "        text = text.render_for_display()\n"
+        "    if False:\n"
+        "        raise PayloadEnteredVoicePipeline(",
+        "the boundary stops being structural: the gate silently accepts a payload and styles the bytes "
+        "the student approved",
         BYTES_SUITE),
     Mutation(
-        "hygiene_flattens_newlines", GOALH,
-        '    return re.sub(r"(?<=\\n)[ \\t]+", "", out)',
-        '    return re.sub(r"\\s{2,}", " ", out)',
-        "paragraph breaks destroyed — every real email becomes one run-on line",
+        "payload_text_normalized_before_hashing", AE,
+        "        if key.lower() in EXACT_TEXT_FIELDS:\n            return value",
+        "        if False:\n            return value",
+        "approval binds a whitespace-flattened body again, so an email reflowed after approval still "
+        "passes execution_gate.require",
         BYTES_SUITE),
     Mutation(
-        "hygiene_is_a_noop_on_the_wrong_channel", GOALH,
-        '    out = gate_outbound_text(value, ChannelKind.self_hosted_imessage.value)',
-        '    out = gate_outbound_text(value, "email")',
-        "the gate returns the text untouched for a non-plain-text channel, so cleaning silently does "
-        "nothing and the divergence returns without any visible change",
-        BYTES_SUITE),
-    Mutation(
-        "line_start_tidy_removed", GOALH,
-        '    return re.sub(r"(?<=\\n)[ \\t]+", "", out)',
-        "    return out",
-        "a stripped phrase leaves the draft with lines starting in whitespace — gate-stable, but it "
-        "looks damaged to the student being asked to approve it",
+        "payload_interpolates_into_text_silently", PAYLOAD,
+        "        raise PayloadEnteredVoicePipeline(\n"
+        "            \"an ApprovedConsequentialPayload was interpolated into text.",
+        "        return self.render_for_display() or (\n"
+        "            \"an ApprovedConsequentialPayload was interpolated into text.",
+        "a payload interpolated into Bruce text becomes a plain string and the type boundary vanishes",
         BYTES_SUITE),
 ]
 
