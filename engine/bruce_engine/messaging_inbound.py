@@ -155,6 +155,77 @@ async def _grant_conversation_access(user_id: UUID) -> None:
         log.exception("entitlement_grant_failed_after_link")
 
 
+async def submit_turn_for_message(user_id: UUID, msg: InboundMessage, *,
+                                  channel: MessagingChannel,
+                                  reply_target: str) -> InboundOutcome | None:
+    """THE SURFACE-NEUTRAL INGRESS BOUNDARY. Everything above this line is transport; below it is Bruce.
+
+    Returns the runtime's outcome, or None when the access gate declines — in which case the caller may
+    fall back to whatever it has (the messaging path has a legacy intake lane; a cloud surface has none).
+
+    This is a PURE MOVE of what used to sit inline in `handle_inbound`, extracted so a second surface can
+    reach the SAME core without inheriting messaging semantics it does not have. Note what it takes: an
+    already-authenticated `user_id`. The relay has to derive that from (channel, handle) because an
+    anonymous inbound message proves nothing about who is texting; a JWT-authenticated client already
+    knows, and must not be forced through a phone-number lookup to prove something it has already proven.
+
+    NO SECOND RUNTIME. This function contains no routing, no semantics and no state machine — it is the
+    context-graph write, the access gate, and the existing `conversation_runtime.handle` call, in that
+    order, exactly as before.
+    """
+    # CONVERSATION CONTEXT GRAPH — persistence only. Upsert the canonical inbound node + reply/thread
+    # edges so a later turn can resolve a replied-to message without a resend. Idempotent; produces NO
+    # turn and NO reply.
+    from . import conversation_graph  # local import: avoid an import cycle via api/runtime
+    msg.user_id = user_id
+    await conversation_graph.ingest_inbound_message(msg)
+
+    # DB-gated per user. The gate is (user_id, capability) with NO channel term, which is why it needed
+    # no change for a second surface. The runtime also refuses groups.
+    from . import access_control  # local import: same cycle-avoidance as the runtime import below
+    from . import conversation_runtime  # local import: breaks the runtime<->inbound circular import
+    access = await access_control.conversation_access(user_id, "conversation")
+    if not msg.is_group and access.allow:
+        return await conversation_runtime.handle(channel, msg, user_id=user_id, reply_target=reply_target)
+
+    # Log WHY at warning: a lapsed enrollment used to be invisible here, so the system degraded in
+    # silence and every turn came back as a canned ack.
+    log.warning("conversation_runtime_unavailable user=%s source=%s reason=%s is_group=%s",
+                user_id, access.source, access.reason, msg.is_group)
+    return None
+
+
+async def submit_turn(user_id: UUID, *, source: ChannelKind, trusted_text: str, source_turn_id: str,
+                      conversation_scope: str | None = None,
+                      metadata: dict | None = None) -> InboundOutcome | None:
+    """Phase 1's generic ingress: an authenticated turn from ANY surface.
+
+    `source_turn_id` is the idempotency key. It joins (user_id, source, role) in `uq_turn_msg_role`, so
+    one submitted turn is one canonical turn and a duplicate delivery cannot produce a second
+    consequential execution — the same Postgres-decided claim the relay path already relies on.
+
+    `conversation_scope` is a STABLE OPAQUE THREAD IDENTIFIER, and its opacity is the point. On the
+    messaging path this slot holds a phone number, and that transport identity currently reaches the
+    durable consent layer as `conversation_id`. Phase 1 does NOT redesign that; it declines to add a
+    second transport identity to it. A caller that passes nothing gets a per-user scope, which keeps a
+    surface's raw history and deictic references thread-local without inventing a handle.
+
+    `metadata` is accepted and deliberately NOT interpreted here. A surface hint that changed routing
+    would be a second semantic path, which is exactly what Phase 1 forbids.
+    """
+    msg = InboundMessage(
+        provider_message_id=source_turn_id,
+        channel=source,
+        channel_identity=conversation_scope or f"user:{user_id}",
+        text=trusted_text,
+        attachments=[],
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    return await submit_turn_for_message(
+        user_id, msg, channel=messaging_outbound.QueueChannel(),
+        reply_target=msg.channel_identity)
+
+
 async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> InboundOutcome:
     now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -215,29 +286,13 @@ async def handle_inbound(channel: MessagingChannel, msg: InboundMessage) -> Inbo
                     dedup_key=f"prompt:{msg.provider_message_id}")
         return InboundOutcome(status="unlinked_prompt")
 
-    # 2a. CONVERSATION CONTEXT GRAPH (Bite 2 A2) — persistence only. Upsert the canonical inbound node +
-    # reply/thread edges for this LINKED message so A3 can later resolve a replied-to message/image
-    # without a resend. Idempotent; produces NO turn and NO reply. Runs for both runtime + legacy paths.
-    from . import conversation_graph  # local import: avoid an import cycle via api/runtime
-    msg.user_id = user_id
-    await conversation_graph.ingest_inbound_message(msg)
+    runtime_outcome = await submit_turn_for_message(
+        user_id, msg, channel=channel, reply_target=reply_target)
+    if runtime_outcome is not None:
+        return runtime_outcome
 
-    # 2b. CONVERSATION RUNTIME (Bite 1) — DB-gated per user (Bite 1.5 keystone). A LINKED inbound goes to
-    # the multimodal conversation brain instead of the legacy intake + hard-coded ACK, but only if the DB
-    # access gate allows THIS user (an active production entitlement or a live staging enrollment, unless a
-    # global kill / hard-off overrides). The gate is by user_id, not a fragile handle allow-list; the
-    # runtime also refuses groups. When access is denied, fall through to the unchanged legacy path.
-    from . import access_control  # local import: same cycle-avoidance as the runtime import below
-    from . import conversation_runtime  # local import: breaks the runtime<->inbound circular import
-    access = await access_control.conversation_access(user_id, "conversation")
-    if not msg.is_group and access.allow:
-        return await conversation_runtime.handle(channel, msg, user_id=user_id, reply_target=reply_target)
-
-    # 2c. RUNTIME NOT AVAILABLE. Log WHY at warning: a lapsed enrollment used to be invisible here, so the
-    # system degraded to the legacy intake path in silence and every turn came back as a canned ack. A
-    # 15-minute enrollment expiring mid-conversation should be loud, not a mystery.
-    log.warning("conversation_runtime_unavailable user=%s source=%s reason=%s is_group=%s",
-                user_id, access.source, access.reason, msg.is_group)
+    # 2c. RUNTIME NOT AVAILABLE — the WHY is logged inside submit_turn_for_message, at the point the
+    # decision is actually made, so a second ingress gets the same explanation for free.
 
     # A claim of active work has to be TRUE. Without the runtime, conversational chatter and executable
     # goals produce nothing real, so they must not be turned into an intake mission and must not be

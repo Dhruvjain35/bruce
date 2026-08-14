@@ -711,7 +711,7 @@ async def relay_claim_outbound(device: schema.RelayDevice = Depends(current_rela
         blocked = True
     if blocked:
         return _paused_204()
-    c = await messaging_outbound.claim(device.id)
+    c = await messaging_outbound.claim(device.id, channel=device.channel)
     if c is None:
         return Response(status_code=204)
     return {"id": str(c.id), "to": c.to_handle, "kind": c.kind, "text": c.text,
@@ -787,6 +787,30 @@ async def relay_upload(req: RelayUploadRequest, device: schema.RelayDevice = Dep
 
 # ------------------------------------------------------- Phase 1 compute endpoints (auth-gated)
 
+class TurnRequest(BaseModel):
+    """A trusted turn from any authenticated surface. Phase 1's generic ingress contract."""
+
+    source: ChannelKind
+    trusted_text: str = Field(min_length=1, max_length=4000)
+    # THE IDEMPOTENCY KEY, and it is a UUID by requirement rather than by convention. Three unique
+    # constraints in this schema are scoped by (channel, provider_message_id) WITHOUT a user term —
+    # uq_outbound_idem, uq_conv_msg_provider and uq_inbound_provider_msg — so a guessable or colliding
+    # id from one tenant can meet another tenant's row. Forcing a UUID here is what keeps that
+    # theoretical rather than reachable, until those constraints are user-scoped (see
+    # docs/VOICE_PIVOT_BASELINE.md, remaining debt).
+    source_turn_id: UUID
+    # A STABLE OPAQUE thread scope. Deliberately not a handle: this slot becomes conversation_id, which
+    # still reaches the durable consent layer on the messaging path.
+    conversation_scope: str | None = Field(default=None, max_length=255)
+    metadata: dict | None = Field(default=None)
+
+
+class TurnAccepted(BaseModel):
+    status: str
+    turn_id: str
+    reply: str | None = None
+
+
 class IntakeRequest(BaseModel):
     """Text OR base64 bytes (image/pdf). The request is ACCEPTED and processed asynchronously."""
 
@@ -807,6 +831,46 @@ class IntakeAccepted(BaseModel):
     state: str  # canonical mission phase, e.g. "understanding"
     display_status: str  # e.g. "Understanding your flyer…"
     poll: dict[str, str]  # URLs the client can GET for canonical state + phase events
+
+
+@app.post("/v1/turns", response_model=TurnAccepted)
+async def submit_turn(req: TurnRequest, user: AuthenticatedUser = Depends(current_user)) -> TurnAccepted:
+    """PHASE 1 — a trusted turn from an authenticated cloud surface, into the EXISTING conversation core.
+
+    This route is transport and nothing else. It performs no routing, owns no semantics, and creates no
+    second runtime: it hands an authenticated user id and a trusted utterance to the same
+    `conversation_runtime.handle` the relay reaches, and returns what that produced.
+
+    `user_id` comes ONLY from the verified token. A client-supplied user id is never accepted — the same
+    rule `/v1/intake` states, and the reason this surface needs no phone-number lookup: a JWT `sub` is a
+    strictly stronger identity claim than an inbound handle, so the messaging path's
+    (channel, channel_identity) -> user_id resolution is not merely unnecessary here, it would be weaker.
+
+    The reply is read back from the durable outbound row rather than returned from the core. That keeps
+    `outbound_messages` the single source of Bruce's words — the row has already passed
+    `gate_outbound_text`, so a caller cannot receive text that was never gated, and a surface that
+    disconnects can still collect the reply later from the same row.
+    """
+    await _user_repo.ensure(user.user_id, auth_provider=user.auth_provider)
+
+    outcome = await messaging_inbound.submit_turn(
+        user.user_id, source=req.source, trusted_text=req.trusted_text,
+        source_turn_id=str(req.source_turn_id), conversation_scope=req.conversation_scope,
+        metadata=req.metadata)
+
+    if outcome is None:
+        # The access gate declined. Unlike the messaging path there is no legacy intake lane to fall back
+        # to, and inventing one would be a second path — so this is an honest refusal, not a canned ack.
+        raise HTTPException(status_code=403, detail={"error": "conversation_unavailable"})
+
+    reply = None
+    key = f"conv:{req.source.value}:{req.source_turn_id}"
+    async with user_session(user.user_id) as s:
+        row = (await s.execute(sa_select(schema.OutboundMessageRow).where(
+            schema.OutboundMessageRow.idempotency_key == key))).scalar_one_or_none()
+        if row is not None:
+            reply = row.text
+    return TurnAccepted(status=outcome.status, turn_id=str(req.source_turn_id), reply=reply)
 
 
 @app.post("/v1/intake", status_code=202, response_model=IntakeAccepted)

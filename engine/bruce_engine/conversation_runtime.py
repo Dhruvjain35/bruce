@@ -78,10 +78,26 @@ async def _open_goal_candidates(user_id: UUID, conversation_id: str) -> list[dic
     This used to return the FIRST such run and call it the answer. It returns all of them now because
     "newest" is a reading of the clock, and with an email goal and a calendar goal both open the clock
     knows nothing about which one the student just typed at. `goal_selection.select` does the choosing.
+
+    SCOPE IS THE USER, NOT THE CONVERSATION, and that is a product decision rather than a convenience.
+    A delegation is a commitment Bruce owns FOR A PERSON; it is not a fact about a phone number. Scoping
+    candidates to `conversation_id` meant Bruce forgot what it had taken on the moment the user changed
+    surface — ask by text, follow up by voice, and the goal was invisible. Raw conversational history
+    stays thread-local (`conversation_store.load_recent_turns` still filters on channel AND identity),
+    which is the counterweight: Bruce remembers the COMMITMENT everywhere and the TRANSCRIPT only where
+    it happened, so a spoken "send that one" cannot silently bind to a referent in a text thread.
+
+    `conversation_id` is still taken and still used below for logging and for the authorization scope the
+    durable layer already binds; only CANDIDATE VISIBILITY is widened here. Redesigning that binding —
+    which today carries a transport identity — is deliberately out of scope for this phase and recorded
+    as debt in docs/VOICE_PIVOT_BASELINE.md.
+
+    For a single-surface user this changes nothing: every one of their goals already shares one
+    conversation_id, so the widened query returns exactly the same rows.
     """
     from . import goal_runtime, goal_slots
     out: list[dict] = []
-    for run in await goal_runtime.open_runs(user_id, conversation_id=conversation_id):
+    for run in await goal_runtime.open_runs(user_id):
         goal = run.get("goal")
         kind, _slots = goal_slots.from_goal_jsonb(goal if isinstance(goal, dict) else None)
         if kind is not None:
@@ -1003,9 +1019,18 @@ class _Runtime:
         # here would hand the gate a plain string, the type would be gone, and the draft would be styled
         # on its way to the screen — which is the confusion `consequential_payload` exists to end.
         # `ApprovedConsequentialPayload.__str__` raises, so that mistake cannot be made quietly.
+        # THE REPLY GOES BACK THE WAY THE TURN CAME IN. `ch` is the inbound channel, destructured on the
+        # first line of handle() and already used for turn persistence — the egress used to discard it
+        # and assert iMessage, so a turn arriving on any other surface would have had its reply addressed
+        # to a phone.
+        #
+        # The idempotency key is namespaced by channel because `uq_outbound_idem` is UNIQUE on the key
+        # ALONE (no user, no channel) and `enqueue` dedupes with a check-then-act SELECT. Two surfaces
+        # emitting the same source turn id would otherwise collide and the second reply would be silently
+        # swallowed. The channel-prefixed shape is the house pattern already used elsewhere.
         await messaging_outbound.enqueue(
-            user_id=user_id, to_handle=reply_target, channel=ChannelKind.self_hosted_imessage,
-            kind=kind, text=reply, idempotency_key=f"conv:{pmid}", payload=payload)
+            user_id=user_id, to_handle=reply_target, channel=ChannelKind(ch),
+            kind=kind, text=reply, idempotency_key=f"conv:{ch}:{pmid}", payload=payload)
 
         # The memory stack finally has a caller. This runs AFTER the reply is enqueued, deliberately: the
         # student's answer is already safe, so a memory failure costs a remembered preference rather than

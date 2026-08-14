@@ -41,7 +41,29 @@ class ClaimedOutbound:
     attempts: int
 
 
-_PLAIN_TEXT_CHANNELS = frozenset({"self_hosted_imessage", "imessage", "sms"})
+# WHICH CHANNELS MAY SKIP THE PLAIN-TEXT FLOOR — an explicit allowlist, because the alternative failed
+# open and this function calls itself the last-line guarantee with "no bypasses".
+#
+# THE DEFECT THIS REPLACES. The rule was `if channel_value not in _PLAIN_TEXT_CHANNELS: return text`,
+# i.e. a channel nobody had classified got NO sanitisation at all — no PROHIBITED_PHRASES strip, no
+# em-dash rewrite. Adding any new surface would have silently made it less safe than the one it joined,
+# and nothing would have said so. A safety floor whose default is "skip" is not a floor.
+#
+# So the question is inverted: a channel is plain-text UNLESS it is explicitly known to render rich text.
+# An unknown, empty, misspelled or not-yet-classified value therefore gets the STRICTEST treatment. The
+# cost of being wrong in this direction is a comma where an em dash was wanted; the cost in the other
+# direction is corporate filler shipped to a user on a surface nobody reviewed.
+_RICH_TEXT_CHANNELS = frozenset({"in_app", "share_extension", "push_action", "apple_business", "linq",
+                                 "fake"})
+
+# Kept as the positive statement of what is known to be plain text. It is documentation and a test
+# anchor — membership is NOT what decides gating, `_is_plain_text` is.
+_PLAIN_TEXT_CHANNELS = frozenset({"self_hosted_imessage", "imessage", "sms", "spoken"})
+
+
+def _is_plain_text(channel_value: str) -> bool:
+    """Fail CLOSED. Only a channel explicitly classified as rich-text escapes the floor."""
+    return channel_value not in _RICH_TEXT_CHANNELS
 
 
 def gate_outbound_text(text: str, channel_value: str) -> str:
@@ -74,7 +96,7 @@ def gate_outbound_text(text: str, channel_value: str) -> str:
         raise PayloadEnteredVoicePipeline(
             f"gate_outbound_text accepts Bruce-authored conversational text only, got "
             f"{type(text).__name__}")
-    if not text or channel_value not in _PLAIN_TEXT_CHANNELS:
+    if not text or not _is_plain_text(channel_value):
         return text
     import re
     out = text
@@ -130,8 +152,17 @@ async def enqueue(*, user_id: UUID | None, to_handle: str, channel: ChannelKind,
             await _write(s)
 
 
-async def claim(relay_device_id: UUID, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> ClaimedOutbound | None:
-    """Claim the next sendable outbound message for a relay device (cross-user; worker session)."""
+async def claim(relay_device_id: UUID, *, channel: str,
+                lease_seconds: int = DEFAULT_LEASE_SECONDS) -> ClaimedOutbound | None:
+    """Claim the next sendable outbound message FOR THIS CHANNEL (cross-user; worker session).
+
+    `channel` IS REQUIRED, and it is required rather than defaulted because the previous signature was
+    correct only by accident. There was no channel predicate at all, so the query's correctness rested
+    entirely on there being exactly one channel in the table — an invariant nothing enforced and nothing
+    stated. The moment a second delivery surface exists, the first device to poll claims the other
+    surface's message and delivers it to the wrong place: a spoken reply read out over iMessage, or an
+    iMessage reply spoken aloud.
+    """
     sql = sa_text(
         """
         UPDATE outbound_messages SET
@@ -140,9 +171,10 @@ async def claim(relay_device_id: UUID, lease_seconds: int = DEFAULT_LEASE_SECOND
             attempts = attempts + 1, version = version + 1, updated_at = now()
         WHERE id = (
             SELECT id FROM outbound_messages
-            WHERE (status = 'pending')
-               OR (status IN ('sending', 'retryable_failed')
-                   AND lease_expires_at IS NOT NULL AND lease_expires_at < now())
+            WHERE channel = :chan
+              AND ((status = 'pending')
+                   OR (status IN ('sending', 'retryable_failed')
+                       AND lease_expires_at IS NOT NULL AND lease_expires_at < now()))
             ORDER BY created_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -151,7 +183,8 @@ async def claim(relay_device_id: UUID, lease_seconds: int = DEFAULT_LEASE_SECOND
         """
     )
     async with worker_session() as s:
-        row = (await s.execute(sql, {"owner": str(relay_device_id)[:64], "dev": str(relay_device_id), "lease": lease_seconds})).mappings().first()
+        row = (await s.execute(sql, {"owner": str(relay_device_id)[:64], "dev": str(relay_device_id),
+                                     "lease": lease_seconds, "chan": channel})).mappings().first()
     if row is None:
         return None
     return ClaimedOutbound(id=row["id"], to_handle=row["to_handle"], channel=row["channel"],

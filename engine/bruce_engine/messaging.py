@@ -50,6 +50,11 @@ class ChannelKind(str, Enum):
     self_hosted_imessage = "self_hosted_imessage"  # dedicated-Mac imsg relay (alpha)
     apple_business = "apple_business"  # planned — requires Apple approval
     push_action = "push_action"
+    # CLOUD, JWT-AUTHENTICATED SPOKEN INGRESS. Named `spoken`, NOT `voice`: "voice" already means
+    # PERSONA throughout this repo (conversation_style.VoiceProfile, "Bruce Voice OS",
+    # product/voice_profiles.yaml, ~50 uses), so ChannelKind.voice would read as style to every
+    # existing reader. This member names a TRANSPORT and nothing else.
+    spoken = "spoken"
     fake = "fake"                    # tests only
 
 

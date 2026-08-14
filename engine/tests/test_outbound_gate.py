@@ -38,8 +38,26 @@ def test_gate_strips_em_dash_and_corporate_on_plain_channels():
 def test_gate_is_idempotent_and_leaves_non_plain_channels_alone():
     once = messaging_outbound.gate_outbound_text("a — b", "self_hosted_imessage")
     assert messaging_outbound.gate_outbound_text(once, "self_hosted_imessage") == once and EM not in once
-    # a non-plain channel (hypothetical rich channel) is passed through unchanged
-    assert messaging_outbound.gate_outbound_text("a — b", "rich_web") == "a — b"
+    # A REGISTERED rich channel is passed through unchanged. This assertion previously used "rich_web",
+    # a name that is not a ChannelKind member — so what it actually pinned was the UNKNOWN-channel
+    # branch, i.e. "a channel nobody has classified is passed through ungated". That was the fail-open
+    # defect the Phase 0 audit found, in the function whose own docstring calls itself the last-line
+    # floor with "no bypasses". The INTENT here — a rich surface keeps its formatting — is unchanged and
+    # still asserted; it is now demonstrated with a channel that is genuinely classified as rich.
+    assert messaging_outbound.gate_outbound_text("a — b", "in_app") == "a — b"
+
+
+def test_an_unclassified_channel_gets_the_strictest_treatment_not_the_loosest():
+    """THE INVERSION, asserted directly. A channel that is unknown, empty, misspelled or simply not yet
+    classified must be treated as PLAIN TEXT — the strictest option — never waved through.
+
+    Being wrong in this direction costs a comma where an em dash was wanted. Being wrong in the other
+    direction ships corporate filler and raw punctuation to a surface nobody reviewed, silently, on the
+    day that surface is added."""
+    for channel in ("rich_web", "totally_unknown", "", "future_surface_v2"):
+        out = messaging_outbound.gate_outbound_text("I'd be happy to help — great question", channel)
+        assert EM not in out, f"{channel!r} bypassed the em-dash rewrite"
+        assert "i'd be happy to" not in out.lower(), f"{channel!r} bypassed the phrase strip"
 
 
 def test_legacy_constants_have_no_em_dash_and_survive_the_gate_unchanged():

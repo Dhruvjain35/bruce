@@ -65,6 +65,7 @@ LINK_SUITE = "tests/test_link_grants_access.py"
 CLAIM_SUITE = "tests/test_inbound_turn_claim.py"
 BYTES_SUITE = "tests/test_approved_bytes_are_sent_bytes.py"
 FINALIZE_SUITE = "tests/test_finalize_payload_path.py"
+PHASE1_SUITE = "tests/test_phase1_surface_neutral_ingress.py"
 
 
 class Mutation:
@@ -284,19 +285,58 @@ MUTATIONS = [
         BYTES_SUITE),
     Mutation(
         "finalize_drops_the_payload_seam", RUNTIME,
-        "            kind=kind, text=reply, idempotency_key=f\"conv:{pmid}\", payload=payload)",
-        "            kind=kind, text=reply, idempotency_key=f\"conv:{pmid}\")",
+        "            kind=kind, text=reply, idempotency_key=f\"conv:{ch}:{pmid}\", payload=payload)",
+        "            kind=kind, text=reply, idempotency_key=f\"conv:{ch}:{pmid}\")",
         "the boundary stops being live at the only call site that matters: the proposal reaches the "
         "student as one gated string again, so the draft is styled on its way to the screen",
         FINALIZE_SUITE),
     Mutation(
         "finalize_splices_the_payload_into_bruce_text", RUNTIME,
-        "            kind=kind, text=reply, idempotency_key=f\"conv:{pmid}\", payload=payload)",
+        "            kind=kind, text=reply, idempotency_key=f\"conv:{ch}:{pmid}\", payload=payload)",
         "            kind=kind, text=(reply + (payload.render_for_display() if payload else \"\")),\n"
-        "            idempotency_key=f\"conv:{pmid}\")",
+        "            idempotency_key=f\"conv:{ch}:{pmid}\")",
         "the payload is interpolated upstream, so the gate receives it as a plain string and the type "
         "boundary is gone even though the bytes still reach the student",
         FINALIZE_SUITE),
+    # --- PHASE 1: surface-neutral ingress ------------------------------------------------------------
+    Mutation(
+        "canonical_turn_persistence_bypassed", RUNTIME,
+        "        claim = await conversation_store.claim_inbound_turn(",
+        "        claim = await conversation_store.claim_inbound_turn_UNUSED(" ,
+        "the canonical turn claim is bypassed: no single source of turn truth, and the exactly-once "
+        "guarantee goes with it",
+        PHASE1_SUITE),
+    # BOTH predicates, not just the channel one. Removing `channel ==` alone leaves
+    # `channel_identity ==` still scoping the window, so no leak occurs and the mutation SURVIVES on its
+    # own weakness. Thread-locality here is enforced by the PAIR.
+    Mutation(
+        "raw_history_leaks_across_surfaces", STORE,
+        "                       schema.ConversationTurn.channel == channel,\n"
+        "                       schema.ConversationTurn.channel_identity == channel_identity)",
+        "                       True)",
+        "raw transcripts merge across surfaces: a spoken 'send that one' can bind to a referent the "
+        "speaker never said aloud",
+        PHASE1_SUITE),
+    Mutation(
+        "unknown_channel_fails_open_again", OUTBOUND,
+        "    return channel_value not in _RICH_TEXT_CHANNELS",
+        "    return channel_value in _PLAIN_TEXT_CHANNELS",
+        "the safety floor fails open for an unclassified channel again — the exact Phase-0 defect",
+        PHASE1_SUITE),
+    Mutation(
+        "outbound_claim_loses_its_channel_predicate", OUTBOUND,
+        "            WHERE channel = :chan\n"
+        "              AND ((status = 'pending')",
+        "            WHERE ((status = 'pending')",
+        "any delivery adapter claims any channel's row: a spoken reply gets spoken into iMessage",
+        PHASE1_SUITE),
+    Mutation(
+        "duplicate_spoken_delivery_executes_twice", RUNTIME,
+        "        if not claim.claimed:",
+        "        if False:",
+        "a duplicate spoken delivery runs the model and the consequential path a second time",
+        PHASE1_SUITE),
+
     Mutation(
         "payload_interpolates_into_text_silently", PAYLOAD,
         "        raise PayloadEnteredVoicePipeline(\n"

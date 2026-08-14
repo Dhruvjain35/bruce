@@ -28,7 +28,16 @@ import re
 from dataclasses import dataclass, field
 
 # Channels that render plain text only (no Markdown, no LaTeX). iMessage/SMS today.
-PLAIN_TEXT_CHANNELS = frozenset({"self_hosted_imessage", "imessage", "sms"})
+# Same fail-closed rule as messaging_outbound: a channel nobody classified renders as PLAIN TEXT, so
+# raw LaTeX/Markdown can never reach an unreviewed surface (a TTS engine would read it aloud verbatim).
+PLAIN_TEXT_CHANNELS = frozenset({"self_hosted_imessage", "imessage", "sms", "spoken"})
+RICH_TEXT_CHANNELS = frozenset({"in_app", "share_extension", "push_action", "apple_business", "linq",
+                                "fake"})
+
+
+def renders_plain_text(channel_value: str) -> bool:
+    """Fail CLOSED: only an explicitly rich-text channel keeps markup."""
+    return channel_value not in RICH_TEXT_CHANNELS
 
 
 class ExpressionEquivalenceError(Exception):
